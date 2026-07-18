@@ -1,0 +1,156 @@
+package execution
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"trade-kernel/internal/session"
+)
+
+type fakeQuotes struct {
+	bid, ask float64
+	qAt      time.Time
+	last     float64
+	tAt      time.Time
+}
+
+func (f fakeQuotes) LatestQuote() (float64, float64, time.Time) { return f.bid, f.ask, f.qAt }
+func (f fakeQuotes) LatestTrade() (float64, time.Time)          { return f.last, f.tAt }
+
+type fakeElig map[string]bool
+
+func (f fakeElig) OvernightTradable(_ context.Context, s string) (bool, error) {
+	return f[s], nil
+}
+
+var testNow = time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC)
+
+func newTestBuilder(q fakeQuotes, elig Eligibility) *Builder {
+	b := NewBuilder(q, elig, 25, 3*time.Second) // 25 bps, 3s staleness
+	b.SetClock(func() time.Time { return testNow })
+	return b
+}
+
+func TestBuildRegularMarket(t *testing.T) {
+	b := newTestBuilder(fakeQuotes{}, nil)
+	req, warn, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "buy", Qty: 100, Session: session.Regular,
+	})
+	if err != nil || warn != "" {
+		t.Fatalf("err=%v warn=%q", err, warn)
+	}
+	if req.Type != "market" || req.TimeInForce != "day" || req.ExtendedHours {
+		t.Fatalf("req = %+v", req)
+	}
+	if req.ClientOrderID != "" {
+		t.Fatal("builder must not set client order id (executor does)")
+	}
+}
+
+func TestBuildRegularLimitIOC(t *testing.T) {
+	b := newTestBuilder(fakeQuotes{}, nil)
+	req, _, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "sell", Qty: 50, LimitPrice: 152.3,
+		Session: session.Regular, RegularTIF: "ioc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Type != "limit" || req.LimitPrice != "152.30" || req.TimeInForce != "ioc" || req.ExtendedHours {
+		t.Fatalf("req = %+v", req)
+	}
+}
+
+func TestBuildExtendedAggressiveBuy(t *testing.T) {
+	q := fakeQuotes{bid: 100.00, ask: 100.10, qAt: testNow.Add(-time.Second), last: 100.05, tAt: testNow.Add(-time.Second)}
+	b := newTestBuilder(q, nil)
+	req, warn, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "buy", Qty: 100, Session: session.PreMarket,
+	})
+	if err != nil || warn != "" {
+		t.Fatalf("err=%v warn=%q", err, warn)
+	}
+	// ask * 1.0025 = 100.35025 → ceil to cent = 100.36
+	if req.Type != "limit" || req.LimitPrice != "100.36" || !req.ExtendedHours || req.TimeInForce != "day" {
+		t.Fatalf("req = %+v", req)
+	}
+}
+
+func TestBuildExtendedAggressiveSell(t *testing.T) {
+	q := fakeQuotes{bid: 100.00, ask: 100.10, qAt: testNow.Add(-time.Second)}
+	b := newTestBuilder(q, nil)
+	req, _, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "sell", Qty: 100, Session: session.AfterHours,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// bid * 0.9975 = 99.75 → floor to cent = 99.75
+	if req.LimitPrice != "99.75" {
+		t.Fatalf("req = %+v", req)
+	}
+}
+
+func TestBuildExtendedStaleQuoteFallsBack(t *testing.T) {
+	q := fakeQuotes{
+		bid: 100.00, ask: 100.10, qAt: testNow.Add(-time.Hour), // stale
+		last: 101.00, tAt: testNow.Add(-time.Second),
+	}
+	b := newTestBuilder(q, nil)
+	req, warn, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "buy", Qty: 100, Session: session.PreMarket,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warn == "" {
+		t.Fatal("expected stale-quote warning")
+	}
+	// last * 1.0025 = 101.2525 → ceil = 101.26
+	if req.LimitPrice != "101.26" {
+		t.Fatalf("req = %+v", req)
+	}
+}
+
+func TestBuildOvernightEligibility(t *testing.T) {
+	q := fakeQuotes{bid: 100, ask: 100.1, qAt: testNow.Add(-time.Second)}
+	elig := fakeElig{"AAPL": true, "XYZ": false}
+	b := newTestBuilder(q, elig)
+
+	if _, _, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "buy", Qty: 10, Session: session.Overnight,
+	}); err != nil {
+		t.Fatalf("eligible symbol rejected: %v", err)
+	}
+	_, _, err := b.Build(context.Background(), BuildInput{
+		Symbol: "XYZ", Side: "buy", Qty: 10, Session: session.Overnight,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not overnight-tradable") {
+		t.Fatalf("ineligible symbol: err = %v", err)
+	}
+}
+
+func TestBuildClosedRejected(t *testing.T) {
+	b := newTestBuilder(fakeQuotes{}, nil)
+	_, _, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "buy", Qty: 10, Session: session.Closed,
+	})
+	if err == nil {
+		t.Fatal("expected error when market closed")
+	}
+}
+
+func TestBuildExtendedExplicitLimit(t *testing.T) {
+	b := newTestBuilder(fakeQuotes{}, nil)
+	req, _, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "buy", Qty: 10, LimitPrice: 99.5, Session: session.PreMarket,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.LimitPrice != "99.50" || !req.ExtendedHours {
+		t.Fatalf("req = %+v", req)
+	}
+}

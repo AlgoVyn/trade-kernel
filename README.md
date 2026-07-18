@@ -1,0 +1,125 @@
+# trade-kernel
+
+A low-latency terminal trading app for US equities on
+[Alpaca](https://alpaca.markets), built for speed: keyboard-first order
+entry, full 24/5 session support (overnight, pre-market, regular,
+after-hours), braille candlestick charts with SMA/EMA/VWAP overlays,
+and hard safety rails. Runs on a server near Alpaca; you attach over
+SSH + tmux.
+
+```
+ PAPER  REGULAR  AAPL  152.31 152.30×152.32  10:42:17 ET  size 250  tf 1m  p50 12ms p99 31ms
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀   AAPL
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⡄⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⢠⠀⠀⠀⠀⢠⡇⠀⠀⠀   last   152.31
+⠀⣄⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⠀⠀⠀⠀⢸⡇⠀⠀⠀⣿⡇⠀⠀⡆⠀⠀⣾⠀⠀⠀⠀⢸⡇⠀⠀⠀   bid    152.30
+⣠⣿⡄⠀⠀⠀⠀⠀⠀⢀⣾⡇⠀⠀⠀⠀⠀⢸⡇⠀⠀⠀⣿⡇⠀⢀⡇⠀⠀⣿⠀⠀⠀⢀⣾⠀⠀⠀⠀   ask    152.32
+...
+```
+
+## Features
+
+- **All sessions tradable.** Orders outside regular hours automatically
+  convert to aggressive limit orders (`extended_hours=true`, far side of
+  the NBBO ± configurable slippage), with an overnight-eligibility check
+  per symbol. The status bar always shows the current session and, when
+  confirmations are on, the converted limit price before submission.
+- **Fast order entry.** One keystroke to buy/sell/add/reduce/flatten
+  with preset sizes; `:` command line for custom orders.
+- **Safety rails.** Max order size, max position size, duplicate-order
+  debounce, and a daily-loss kill-switch that cancels everything,
+  flattens, and locks until manually unlocked. `X` is the panic key.
+- **Charts.** Candlesticks in braille (2×4 dots/cell), volume pane,
+  SMA/EMA/session-VWAP overlays, per-session background shading,
+  resolutions from 1s to 1d, weekend/holiday gaps collapsed.
+- **Resilient.** WebSocket auto-reconnect with REST backfill, state
+  reconciliation on startup and reconnect, client order IDs for
+  idempotency, keypress→ack latency (p50/p99) in the status bar.
+
+## Quickstart
+
+Requires Go 1.24+ and an Alpaca account (paper works; SIP data requires
+the Algo Trader Plus data plan).
+
+```bash
+# 1. Build
+go build -o trade-kernel ./cmd/trade-kernel
+
+# 2. Configure
+cp config.example.yaml trade-kernel.yaml   # edit to taste
+
+# 3. Credentials (environment wins over the config file)
+export APCA_API_KEY_ID=...
+export APCA_API_SECRET_KEY=...
+
+# 4. Run (paper by default)
+./trade-kernel
+```
+
+## Usage
+
+### Hotkeys (all rebindable in config)
+
+| Key | Action |
+|---|---|
+| `B` / `S` | Buy / sell preset size |
+| `A` / `D` | Add to / reduce position |
+| `F` | Flatten entire position |
+| `C` | Cancel all open orders |
+| `X` | Panic: cancel all + flatten (no confirmation) |
+| `1`–`4` | Select size preset |
+| `Tab` | Cycle chart resolution |
+| `i` | Cycle indicator overlays |
+| `:` | Command line |
+| `q` / `Ctrl+C` | Quit / force quit |
+
+### Commands
+
+```
+:buy 250 lmt 152.30      limit buy        :sell 100 mkt     market sell
+:sym NVDA                switch symbol    :tf 5m            chart timeframe
+:preset 2                size preset      :flatten          close position
+:cancel                  cancel all       :unlock           release kill-switch
+:confirm on|off          toggle confirms  :shading on|off   toggle shading
+:quit                    quit             :help             key summary
+```
+
+### How orders are built
+
+| Session | Hotkey order | `:... lmt PRICE` |
+|---|---|---|
+| Regular | market, TIF=day | limit, TIF=day/ioc |
+| Pre-market / after-hours | limit at NBBO far side ± slippage, `extended_hours=true` | limit as given, `extended_hours=true` |
+| Overnight | same + symbol eligibility check | same |
+| Closed | rejected | rejected |
+
+Stale NBBO (>3 s) falls back to pricing off the last trade with a
+warning. Flatten/reduce are direction-aware from the position sign.
+
+## Safety
+
+- **Paper first.** Live trading needs both `paper: false` and
+  `live_trading_acknowledged: true`, and prints a warning banner.
+- **Kill-switch.** If equity drops `daily_loss_limit` from the day's
+  first reading: cancel all, flatten everything, lock. `:unlock` to
+  re-enable (fires at most once per day).
+- **Confirmations.** `confirm_orders: true` shows every order (with the
+  converted limit price in extended sessions) before submission.
+
+## Development
+
+```bash
+go build ./... && go vet ./... && go test -race ./...
+```
+
+See [DESIGN.md](DESIGN.md) for the architecture, package map, order
+builder rules, failure handling, and testing strategy.
+
+## Deployment
+
+See [deploy/SETUP.md](deploy/SETUP.md): GCP region selection by RTT
+measurement, systemd + tmux unit, secrets handling, attach over SSH
+(`ssh -t host 'tmux attach -t trade-kernel'`).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,0 +1,44 @@
+# trade-kernel configuration. Copy to trade-kernel.yaml and edit.
+# Credentials are read from the environment and override this file:
+#   APCA_API_KEY_ID, APCA_API_SECRET_KEY
+
+# Paper trading is the default. For live trading you must set BOTH
+# paper: false and live_trading_acknowledged: true.
+paper: true
+live_trading_acknowledged: false
+
+default_symbol: AAPL
+
+# Selectable with keys 1-4. First entry is the default.
+size_presets: [100, 250, 500, 1000]
+
+# Ask for y/n confirmation before every order (shows the converted
+# limit price in extended sessions).
+confirm_orders: true
+
+limits:
+  max_order_qty: 1000       # reject orders larger than this
+  max_position_qty: 5000    # reject orders that would grow |position| past this
+  daily_loss_limit: 2000    # kill-switch: cancel all + flatten + lock (0 disables)
+  debounce_ms: 300          # duplicate-order debounce window
+
+extended_hours:
+  slippage_bps: 25          # aggressive-limit offset (basis points)
+  quote_stale_ms: 3000      # NBBO older than this -> price off last trade + warn
+
+indicators:
+  sma_period: 20
+  ema_period: 9
+  vwap_anchor: session      # "session" resets each session; "day" resets at 20:00 ET
+
+chart:
+  timeframe: 1m             # initial resolution
+  bars_visible: 120
+  session_shading: true
+
+# Optional keybinding overrides (action -> key). Actions:
+# buy, sell, add, reduce, flatten, cancel_all, panic, cmdline,
+# cycle_tf, cycle_indicators, quit, quit_force
+# keys:
+#   buy: B
+#   panic: X

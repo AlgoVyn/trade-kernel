@@ -1,0 +1,40 @@
+# Binaries
+trade-kernel
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+.kilo
+
+# Env / secrets (never commit)
+.env
+*.pem
+config.yaml
+config.yml
+trade-kernel.yaml
+trade-kernel.yml
+
+# Logs
+*.log
+logs/

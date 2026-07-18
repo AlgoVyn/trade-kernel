@@ -1,0 +1,26 @@
+# /etc/systemd/system/trade-kernel.service
+# Runs trade-kernel inside tmux so the UI survives SSH detach.
+# Requires: /etc/trade-kernel/env (mode 600) with APCA_API_KEY_ID and
+# APCA_API_SECRET_KEY, and /etc/trade-kernel/trade-kernel.yaml.
+[Unit]
+Description=trade-kernel terminal trading app
+After=network-online.target chronyd.service systemd-timesyncd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trade
+Group=trade
+EnvironmentFile=/etc/trade-kernel/env
+WorkingDirectory=/opt/trade-kernel
+# Start inside a detached tmux session; attach with:
+#   ssh -t host 'tmux attach -t trade-kernel'
+ExecStart=/usr/bin/tmux new-session -d -s trade-kernel '/opt/trade-kernel/trade-kernel -config /etc/trade-kernel/trade-kernel.yaml'
+ExecStop=/usr/bin/tmux kill-session -t trade-kernel
+Restart=on-failure
+RestartSec=3
+# Do not restart if the process exits cleanly (user quit intentionally).
+RestartPreventExitStatus=0
+
+[Install]
+WantedBy=multi-user.target
