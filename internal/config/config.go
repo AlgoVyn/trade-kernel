@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"trade-kernel/internal/bars"
 )
 
 // Config is the root configuration for trade-kernel.
@@ -68,7 +70,10 @@ type Indicators struct {
 
 // Chart configures rendering.
 type Chart struct {
-	Timeframe      string `yaml:"timeframe"` // initial resolution
+	// Timeframe is the initial chart resolution: built-ins (1s, 5s, 15s,
+	// 1m, 5m, 15m, 1h, 1d) or a custom duration (e.g. 2m, 3m, 30s, 4h).
+	// Change at runtime with :tf <resolution>.
+	Timeframe      string `yaml:"timeframe"`
 	BarsVisible    int    `yaml:"bars_visible"`
 	SessionShading bool   `yaml:"session_shading"`
 	// TickMS is the base UI render interval in milliseconds (default 50).
@@ -156,6 +161,8 @@ func (c *Config) Validate() error {
 	}
 	if c.Chart.Timeframe == "" {
 		c.Chart.Timeframe = "1m"
+	} else if _, ok := bars.ParseChartTF(c.Chart.Timeframe); !ok {
+		return fmt.Errorf("chart.timeframe %q is invalid (use 1s|5s|15s|1m|5m|15m|1h|1d or a custom duration like 2m, 30s, 4h)", c.Chart.Timeframe)
 	}
 	if c.Chart.BarsVisible <= 0 {
 		c.Chart.BarsVisible = 120

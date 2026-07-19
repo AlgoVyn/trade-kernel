@@ -45,9 +45,9 @@ func (f *fakeExec) CancelAll(_ context.Context) error {
 	f.calls = append(f.calls, "cancelall")
 	return nil
 }
-func (f *fakeExec) CancelSymbol(_ context.Context, sym string) error {
+func (f *fakeExec) CancelSymbol(_ context.Context, sym string) (int, error) {
 	f.calls = append(f.calls, "cancelsym "+sym)
-	return nil
+	return 0, nil
 }
 
 func testDeps(t *testing.T) (Deps, *fakeExec, *state.Store, *bars.Aggregator) {
@@ -111,6 +111,48 @@ func TestHotkeyBuyFlow(t *testing.T) {
 	drain(m, cmd)
 	if len(fx.calls) != 2 || fx.calls[1] != "sell AAPL" {
 		t.Fatalf("calls = %v", fx.calls)
+	}
+}
+
+// TestOrderBlockedBeforeReconcile: a fresh store with no Reconcile must block
+// the buy hotkey (a failed startup snapshot must not let the operator trade
+// against an empty view). After Reconcile lands, the hotkey goes through.
+// Flatten still works either way (tested separately).
+func TestOrderBlockedBeforeReconcile(t *testing.T) {
+	d, fx, st, _ := testDeps(t)
+	// Replace the reconciled store with a fresh, unreconciled one.
+	fresh := state.NewStore()
+	d.Store = fresh
+	d.Risk = risk.NewChecker(risk.Limits{MaxOrderQty: 1000, MaxPositionQty: 5000}, fresh, nil)
+	m := NewModel(d)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	if fresh.Reconciled() {
+		t.Fatal("setup: store must be unreconciled")
+	}
+
+	// B is blocked.
+	_, cmd := m.handleKey(key('B'))
+	if cmd != nil {
+		drain(m, cmd)
+	}
+	if len(fx.calls) != 0 {
+		t.Fatalf("order must be blocked before reconcile, calls = %v", fx.calls)
+	}
+	if !m.statusErr || !strings.Contains(m.status, "reconcile pending") {
+		t.Fatalf("status = %q err=%v, want reconcile-pending error", m.status, m.statusErr)
+	}
+
+	// First successful reconcile flips the gate; B now goes through.
+	fresh.Reconcile(
+		alpaca.Account{Equity: 100000, Cash: 50000, BuyingPower: 200000},
+		nil, nil,
+	)
+	_ = st
+	_, cmd = m.handleKey(key('B'))
+	drain(m, cmd)
+	if len(fx.calls) != 1 || fx.calls[0] != "buy AAPL" {
+		t.Fatalf("after reconcile, calls = %v, want buy AAPL", fx.calls)
 	}
 }
 
@@ -268,6 +310,66 @@ func TestInfoBarShowsDayWeekPnL(t *testing.T) {
 	}
 	if !strings.Contains(row1, "wk") || !strings.Contains(row1, "+2.7k") {
 		t.Fatalf("row1 missing week PnL: %q", row1)
+	}
+}
+
+// TestChartOrdersForFiltersSymbolAndMarket keeps priced orders for the
+// active symbol (limits + stops); market/unpriced are skipped.
+// stop_limit yields both trigger and limit markers.
+func TestChartOrdersForFiltersSymbolAndMarket(t *testing.T) {
+	orders := []alpaca.Order{
+		{ID: "1", Symbol: "AAPL", Side: "buy", Type: "limit", LimitPrice: 150},
+		{ID: "2", Symbol: "AAPL", Side: "sell", Type: "market"}, // no price
+		{ID: "3", Symbol: "NVDA", Side: "buy", Type: "limit", LimitPrice: 900},
+		{ID: "4", Symbol: "AAPL", Side: "sell", Type: "limit", LimitPrice: 160},
+		{ID: "5", Symbol: "AAPL", Side: "sell", Type: "stop", StopPrice: 145},
+		{ID: "6", Symbol: "AAPL", Side: "buy", Type: "stop_limit", StopPrice: 148, LimitPrice: 149},
+	}
+	got := chartOrdersFor("AAPL", orders)
+	if len(got) != 5 {
+		t.Fatalf("got %d markers, want 5 (AAPL limit+stop+stop_limit×2): %+v", len(got), got)
+	}
+	if got[0].Side != "buy" || got[0].Price != 150 {
+		t.Fatalf("first = %+v, want buy@150", got[0])
+	}
+	if got[1].Side != "sell" || got[1].Price != 160 {
+		t.Fatalf("second = %+v, want sell@160", got[1])
+	}
+	if got[2].Side != "sell" || got[2].Price != 145 {
+		t.Fatalf("third = %+v, want sell stop@145", got[2])
+	}
+	if got[3].Side != "buy" || got[3].Price != 148 {
+		t.Fatalf("fourth = %+v, want buy stop@148 (trigger)", got[3])
+	}
+	if got[4].Side != "buy" || got[4].Price != 149 {
+		t.Fatalf("fifth = %+v, want buy limit@149 (stop_limit leg)", got[4])
+	}
+}
+
+// TestViewRendersOrderMarkers puts buy/sell glyphs on the chart for open limits.
+func TestViewRendersOrderMarkers(t *testing.T) {
+	d, _, st, agg := testDeps(t)
+	base := time.Date(2026, 7, 17, 15, 0, 0, 0, time.UTC)
+	for i := 0; i < 40; i++ {
+		agg.OnTrade("AAPL", 150+float64(i%5), 10, base.Add(time.Duration(i)*time.Minute))
+	}
+	st.Reconcile(
+		alpaca.Account{Equity: 100000, Cash: 50000, BuyingPower: 200000},
+		nil,
+		[]alpaca.Order{
+			{ID: "1", Symbol: "AAPL", Side: "buy", Type: "limit", LimitPrice: 149, Status: "open"},
+			{ID: "2", Symbol: "AAPL", Side: "sell", Type: "limit", LimitPrice: 154, Status: "open"},
+			{ID: "3", Symbol: "NVDA", Side: "buy", Type: "limit", LimitPrice: 900, Status: "open"},
+		},
+	)
+	m := NewModel(d)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	out := stripANSI(m.View())
+	if !strings.ContainsRune(out, orderBuyMark) {
+		t.Fatalf("view should show buy marker %q, got snippet %q", string(orderBuyMark), truncate(out, 200))
+	}
+	if !strings.ContainsRune(out, orderSellMark) {
+		t.Fatalf("view should show sell marker %q, got snippet %q", string(orderSellMark), truncate(out, 200))
 	}
 }
 
@@ -516,6 +618,68 @@ func TestCycleTFBackward(t *testing.T) {
 	want := (start - 1 + len(m.tfs)) % len(m.tfs)
 	if m.tfIdx != want {
 		t.Fatalf("tfIdx = %d, want %d", m.tfIdx, want)
+	}
+}
+
+// TestCustomTFCommand sets :tf 2m and clears it when Tab cycles built-ins.
+func TestCustomTFCommand(t *testing.T) {
+	d, _, _, agg := testDeps(t)
+	feedHistory(t, agg, 20)
+	m := NewModel(d)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	m.handleKey(key(':'))
+	for _, r := range "tf 2m" {
+		if r == ' ' {
+			m.handleKey(tea.KeyMsg{Type: tea.KeySpace})
+		} else {
+			m.handleKey(key(r))
+		}
+	}
+	m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.customName != "2m" || m.customDur != 2*time.Minute {
+		t.Fatalf("custom = %q/%v, want 2m", m.customName, m.customDur)
+	}
+	if name, ok := agg.CustomActive(); !ok || name != "2m" {
+		t.Fatalf("agg custom = %q ok=%v", name, ok)
+	}
+	if m.chartTFName() != "2m" {
+		t.Fatalf("chartTFName = %q", m.chartTFName())
+	}
+	// View should render without panic.
+	if out := m.View(); out == "" {
+		t.Fatal("empty view on custom TF")
+	}
+	// Tab leaves custom and returns to the previous built-in (no advance).
+	prevIdx := m.tfIdx
+	m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	if m.customName != "" {
+		t.Fatalf("custom should clear on cycle_tf, got %q", m.customName)
+	}
+	if _, ok := agg.CustomActive(); ok {
+		t.Fatal("agg custom should be cleared after Tab")
+	}
+	if m.tfIdx != prevIdx {
+		t.Fatalf("first Tab from custom should keep tfIdx=%d, got %d", prevIdx, m.tfIdx)
+	}
+	// Second Tab advances the built-in cycle.
+	m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	want := (prevIdx + 1) % len(m.tfs)
+	if m.tfIdx != want {
+		t.Fatalf("second Tab tfIdx=%d, want %d", m.tfIdx, want)
+	}
+}
+
+// TestConfigCustomTimeframe enables custom TF from chart.timeframe at startup.
+func TestConfigCustomTimeframe(t *testing.T) {
+	d, _, _, agg := testDeps(t)
+	d.Cfg.Chart.Timeframe = "3m"
+	m := NewModel(d)
+	if m.customName != "3m" || m.customDur != 3*time.Minute {
+		t.Fatalf("custom from config = %q/%v", m.customName, m.customDur)
+	}
+	if name, ok := agg.CustomActive(); !ok || name != "3m" {
+		t.Fatalf("agg custom = %q ok=%v", name, ok)
 	}
 }
 

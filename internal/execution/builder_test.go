@@ -146,6 +146,22 @@ func TestBuildClosedRejected(t *testing.T) {
 	}
 }
 
+// TestBuildEmptySymbolRejected guards the builder boundary: an empty symbol
+// must never produce an order request (UI paths always set it, but the
+// builder is the safety boundary). Runs across every session so the guard is
+// not accidentally bypassed via a session-specific branch.
+func TestBuildEmptySymbolRejected(t *testing.T) {
+	b := newTestBuilder(fakeQuotes{}, nil)
+	for _, sess := range []session.Session{session.Regular, session.PreMarket, session.AfterHours, session.Overnight, session.Closed} {
+		_, _, err := b.Build(context.Background(), BuildInput{
+			Symbol: "", Side: "buy", Qty: 10, Session: sess,
+		})
+		if err == nil {
+			t.Fatalf("session %v: expected empty-symbol rejection", sess)
+		}
+	}
+}
+
 func TestBuildExtendedExplicitLimit(t *testing.T) {
 	b := newTestBuilder(fakeQuotes{}, nil)
 	req, _, err := b.Build(context.Background(), BuildInput{

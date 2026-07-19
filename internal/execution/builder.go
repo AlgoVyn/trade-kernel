@@ -92,6 +92,11 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (alpaca.OrderRequest
 	if in.Side != "buy" && in.Side != "sell" {
 		return alpaca.OrderRequest{}, "", fmt.Errorf("side must be buy or sell")
 	}
+	if in.Symbol == "" {
+		// Defense in depth: an empty symbol would submit an un-routable order.
+		// UI paths always set it, but the builder is the boundary.
+		return alpaca.OrderRequest{}, "", fmt.Errorf("symbol must be non-empty")
+	}
 	req := alpaca.OrderRequest{
 		Symbol: in.Symbol,
 		Qty:    fmt.Sprintf("%d", in.Qty),

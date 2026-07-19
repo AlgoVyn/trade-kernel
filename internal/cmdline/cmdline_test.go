@@ -50,6 +50,14 @@ func TestParseOther(t *testing.T) {
 	if err != nil || c.Kind != KindTF || c.TF != "5m" {
 		t.Fatalf("%+v err=%v", c, err)
 	}
+	c, err = Parse("tf 2m")
+	if err != nil || c.Kind != KindTF || c.TF != "2m" {
+		t.Fatalf("custom tf: %+v err=%v", c, err)
+	}
+	c, err = Parse("tf 30s")
+	if err != nil || c.Kind != KindTF || c.TF != "30s" {
+		t.Fatalf("custom tf 30s: %+v err=%v", c, err)
+	}
 	c, err = Parse("preset 2")
 	if err != nil || c.Kind != KindPreset || c.Preset != 2 {
 		t.Fatalf("%+v err=%v", c, err)

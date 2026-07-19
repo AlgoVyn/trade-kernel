@@ -102,6 +102,19 @@ func (g *grid) setCandle(x, y int, ch rune, fg uint8) {
 	g.fg[i] = fg
 }
 
+// setMarker paints a solid overlay glyph that wins over candles and
+// indicator braille (used for working buy/sell order markers).
+func (g *grid) setMarker(x, y int, ch rune, fg uint8) {
+	if x < 0 || x >= g.w || y < 0 || y >= g.h {
+		return
+	}
+	i := g.idx(x, y)
+	g.ch[i] = ch
+	g.fg[i] = fg
+	g.indDots[i] = 0
+	g.indColor[i] = 0
+}
+
 func (g *grid) setColBg(cx int, bg uint8) {
 	if cx < 0 || cx >= g.w {
 		return
@@ -220,10 +233,21 @@ func (g *grid) render() []string {
 	return lines
 }
 
+// ChartOrder is a working order plotted on the candle pane at Price.
+// Side is "buy" or "sell"; Price is typically the limit price.
+type ChartOrder struct {
+	Side  string
+	Price float64
+}
+
 // ChartOpts controls rendering.
 type ChartOpts struct {
 	ShowEMA, ShowEMA2, ShowVWAP bool
 	SessionShading              bool
+	// Orders are open working orders for the active symbol. Each is drawn
+	// as a dashed price level with a buy (▲) or sell (▼) glyph at the
+	// live edge. Market orders without a limit price are omitted upstream.
+	Orders []ChartOrder
 }
 
 // sessionBG maps a trading session to a chart background tint.
@@ -262,10 +286,26 @@ func barCol(w, n, i int) int {
 	return w - 1 - (n-1-i)*barStride
 }
 
+// validOrderPrice reports whether p is a plottable working-order price.
+// Shared by priceRange, paintOrderMarkers, and chartOrdersFor so invalid
+// values never expand the axis without also drawing a marker (and vice versa).
+func validOrderPrice(p float64) bool {
+	return p > 0 && !math.IsNaN(p) && !math.IsInf(p, 0)
+}
+
+// orderScaleExpand is how far beyond the bar/indicator span a resting limit
+// may pull the Y-axis, as a multiple of that span. Orders outside the window
+// still paint (clamped to the top/bottom edge) but do not squash candle detail.
+const orderScaleExpand = 1.0
+
 // priceRange returns the (min, max) price span across snap's bars and the
 // enabled overlays, with 2% padding on each side — exactly the range the
 // candle pane maps to its y-axis. Shared by renderCandles and the price
 // axis so labels line up with the bars. Returns (0,0,false) for empty.
+//
+// Nearby working-order prices expand the scale so markers sit on-screen;
+// far GTC/limits only expand within orderScaleExpand× the bar span so a
+// distant resting order cannot flatten the candle structure.
 func priceRange(snap bars.Snapshot, opts ChartOpts) (min, max float64, ok bool) {
 	if len(snap.Bars) == 0 {
 		return 0, 0, false
@@ -294,6 +334,23 @@ func priceRange(snap bars.Snapshot, opts ChartOpts) (min, max float64, ok bool) 
 		if opts.ShowVWAP {
 			grow(snap.VWAP[i])
 		}
+	}
+	if min >= max {
+		max = min + 1
+	}
+	// Cap order-driven expansion to a band around the bar/indicator range.
+	barMin, barMax := min, max
+	span := barMax - barMin
+	loBound := barMin - span*orderScaleExpand
+	hiBound := barMax + span*orderScaleExpand
+	for _, o := range opts.Orders {
+		if !validOrderPrice(o.Price) {
+			continue
+		}
+		if o.Price < loBound || o.Price > hiBound {
+			continue
+		}
+		grow(o.Price)
 	}
 	if min >= max {
 		max = min + 1
@@ -431,7 +488,79 @@ func renderCandles(snap bars.Snapshot, w, h int, opts ChartOpts) []string {
 		plotSeries(snap.VWAP, colVWAP)
 	}
 
+	// Working orders: dashed level + buy/sell glyph at the live edge.
+	// Drawn last so markers win over candles and indicator braille.
+	paintOrderMarkers(g, opts.Orders, yOfCell, w)
+
 	return g.render()
+}
+
+// order marker glyphs — classic chart convention (up = buy, down = sell).
+const (
+	orderBuyMark  = '▲'
+	orderSellMark = '▼'
+	orderBothMark = '◆'
+	orderLevelCh  = '┄' // light triple-dash horizontal guide
+)
+
+// paintOrderMarkers draws each working order as a dashed horizontal guide
+// at its price and a buy/sell symbol on the rightmost column. Multiple
+// orders that map to the same row are collapsed; mixed buy+sell uses ◆.
+// Prices outside the current scale still paint (yOfCell clamps them to the
+// top/bottom edge) so far limits remain visible without rescaling.
+func paintOrderMarkers(g *grid, orders []ChartOrder, yOfCell func(float64) int, w int) {
+	if g == nil || len(orders) == 0 || w <= 0 {
+		return
+	}
+	type sides struct{ buy, sell bool }
+	byY := make(map[int]sides, len(orders))
+	for _, o := range orders {
+		if !validOrderPrice(o.Price) {
+			continue
+		}
+		y := yOfCell(o.Price)
+		if y < 0 || y >= g.h {
+			continue
+		}
+		s := byY[y]
+		if strings.EqualFold(o.Side, "sell") {
+			s.sell = true
+		} else {
+			// treat anything non-sell as buy (Alpaca uses "buy"/"sell")
+			s.buy = true
+		}
+		byY[y] = s
+	}
+	for y, s := range byY {
+		if y < 0 || y >= g.h {
+			continue
+		}
+		col := colUp
+		mark := orderBuyMark
+		switch {
+		case s.buy && s.sell:
+			col = colVWAP
+			mark = orderBothMark
+		case s.sell:
+			col = colDown
+			mark = orderSellMark
+		}
+		// Dashed guide on empty cells only so candle bodies stay readable.
+		for x := 0; x < w-1 && x < g.w; x++ {
+			i := g.idx(x, y)
+			if g.ch[i] == ' ' && g.indDots[i] == 0 {
+				g.setMarker(x, y, orderLevelCh, col)
+			}
+		}
+		// Live-edge glyph always wins the rightmost column.
+		edge := w - 1
+		if edge >= g.w {
+			edge = g.w - 1
+		}
+		if edge >= 0 {
+			g.setMarker(edge, y, mark, col)
+		}
+	}
 }
 
 var volBlocks = []rune{'▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}

@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -104,6 +105,229 @@ func TestDrawIndLineConnects(t *testing.T) {
 		if g.indColor[i] != colEMA {
 			t.Fatalf("col %d: color = %v, want colEMA", x, g.indColor[i])
 		}
+	}
+}
+
+// TestOrderMarkersOnChart draws buy (▲) and sell (▼) symbols at order prices.
+func TestOrderMarkersOnChart(t *testing.T) {
+	agg := bars.NewAggregator(3, 3)
+	base := time.Date(2026, 7, 17, 15, 0, 0, 0, time.UTC)
+	// Flat tape around 100 so order prices land mid-pane.
+	for i := 0; i < 20; i++ {
+		agg.OnTrade("AAPL", 100, 10, base.Add(time.Duration(i)*time.Minute))
+		agg.OnTrade("AAPL", 101, 10, base.Add(time.Duration(i)*time.Minute+10*time.Second))
+		agg.OnTrade("AAPL", 99, 10, base.Add(time.Duration(i)*time.Minute+20*time.Second))
+	}
+	snap := agg.Snapshot(bars.TF1m, 40, 0)
+	opts := ChartOpts{
+		Orders: []ChartOrder{
+			{Side: "buy", Price: 99.5},
+			{Side: "sell", Price: 100.5},
+		},
+	}
+	lines := renderCandles(snap, 40, 14, opts)
+	joined := stripANSI(strings.Join(lines, "\n"))
+	if !strings.ContainsRune(joined, orderBuyMark) {
+		t.Fatalf("expected buy marker %q in chart, got %q", string(orderBuyMark), truncate(joined, 120))
+	}
+	if !strings.ContainsRune(joined, orderSellMark) {
+		t.Fatalf("expected sell marker %q in chart, got %q", string(orderSellMark), truncate(joined, 120))
+	}
+	// Rightmost column of some row should carry a marker (live-edge glyph).
+	foundEdge := false
+	for _, line := range lines {
+		plain := stripANSI(line)
+		runes := []rune(plain)
+		if len(runes) == 0 {
+			continue
+		}
+		last := runes[len(runes)-1]
+		if last == orderBuyMark || last == orderSellMark {
+			foundEdge = true
+			break
+		}
+	}
+	if !foundEdge {
+		t.Fatalf("order marker should sit on the live-edge column, got:\n%s", stripANSI(strings.Join(lines, "\n")))
+	}
+}
+
+// TestOrderBothMarkCollapse collapses opposite sides at the same price to ◆.
+func TestOrderBothMarkCollapse(t *testing.T) {
+	agg := bars.NewAggregator(3, 3)
+	base := time.Date(2026, 7, 17, 15, 0, 0, 0, time.UTC)
+	for i := 0; i < 20; i++ {
+		agg.OnTrade("AAPL", 100, 10, base.Add(time.Duration(i)*time.Minute))
+		agg.OnTrade("AAPL", 101, 10, base.Add(time.Duration(i)*time.Minute+10*time.Second))
+		agg.OnTrade("AAPL", 99, 10, base.Add(time.Duration(i)*time.Minute+20*time.Second))
+	}
+	snap := agg.Snapshot(bars.TF1m, 40, 0)
+	// Same limit price, opposite sides → one live-edge cell with ◆.
+	opts := ChartOpts{
+		Orders: []ChartOrder{
+			{Side: "buy", Price: 100},
+			{Side: "sell", Price: 100},
+		},
+	}
+	lines := renderCandles(snap, 40, 14, opts)
+	found := false
+	for _, line := range lines {
+		runes := []rune(stripANSI(line))
+		if len(runes) == 0 {
+			continue
+		}
+		if runes[len(runes)-1] == orderBothMark {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected mixed buy+sell at same price to collapse to %q on live edge, got:\n%s",
+			string(orderBothMark), stripANSI(strings.Join(lines, "\n")))
+	}
+	joined := stripANSI(strings.Join(lines, "\n"))
+	if strings.ContainsRune(joined, orderBuyMark) || strings.ContainsRune(joined, orderSellMark) {
+		t.Fatalf("collapsed row should use only %q, not buy/sell alone; got %q",
+			string(orderBothMark), truncate(joined, 120))
+	}
+}
+
+// TestOrderMarkerRowPlacement pins markers to the expected price rows for a
+// known flat tape and explicit order prices.
+func TestOrderMarkerRowPlacement(t *testing.T) {
+	const w, h = 20, 11
+	agg := bars.NewAggregator(3, 3)
+	base := time.Date(2026, 7, 17, 15, 0, 0, 0, time.UTC)
+	// Flat OHLC at 100 so the scale is deterministic after min>=max → span 1.
+	for i := 0; i < 10; i++ {
+		agg.OnTrade("AAPL", 100, 10, base.Add(time.Duration(i)*time.Minute))
+	}
+	snap := agg.Snapshot(bars.TF1m, 20, 0)
+	// Sell above mid, buy below mid — both within the expand window.
+	opts := ChartOpts{
+		Orders: []ChartOrder{
+			{Side: "sell", Price: 100.5},
+			{Side: "buy", Price: 99.5},
+		},
+	}
+	min, max, ok := priceRange(snap, opts)
+	if !ok {
+		t.Fatal("expected ok range")
+	}
+	// Same mapping as renderCandles yOfCell.
+	yOf := func(p float64) int {
+		y := int(math.Round((max - p) / (max - min) * float64(h-1)))
+		if y < 0 {
+			y = 0
+		}
+		if y > h-1 {
+			y = h - 1
+		}
+		return y
+	}
+	wantSellY, wantBuyY := yOf(100.5), yOf(99.5)
+	if wantSellY >= wantBuyY {
+		t.Fatalf("sell@100.5 should map above buy@99.5: sellY=%d buyY=%d (min=%v max=%v)",
+			wantSellY, wantBuyY, min, max)
+	}
+	lines := renderCandles(snap, w, h, opts)
+	if len(lines) != h {
+		t.Fatalf("want %d lines, got %d", h, len(lines))
+	}
+	sellPlain := stripANSI(lines[wantSellY])
+	buyPlain := stripANSI(lines[wantBuyY])
+	sellRunes := []rune(sellPlain)
+	buyRunes := []rune(buyPlain)
+	if len(sellRunes) == 0 || sellRunes[len(sellRunes)-1] != orderSellMark {
+		t.Fatalf("row %d should end with sell marker, got %q", wantSellY, sellPlain)
+	}
+	if len(buyRunes) == 0 || buyRunes[len(buyRunes)-1] != orderBuyMark {
+		t.Fatalf("row %d should end with buy marker, got %q", wantBuyY, buyPlain)
+	}
+}
+
+// TestOrderMarkerWinsOverCandle ensures setMarker clears braille so the
+// buy/sell glyph is visible on the live edge.
+func TestOrderMarkerWinsOverCandle(t *testing.T) {
+	g := newGrid(4, 3)
+	for x := 0; x < 4; x++ {
+		g.setCandle(x, 1, '█', colUp)
+		g.setIndDot(x*2, 4+1, colEMA) // braille in row 1
+	}
+	g.setMarker(3, 1, orderBuyMark, colUp)
+	lines := g.render()
+	plain := stripANSI(lines[1])
+	runes := []rune(plain)
+	if len(runes) < 4 || runes[3] != orderBuyMark {
+		t.Fatalf("live-edge cell should be buy marker, got %q", plain)
+	}
+	if containsBraille(string(runes[3])) {
+		t.Fatalf("marker must clear indicator braille, got %q", plain)
+	}
+}
+
+// TestPriceRangeIncludesOrders expands for nearby limits but not far ones.
+func TestPriceRangeIncludesOrders(t *testing.T) {
+	agg := bars.NewAggregator(3, 3)
+	base := time.Date(2026, 7, 17, 15, 0, 0, 0, time.UTC)
+	for i := 0; i < 10; i++ {
+		agg.OnTrade("AAPL", 100, 10, base.Add(time.Duration(i)*time.Minute))
+	}
+	snap := agg.Snapshot(bars.TF1m, 20, 0)
+
+	// Nearby orders (within orderScaleExpand× bar span) pull the axis.
+	near := ChartOpts{Orders: []ChartOrder{{Side: "buy", Price: 99.5}, {Side: "sell", Price: 100.5}}}
+	min, max, ok := priceRange(snap, near)
+	if !ok {
+		t.Fatal("expected ok range")
+	}
+	if min > 99.5 {
+		t.Fatalf("range should include nearby buy at 99.5: min=%v", min)
+	}
+	if max < 100.5 {
+		t.Fatalf("range should include nearby sell at 100.5: max=%v", max)
+	}
+
+	// Far GTC limits must not squash the scale to include 50/150.
+	far := ChartOpts{Orders: []ChartOrder{{Side: "buy", Price: 50}, {Side: "sell", Price: 150}}}
+	minFar, maxFar, ok := priceRange(snap, far)
+	if !ok {
+		t.Fatal("expected ok range for far orders")
+	}
+	if minFar <= 50 {
+		t.Fatalf("far buy at 50 must not fully expand scale: min=%v", minFar)
+	}
+	if maxFar >= 150 {
+		t.Fatalf("far sell at 150 must not fully expand scale: max=%v", maxFar)
+	}
+	// Invalid prices must not affect the axis either.
+	bad := ChartOpts{Orders: []ChartOrder{
+		{Side: "buy", Price: 0},
+		{Side: "sell", Price: math.Inf(1)},
+		{Side: "buy", Price: math.NaN()},
+	}}
+	minBad, maxBad, ok := priceRange(snap, bad)
+	if !ok {
+		t.Fatal("expected ok range with invalid orders")
+	}
+	baseMin, baseMax, _ := priceRange(snap, ChartOpts{})
+	if minBad != baseMin || maxBad != baseMax {
+		t.Fatalf("invalid order prices must not change range: got [%v,%v] want [%v,%v]",
+			minBad, maxBad, baseMin, baseMax)
+	}
+}
+
+// TestPaintOrderMarkersSkipsInvalidY ensures a bad yOfCell cannot panic
+// via the empty-cell probe.
+func TestPaintOrderMarkersSkipsInvalidY(t *testing.T) {
+	g := newGrid(8, 4)
+	// Map everything off-grid; must no-op without panic.
+	paintOrderMarkers(g, []ChartOrder{{Side: "buy", Price: 100}}, func(float64) int { return -1 }, 8)
+	paintOrderMarkers(g, []ChartOrder{{Side: "sell", Price: 100}}, func(float64) int { return 99 }, 8)
+	// Valid row still paints.
+	paintOrderMarkers(g, []ChartOrder{{Side: "buy", Price: 100}}, func(float64) int { return 2 }, 8)
+	if g.ch[g.idx(7, 2)] != orderBuyMark {
+		t.Fatalf("expected buy mark at live edge row 2, got %q", string(g.ch[g.idx(7, 2)]))
 	}
 }
 

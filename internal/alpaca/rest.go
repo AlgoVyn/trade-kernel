@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,25 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrResponseTruncated is returned by REST methods when a response body
+// exceeded the per-call read cap (1 MB). Pagination keeps individual Alpaca
+// responses well under this; a truncation indicates an unexpectedly large
+// payload whose tail would otherwise be silently dropped and mis-decoded.
+var ErrResponseTruncated = errors.New("response body exceeded size limit")
+
+// readBounded reads up to maxBytes from r. If the body contains more than
+// maxBytes, it returns the bytes read so far and ErrResponseTruncated.
+func readBounded(r io.Reader, maxBytes int) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, int64(maxBytes)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxBytes {
+		return b[:maxBytes], ErrResponseTruncated
+	}
+	return b, nil
+}
 
 // REST is a client for the Alpaca trading and market-data REST APIs.
 // Trading and market-data use separate HTTP clients so order/account paths
@@ -109,7 +129,12 @@ func (c *REST) do(ctx context.Context, hc *http.Client, method, base, path strin
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// 1 MB cap per response — enough for any single Alpaca envelope we
+	// consume (positions/orders/bars pages are far smaller; pagination keeps
+	// individual calls bounded). Reading up to N+1 bytes lets us detect a
+	// truncation rather than silently chopping the tail, which would yield a
+	// misleading decode error or, worse, a partial parse.
+	data, err := readBounded(resp.Body, 1<<20)
 	if err != nil {
 		return fmt.Errorf("read %s %s: %w", method, path, err)
 	}
@@ -217,24 +242,30 @@ func (c *REST) CancelOrder(ctx context.Context, id string) error {
 // CancelSymbol cancels every open order for symbol. It fetches open orders
 // filtered by symbol and deletes them concurrently (bounded worker pool) so
 // panic/flatten paths with many resting child orders stay under timeout
-// without bursting unbounded DELETEs. Returns the first error encountered
-// (still attempts the rest so a single failure does not leave siblings open).
+// without bursting unbounded DELETEs.
+//
+// Returns the number of per-order DELETEs that failed (failures) and the
+// first error encountered (err). Every cancel is still attempted so a single
+// failure does not leave siblings open; failures>0 tells the operator (and
+// the panic path) that some orders may remain resting.
+//
 // Empty symbol is rejected so CancelSymbol never becomes account-wide cancel
 // (OpenOrders("") returns all open orders).
-func (c *REST) CancelSymbol(ctx context.Context, symbol string) error {
+func (c *REST) CancelSymbol(ctx context.Context, symbol string) (failures int, err error) {
 	if symbol == "" {
-		return fmt.Errorf("CancelSymbol: empty symbol")
+		return 0, fmt.Errorf("CancelSymbol: empty symbol")
 	}
 	ords, err := c.OpenOrders(ctx, symbol)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	const cancelWorkers = 8
 	var (
-		wg    sync.WaitGroup
-		mu    sync.Mutex
-		first error
-		sem   = make(chan struct{}, cancelWorkers)
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		first     error
+		failedIDs []string // local to this call; do not hoist to package scope
+		sem       = make(chan struct{}, cancelWorkers)
 	)
 	for _, o := range ords {
 		// Defense in depth: never cancel an order for a different symbol.
@@ -249,10 +280,14 @@ func (c *REST) CancelSymbol(ctx context.Context, symbol string) error {
 		select {
 		case <-ctx.Done():
 			wg.Wait()
-			if first != nil {
-				return first
+			mu.Lock()
+			n := len(failedIDs)
+			f := first
+			mu.Unlock()
+			if f != nil {
+				return n, f
 			}
-			return ctx.Err()
+			return n, ctx.Err()
 		case sem <- struct{}{}:
 		}
 		wg.Add(1)
@@ -261,6 +296,7 @@ func (c *REST) CancelSymbol(ctx context.Context, symbol string) error {
 			defer func() { <-sem }()
 			if err := c.CancelOrder(ctx, id); err != nil {
 				mu.Lock()
+				failedIDs = append(failedIDs, id)
 				if first == nil {
 					first = err
 				}
@@ -269,7 +305,11 @@ func (c *REST) CancelSymbol(ctx context.Context, symbol string) error {
 		}(id)
 	}
 	wg.Wait()
-	return first
+	mu.Lock()
+	n := len(failedIDs)
+	f := first
+	mu.Unlock()
+	return n, f
 }
 
 // Clock fetches /v2/clock.

@@ -71,10 +71,14 @@ type Model struct {
 	symbol string
 	tfs    []bars.TF
 	tfIdx  int
-	preset int
-	keyFor map[string]string // key string -> action
-	width  int
-	height int
+	// customName / customDur select a non-built-in chart resolution
+	// (e.g. 2m via config or :tf). Empty name means use tfs[tfIdx].
+	customName string
+	customDur  time.Duration
+	preset     int
+	keyFor     map[string]string // key string -> action
+	width      int
+	height     int
 
 	// panOffset is how many bars the chart view is shifted back from the
 	// live edge. 0 = live (forming bar at the right edge); >0 = viewing
@@ -123,10 +127,19 @@ func NewModel(d Deps) *Model {
 		}
 		m.keyFor[key] = action
 	}
-	if tf, ok := bars.ParseTF(d.Cfg.Chart.Timeframe); ok {
-		for i, t := range m.tfs {
-			if t == tf {
-				m.tfIdx = i
+	if spec, ok := bars.ParseChartTF(d.Cfg.Chart.Timeframe); ok {
+		if spec.IsCustom() {
+			m.customName = spec.Name
+			m.customDur = spec.Custom
+			if d.Agg != nil {
+				d.Agg.EnableCustom(spec.Custom, spec.Name)
+			}
+		} else {
+			for i, t := range m.tfs {
+				if t == spec.Builtin {
+					m.tfIdx = i
+					break
+				}
 			}
 		}
 	}
@@ -170,7 +183,62 @@ func (m *Model) tickInterval() time.Duration {
 	if m.d.Cfg != nil {
 		base = m.d.Cfg.Tick()
 	}
-	return TickFor(m.tfs[m.tfIdx], m.panOffset, m.sess, base)
+	return TickForDuration(m.chartBarDuration(), m.panOffset, m.sess, base)
+}
+
+// usingCustomTF reports whether the chart is on a non-built-in resolution.
+func (m *Model) usingCustomTF() bool {
+	return m.customName != "" && m.customDur > 0
+}
+
+// chartBarDuration is the active resolution length for tick heuristics.
+func (m *Model) chartBarDuration() time.Duration {
+	if m.usingCustomTF() {
+		return m.customDur
+	}
+	return m.tfs[m.tfIdx].Duration()
+}
+
+// chartTFName is the status-bar / ruler resolution label.
+func (m *Model) chartTFName() string {
+	if m.usingCustomTF() {
+		return m.customName
+	}
+	return m.tfs[m.tfIdx].String()
+}
+
+// chartSnapshot pulls bars for the active built-in or custom resolution.
+func (m *Model) chartSnapshot(n, offset int) bars.Snapshot {
+	if m.d.Agg == nil {
+		return bars.Snapshot{}
+	}
+	if m.usingCustomTF() {
+		return m.d.Agg.SnapshotCustom(n, offset)
+	}
+	return m.d.Agg.Snapshot(m.tfs[m.tfIdx], n, offset)
+}
+
+// chartHistoryDepth is pan-clamp depth for the active resolution.
+func (m *Model) chartHistoryDepth() int {
+	if m.d.Agg == nil {
+		return 0
+	}
+	if m.usingCustomTF() {
+		return m.d.Agg.HistoryDepthCustom()
+	}
+	return m.d.Agg.HistoryDepth(m.tfs[m.tfIdx])
+}
+
+// clearCustomTF leaves a custom resolution and disables the aggregator series.
+func (m *Model) clearCustomTF() {
+	if !m.usingCustomTF() {
+		return
+	}
+	m.customName = ""
+	m.customDur = 0
+	if m.d.Agg != nil {
+		m.d.Agg.ClearCustom()
+	}
 }
 
 // TickFor chooses a render interval from TF, pan, session, and configured base.
@@ -181,6 +249,11 @@ func (m *Model) tickInterval() time.Duration {
 //	high TFs (1h/1d), pan, closed: max(base, 100ms) — slower redraw is fine.
 //	mid TFs (1m etc.): base unchanged.
 func TickFor(tf bars.TF, panOffset int, sess session.Session, base time.Duration) time.Duration {
+	return TickForDuration(tf.Duration(), panOffset, sess, base)
+}
+
+// TickForDuration is the duration-based form of TickFor (custom TFs use this).
+func TickForDuration(barLen time.Duration, panOffset int, sess session.Session, base time.Duration) time.Duration {
 	if base <= 0 {
 		base = 50 * time.Millisecond
 	}
@@ -191,14 +264,14 @@ func TickFor(tf bars.TF, panOffset int, sess session.Session, base time.Duration
 		}
 		return base
 	}
-	switch tf {
-	case bars.TF1s, bars.TF5s, bars.TF15s:
+	switch {
+	case barLen > 0 && barLen < time.Minute:
 		// Speed up from a slower base (50→33); keep aggressive configs as-is.
 		if base > 33*time.Millisecond {
 			return 33 * time.Millisecond
 		}
 		return base
-	case bars.TF1h, bars.TF1d:
+	case barLen >= time.Hour:
 		if base < 100*time.Millisecond {
 			return 100 * time.Millisecond
 		}
@@ -347,10 +420,22 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cmdBuf = ""
 		return m, nil
 	case "cycle_tf":
+		// Leaving a custom TF returns to the last built-in (tfIdx unchanged).
+		// A second Tab then advances the built-in cycle.
+		if m.usingCustomTF() {
+			m.clearCustomTF()
+			m.panOffset = 0
+			return m, nil
+		}
 		m.tfIdx = (m.tfIdx + 1) % len(m.tfs)
 		m.panOffset = 0
 		return m, nil
 	case "cycle_tf_back":
+		if m.usingCustomTF() {
+			m.clearCustomTF()
+			m.panOffset = 0
+			return m, nil
+		}
 		m.tfIdx = (m.tfIdx - 1 + len(m.tfs)) % len(m.tfs)
 		m.panOffset = 0
 		return m, nil
@@ -413,7 +498,7 @@ func (m *Model) chartWidth() int {
 // bars (←), dir > 0 pans forward toward live (→). Each press jumps a
 // quarter of the chart width so scrolling feels responsive.
 func (m *Model) pan(dir int) {
-	depth := m.d.Agg.HistoryDepth(m.tfs[m.tfIdx])
+	depth := m.chartHistoryDepth()
 	if depth <= 0 {
 		return
 	}
@@ -457,6 +542,14 @@ func (m *Model) setStatus(s string, isErr bool) {
 // orderIntent runs risk checks and either confirms or submits.
 func (m *Model) orderIntent(side string, qty int, limit float64, skipRisk bool) tea.Cmd {
 	symbol := m.symbol
+	// Block new orders until the first REST reconcile lands so a failed
+	// startup snapshot can't let the operator trade against a stale/empty
+	// view. Flatten and panic bypass this (see flattenIntent / panicIntent):
+	// they read PositionQty live and fall back to DELETE /v2/positions.
+	if m.d.Store != nil && !m.d.Store.Reconciled() {
+		m.setStatus("reconcile pending — order blocked (flatten/panic still work)", true)
+		return nil
+	}
 	if !skipRisk {
 		if err := m.d.Risk.Check(symbol, side, qty); err != nil {
 			m.setStatus(err.Error(), true)
@@ -600,7 +693,19 @@ func (m *Model) cancelIntent() tea.Cmd {
 	p := &pendingAction{
 		label: "CANCEL " + symbol,
 		run: func(ctx context.Context) (alpaca.Order, error) {
-			return alpaca.Order{}, m.d.Exec.CancelSymbol(ctx, symbol)
+			failures, err := m.d.Exec.CancelSymbol(ctx, symbol)
+			if err != nil {
+				if failures > 0 {
+					return alpaca.Order{}, fmt.Errorf("%w (%d cancel(s) still failed)", err, failures)
+				}
+				return alpaca.Order{}, err
+			}
+			if failures > 0 {
+				// All attempted, but some DELETEs failed — surface as an error
+				// so the operator knows siblings may still be resting.
+				return alpaca.Order{}, fmt.Errorf("%d cancel(s) failed (orders may still be open)", failures)
+			}
+			return alpaca.Order{}, nil
 		},
 	}
 	return m.execAsync(p)
@@ -639,18 +744,21 @@ func (m *Model) panicIntent() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		cancelErr := m.d.Exec.CancelSymbol(ctx, symbol)
+		cancelFailures, cancelErr := m.d.Exec.CancelSymbol(ctx, symbol)
 		qty := m.d.Store.PositionQty(symbol)
 		otherOpen := countOtherOpenSymbols(m.d.Store, symbol)
 		otherNote := ""
 		if otherOpen > 0 {
 			otherNote = fmt.Sprintf("; %d other symbol(s) still open — :sym then X", otherOpen)
 		}
+		cancelNote := ""
+		if cancelFailures > 0 {
+			cancelNote = fmt.Sprintf("; %d cancel(s) failed (orders may be open)", cancelFailures)
+		} else if cancelErr != nil {
+			cancelNote = "; cancel err: " + cancelErr.Error()
+		}
 		if qty == 0 {
-			detail := "cancelled " + symbol + " orders; already flat" + otherNote
-			if cancelErr != nil {
-				detail += "; cancel err: " + cancelErr.Error()
-			}
+			detail := "cancelled " + symbol + " orders; already flat" + otherNote + cancelNote
 			return orderResultMsg{
 				label: "PANIC", detail: detail,
 				latency: time.Since(start),
@@ -667,10 +775,7 @@ func (m *Model) panicIntent() tea.Cmd {
 		if id == "" {
 			id = "done"
 		}
-		detail := "flatten " + symbol + " " + id + otherNote
-		if cancelErr != nil {
-			detail += "; cancel err: " + cancelErr.Error()
-		}
+		detail := "flatten " + symbol + " " + id + otherNote + cancelNote
 		return orderResultMsg{
 			label: "PANIC", detail: detail,
 			latency: time.Since(start),
@@ -724,17 +829,28 @@ func (m *Model) runCommand(input string) tea.Cmd {
 			return symbolSwitchedMsg{symbol: c.Symbol, err: err}
 		}
 	case cmdline.KindTF:
-		tf, ok := bars.ParseTF(c.TF)
+		spec, ok := bars.ParseChartTF(c.TF)
 		if !ok {
-			m.setStatus("unknown timeframe "+c.TF, true)
+			m.setStatus("unknown timeframe "+c.TF+" (try 1m, 5m, 2m, 30s, 1h, 1d)", true)
 			return nil
 		}
-		for i, t := range m.tfs {
-			if t == tf {
-				m.tfIdx = i
+		if spec.IsCustom() {
+			m.customName = spec.Name
+			m.customDur = spec.Custom
+			if m.d.Agg != nil {
+				m.d.Agg.EnableCustom(spec.Custom, spec.Name)
+			}
+		} else {
+			m.clearCustomTF()
+			for i, t := range m.tfs {
+				if t == spec.Builtin {
+					m.tfIdx = i
+					break
+				}
 			}
 		}
 		m.panOffset = 0
+		m.setStatus("timeframe "+spec.Name, false)
 		return nil
 	case cmdline.KindPreset:
 		if c.Preset < 1 || c.Preset > len(m.d.Cfg.SizePresets) {
@@ -773,7 +889,7 @@ func (m *Model) runCommand(input string) tea.Cmd {
 		m.done = true
 		return nil
 	case cmdline.KindHelp:
-		m.setStatus("B/S buy/sell A/D add/reduce F flatten C cancel(active) X panic(active only) 1-9 preset :lock/:unlock : cmd ←/→ pan tab/shift-tab tf i q", false)
+		m.setStatus("B/S buy/sell A/D add/reduce F flatten C cancel(active) X panic(active only) 1-9 preset :tf 1m|2m|30s… tab cycle ←/→ pan i ind :lock/:unlock q", false)
 		return nil
 	}
 	return nil
@@ -838,13 +954,18 @@ func (m *Model) View() string {
 		candleH = 1
 	}
 
+	var openOrders []alpaca.Order
+	if m.d.Store != nil {
+		openOrders = m.d.Store.OpenOrders()
+	}
 	opts := ChartOpts{
 		ShowEMA: m.showEMA, ShowEMA2: m.showEMA2, ShowVWAP: m.showVWAP,
 		SessionShading: m.shading,
+		Orders:         chartOrdersFor(m.symbol, openOrders),
 	}
 	// Request only as many bars as fit at barStride spacing; the renderers
 	// still paint into the full plotW-cell canvas with empty spacer columns.
-	snap := m.d.Agg.Snapshot(m.tfs[m.tfIdx], maxBars(plotW), m.panOffset)
+	snap := m.chartSnapshot(maxBars(plotW), m.panOffset)
 	chartLines := renderCandles(snap, plotW, candleH, opts)
 
 	// Join each candle row with its matching price-axis label.
@@ -860,8 +981,13 @@ func (m *Model) View() string {
 	}
 
 	// Time ruler + volume span the plot width; pad under the price axis.
+	// Custom TFs use intraday label format (only built-in 1d is daily).
+	rulerTF := bars.TF1m
+	if !m.usingCustomTF() {
+		rulerTF = m.tfs[m.tfIdx]
+	}
 	axisPad := strings.Repeat(" ", axisW)
-	rulerLine := renderTimeRuler(snap, plotW, m.tfs[m.tfIdx]) + axisPad
+	rulerLine := renderTimeRuler(snap, plotW, rulerTF) + axisPad
 	volLines := renderVolume(snap, plotW, volH, m.shading)
 	for i := range volLines {
 		volLines[i] = volLines[i] + axisPad
@@ -956,8 +1082,8 @@ func (m *Model) renderStatusBar(chartSnap bars.Snapshot) string {
 		var edge bars.Snapshot
 		if m.panOffset == 0 {
 			edge = chartSnap
-		} else if m.d.Agg != nil {
-			edge = m.d.Agg.Snapshot(m.tfs[m.tfIdx], 1, 0)
+		} else {
+			edge = m.chartSnapshot(1, 0)
 		}
 		if len(edge.Bars) > 0 {
 			b := edge.Bars[len(edge.Bars)-1]
@@ -1002,8 +1128,8 @@ func (m *Model) renderStatusBar(chartSnap bars.Snapshot) string {
 		chip("vwap", m.showVWAP) + " " +
 		chip("sh", m.shading)
 
-	// Timeframe.
-	tfSeg := stTF.Render(m.tfs[m.tfIdx].String())
+	// Timeframe (built-in or custom, e.g. 2m).
+	tfSeg := stTF.Render(m.chartTFName())
 
 	// Latency.
 	latSeg := ""
@@ -1014,8 +1140,11 @@ func (m *Model) renderStatusBar(chartSnap bars.Snapshot) string {
 		}
 	}
 
-	// Alerts: lock / history pan / stale feed.
+	// Alerts: unreconciled / lock / history pan / stale feed.
 	alerts := ""
+	if m.d.Store != nil && !m.d.Store.Reconciled() {
+		alerts += stLocked.Render(" UNRECONCILED: order entry blocked ")
+	}
 	if locked, reason := m.d.Risk.Locked(); locked {
 		alerts += stLocked.Render(" LOCKED: " + reason + " ")
 	}
@@ -1117,6 +1246,9 @@ func (m *Model) infoBarRows() int {
 
 // openOrderCount returns how many cached open orders belong to symbol.
 func (m *Model) openOrderCount(symbol string) int {
+	if m.d.Store == nil {
+		return 0
+	}
 	n := 0
 	for _, o := range m.d.Store.OpenOrders() {
 		if o.Symbol == symbol {
@@ -1124,6 +1256,51 @@ func (m *Model) openOrderCount(symbol string) int {
 		}
 	}
 	return n
+}
+
+// chartOrdersFor converts open broker orders for symbol into candle-pane
+// markers. Limits plot at limit_price; stops at stop_price; stop_limit plots
+// both trigger and limit when present (two markers). Market/unpriced skipped.
+func chartOrdersFor(symbol string, orders []alpaca.Order) []ChartOrder {
+	var out []ChartOrder
+	for _, o := range orders {
+		if o.Symbol != symbol {
+			continue
+		}
+		for _, px := range chartOrderPrices(o) {
+			out = append(out, ChartOrder{Side: o.Side, Price: px})
+		}
+	}
+	return out
+}
+
+// chartOrderPrices returns chart-visible price levels for a working order.
+// stop_limit yields stop then limit when both are valid and distinct.
+func chartOrderPrices(o alpaca.Order) []float64 {
+	switch strings.ToLower(o.Type) {
+	case "stop":
+		if px := float64(o.StopPrice); validOrderPrice(px) {
+			return []float64{px}
+		}
+		return nil
+	case "stop_limit":
+		var out []float64
+		if px := float64(o.StopPrice); validOrderPrice(px) {
+			out = append(out, px)
+		}
+		if px := float64(o.LimitPrice); validOrderPrice(px) {
+			if len(out) == 0 || out[0] != px {
+				out = append(out, px)
+			}
+		}
+		return out
+	default:
+		// limit, and any other type that carries a resting limit price
+		if px := float64(o.LimitPrice); validOrderPrice(px) {
+			return []float64{px}
+		}
+		return nil
+	}
 }
 
 // renderInfoBar draws a width-aware strip under the status bar.
@@ -1244,9 +1421,11 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 
 	// --- Orders: active symbol only (trading focus) ---
 	var activeOrds []alpaca.Order
-	for _, o := range m.d.Store.OpenOrders() {
-		if o.Symbol == m.symbol {
-			activeOrds = append(activeOrds, o)
+	if m.d.Store != nil {
+		for _, o := range m.d.Store.OpenOrders() {
+			if o.Symbol == m.symbol {
+				activeOrds = append(activeOrds, o)
+			}
 		}
 	}
 	formatOrd := func(o alpaca.Order) string {
@@ -1261,8 +1440,20 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 		if o.FilledQty > 0 {
 			s += muted.Render(fmt.Sprintf("(%.0f/%.0f)", o.FilledQty, o.Qty))
 		}
-		if o.Type == "limit" {
+		switch strings.ToLower(o.Type) {
+		case "limit":
 			s += muted.Render(fmt.Sprintf("@%.2f", o.LimitPrice))
+		case "stop":
+			if px := float64(o.StopPrice); validOrderPrice(px) {
+				s += muted.Render(fmt.Sprintf(" stop@%.2f", px))
+			}
+		case "stop_limit":
+			if sp := float64(o.StopPrice); validOrderPrice(sp) {
+				s += muted.Render(fmt.Sprintf(" stop@%.2f", sp))
+			}
+			if lp := float64(o.LimitPrice); validOrderPrice(lp) {
+				s += muted.Render(fmt.Sprintf(" lim@%.2f", lp))
+			}
 		}
 		return s
 	}

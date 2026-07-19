@@ -394,14 +394,14 @@ func backfill(ctx context.Context, rest *alpaca.REST, agg *bars.Aggregator, symb
 		log.Printf("backfill trades %s boats (overnight): %v", symbol, errBoats)
 	}
 	atr := alpaca.MergeTrades(sipTr, boatsTr)
-	if len(atr) > 0 {
-		replay := make([]bars.TradeReplay, len(atr))
-		for i, tr := range atr {
-			replay[i] = bars.TradeReplay{
-				Price: float64(tr.Price), Size: float64(tr.Size), Timestamp: tr.Timestamp,
-			}
+	// Always ReplayTrades (even empty): resets 1s/5s/15s and rebuilds any
+	// 1s-sourced custom TF so reconnect/symbol switch cannot keep stale rings.
+	replay := make([]bars.TradeReplay, len(atr))
+	for i, tr := range atr {
+		replay[i] = bars.TradeReplay{
+			Price: float64(tr.Price), Size: float64(tr.Size), Timestamp: tr.Timestamp,
 		}
-		agg.ReplayTrades(replay)
 	}
+	agg.ReplayTrades(replay)
 	return firstErr
 }

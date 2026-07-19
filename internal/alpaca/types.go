@@ -128,6 +128,7 @@ type Order struct {
 	Type           string    `json:"type"`
 	TimeInForce    string    `json:"time_in_force"`
 	LimitPrice     flexFloat `json:"limit_price"`
+	StopPrice      flexFloat `json:"stop_price"`
 	Status         string    `json:"status"`
 	SubmittedAt    time.Time `json:"submitted_at"`
 	FilledAt       time.Time `json:"filled_at"`

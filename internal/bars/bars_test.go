@@ -618,3 +618,323 @@ func mustET(t *testing.T) *time.Location {
 	}
 	return l
 }
+
+func TestParseChartTF(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		custom   bool
+		dur      time.Duration
+	}{
+		{"1m", "1m", false, time.Minute},
+		{"5m", "5m", false, 5 * time.Minute},
+		{"1s", "1s", false, time.Second},
+		{"1d", "1d", false, 24 * time.Hour},
+		{"2m", "2m", true, 2 * time.Minute},
+		{"30s", "30s", true, 30 * time.Second},
+		{"4h", "4h", true, 4 * time.Hour},
+		{"3m", "3m", true, 3 * time.Minute},
+		{" 2M ", "2m", true, 2 * time.Minute},
+		// Exact built-in duration collapses.
+		{"60s", "1m", false, time.Minute},
+		{"3600s", "1h", false, time.Hour},
+	}
+	for _, tc := range cases {
+		got, ok := ParseChartTF(tc.in)
+		if !ok {
+			t.Fatalf("ParseChartTF(%q) failed", tc.in)
+		}
+		if got.Name != tc.wantName {
+			t.Fatalf("%q: name=%q want %q", tc.in, got.Name, tc.wantName)
+		}
+		if got.IsCustom() != tc.custom {
+			t.Fatalf("%q: custom=%v want %v", tc.in, got.IsCustom(), tc.custom)
+		}
+		if got.Duration() != tc.dur {
+			t.Fatalf("%q: dur=%v want %v", tc.in, got.Duration(), tc.dur)
+		}
+	}
+	for _, bad := range []string{"", "0m", "m", "2x", "999d", "-1m", "abc"} {
+		if _, ok := ParseChartTF(bad); ok {
+			t.Fatalf("ParseChartTF(%q) should fail", bad)
+		}
+	}
+}
+
+func TestCustomTF2mAggregation(t *testing.T) {
+	a := NewAggregator(2, 3)
+	// Six 1-minute prints → three 2m buckets when custom is enabled after feed,
+	// or live-fed with EnableCustom first.
+	a.EnableCustom(2*time.Minute, "2m")
+	feed(a, []tick{
+		{0, 100, 10}, {30, 101, 10}, // 14:00–14:01 → first 2m bar (14:00)
+		{60, 102, 10}, {90, 103, 10}, // still same 2m bucket (14:00)
+		{120, 104, 10},               // new 2m bucket 14:02
+	})
+	snap := a.SnapshotCustom(10, 0)
+	if len(snap.Bars) < 2 {
+		t.Fatalf("want ≥2 custom bars, got %d", len(snap.Bars))
+	}
+	b0 := snap.Bars[0]
+	if !b0.Start.Equal(base) {
+		t.Fatalf("first 2m start = %v, want %v", b0.Start, base)
+	}
+	if b0.Open != 100 || b0.High != 103 || b0.Low != 100 || b0.Close != 103 {
+		t.Fatalf("first 2m bar OHLC = O%v H%v L%v C%v", b0.Open, b0.High, b0.Low, b0.Close)
+	}
+	if b0.Volume != 40 {
+		t.Fatalf("first 2m volume = %v, want 40", b0.Volume)
+	}
+	// Forming second bar.
+	b1 := snap.Bars[len(snap.Bars)-1]
+	if !b1.Start.Equal(base.Add(2 * time.Minute)) {
+		t.Fatalf("forming 2m start = %v", b1.Start)
+	}
+	if b1.Close != 104 || b1.Volume != 10 {
+		t.Fatalf("forming 2m = %+v", b1)
+	}
+}
+
+func TestCustomTFResampleFrom1mLoad(t *testing.T) {
+	a := NewAggregator(2, 3)
+	hist := []Bar{
+		{Start: base, Open: 100, High: 101, Low: 99, Close: 100, Volume: 10},
+		{Start: base.Add(time.Minute), Open: 100, High: 102, Low: 100, Close: 101, Volume: 20},
+		{Start: base.Add(2 * time.Minute), Open: 101, High: 103, Low: 101, Close: 102, Volume: 15},
+		{Start: base.Add(3 * time.Minute), Open: 102, High: 104, Low: 102, Close: 103, Volume: 25},
+	}
+	// Load 1m first, then enable custom → rebuild from 1m.
+	a.Load(TF1m, hist)
+	a.EnableCustom(2*time.Minute, "2m")
+	snap := a.SnapshotCustom(10, 0)
+	// 4×1m → 2×2m closed if last is not "current" forming; times are historical
+	// so depending on wall clock vs base, last may be closed. Just check OHLC merge.
+	if len(snap.Bars) < 2 {
+		t.Fatalf("want ≥2 bars after resample, got %d %+v", len(snap.Bars), snap.Bars)
+	}
+	// First 2m: minutes 0–1
+	b0 := snap.Bars[0]
+	if b0.Open != 100 || b0.High != 102 || b0.Low != 99 || b0.Close != 101 || b0.Volume != 30 {
+		t.Fatalf("resampled first 2m = %+v", b0)
+	}
+	// Second 2m: minutes 2–3
+	b1 := snap.Bars[1]
+	if b1.Open != 101 || b1.High != 104 || b1.Low != 101 || b1.Close != 103 || b1.Volume != 40 {
+		t.Fatalf("resampled second 2m = %+v", b1)
+	}
+	// Load again should rebuild custom.
+	a.Load(TF1m, hist[:2])
+	snap2 := a.SnapshotCustom(10, 0)
+	if len(snap2.Bars) != 1 {
+		t.Fatalf("after shorter load want 1 custom bar, got %d", len(snap2.Bars))
+	}
+}
+
+func TestClearCustom(t *testing.T) {
+	a := NewAggregator(2, 3)
+	a.EnableCustom(2*time.Minute, "2m")
+	if _, ok := a.CustomActive(); !ok {
+		t.Fatal("expected custom active")
+	}
+	a.ClearCustom()
+	if _, ok := a.CustomActive(); ok {
+		t.Fatal("expected custom cleared")
+	}
+	if len(a.SnapshotCustom(5, 0).Bars) != 0 {
+		t.Fatal("snapshot after clear should be empty")
+	}
+}
+
+func TestSnapshotCustomRejectsNonPositiveN(t *testing.T) {
+	a := NewAggregator(2, 3)
+	a.EnableCustom(2*time.Minute, "2m")
+	// Forming bar open so the unsafe path would write at count-1.
+	feed(a, []tick{{0, 100, 10}})
+	for _, n := range []int{0, -1} {
+		snap := a.SnapshotCustom(n, 0)
+		if len(snap.Bars) != 0 {
+			t.Fatalf("n=%d: want empty snapshot, got %d bars", n, len(snap.Bars))
+		}
+	}
+}
+
+func TestCustomSourceTF(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want TF
+	}{
+		{30 * time.Second, TF1s},
+		{45 * time.Second, TF1s},
+		{90 * time.Second, TF1s},  // ≥1m but not multiple of 1m
+		{150 * time.Second, TF1s},
+		{2 * time.Minute, TF1m},
+		{3 * time.Minute, TF1m},
+		{4 * time.Hour, TF1m},
+		{time.Minute, TF1m},
+	}
+	for _, tc := range cases {
+		if got := customSourceTF(tc.d); got != tc.want {
+			t.Fatalf("customSourceTF(%v)=%v want %v", tc.d, got, tc.want)
+		}
+	}
+}
+
+func TestCustomTF90sResampleFrom1s(t *testing.T) {
+	a := NewAggregator(4, 3)
+	// 180 seconds of 1s-equivalent prints via ReplayTrades → two 90s buckets.
+	var trades []TradeReplay
+	for i := 0; i < 180; i++ {
+		trades = append(trades, TradeReplay{
+			Price:     100 + float64(i%3),
+			Size:      1,
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+	a.EnableCustom(90*time.Second, "90s")
+	a.ReplayTrades(trades)
+	snap := a.SnapshotCustom(10, 0)
+	if len(snap.Bars) < 2 {
+		t.Fatalf("want ≥2 90s bars from 1s rebuild, got %d %+v", len(snap.Bars), snap.Bars)
+	}
+	if !snap.Bars[0].Start.Equal(base) {
+		t.Fatalf("first 90s start = %v, want %v", snap.Bars[0].Start, base)
+	}
+	// Second bucket starts at base+90s.
+	if !snap.Bars[1].Start.Equal(base.Add(90 * time.Second)) {
+		t.Fatalf("second 90s start = %v", snap.Bars[1].Start)
+	}
+	// Loading 1m history must not overwrite 90s with a wrong 1m resample.
+	// Seed a trivial 1m bar then Load — custom source is TF1s so rebuild
+	// should not run from this Load path; custom series stays from 1s.
+	before := len(a.SnapshotCustom(10, 0).Bars)
+	a.Load(TF1m, []Bar{
+		{Start: base, Open: 1, High: 2, Low: 1, Close: 2, Volume: 99},
+	})
+	after := a.SnapshotCustom(10, 0)
+	if len(after.Bars) != before {
+		t.Fatalf("Load(TF1m) should not rebuild 90s custom: before=%d after=%d", before, len(after.Bars))
+	}
+}
+
+func TestResampleTo(t *testing.T) {
+	src := []Bar{
+		{Start: base, Open: 1, High: 2, Low: 1, Close: 2, Volume: 1, VWAP: 1.5},
+		{Start: base.Add(time.Minute), Open: 2, High: 3, Low: 2, Close: 3, Volume: 2, VWAP: 2.5},
+		{Start: base.Add(2 * time.Minute), Open: 3, High: 4, Low: 3, Close: 4, Volume: 3, VWAP: 3.5},
+	}
+	got := resampleTo(src, 2*time.Minute)
+	if len(got) != 2 {
+		t.Fatalf("len=%d want 2", len(got))
+	}
+	if got[0].Volume != 3 || got[1].Volume != 3 {
+		t.Fatalf("volumes = %v %v", got[0].Volume, got[1].Volume)
+	}
+	// First 2m: vol-weighted VWAP of 1.5@1 + 2.5@2 = (1.5+5)/3 = 2.166...
+	wantVWAP0 := (1.5*1 + 2.5*2) / 3
+	if math.Abs(got[0].VWAP-wantVWAP0) > 1e-9 {
+		t.Fatalf("got[0].VWAP=%v want %v", got[0].VWAP, wantVWAP0)
+	}
+	if math.Abs(got[1].VWAP-3.5) > 1e-9 {
+		t.Fatalf("got[1].VWAP=%v want 3.5", got[1].VWAP)
+	}
+}
+
+// TestReplayTradesResetsSubMinute ensures reconnect/replay cannot keep
+// prior-symbol 1s bars that would pollute 1s-sourced custom TFs.
+func TestReplayTradesResetsSubMinute(t *testing.T) {
+	a := NewAggregator(2, 3)
+	// Symbol A history via first replay.
+	a.ReplayTrades([]TradeReplay{
+		{Price: 100, Size: 1, Timestamp: base},
+		{Price: 101, Size: 1, Timestamp: base.Add(time.Second)},
+	})
+	if a.HistoryDepth(TF1s) == 0 {
+		t.Fatal("setup: expected 1s bars after first replay")
+	}
+	// Second replay for symbol B replaces, not appends.
+	a.ReplayTrades([]TradeReplay{
+		{Price: 200, Size: 1, Timestamp: base.Add(10 * time.Second)},
+		{Price: 201, Size: 1, Timestamp: base.Add(11 * time.Second)},
+	})
+	snap := a.Snapshot(TF1s, 100, 0)
+	if len(snap.Bars) == 0 {
+		t.Fatal("expected 1s bars after second replay")
+	}
+	for _, b := range snap.Bars {
+		if b.Close == 100 || b.Close == 101 {
+			t.Fatalf("stale symbol-A bar remained after replay: %+v", b)
+		}
+		if b.Close != 200 && b.Close != 201 {
+			t.Fatalf("unexpected bar after clean replay: %+v", b)
+		}
+	}
+}
+
+// TestCustom90sReplayClearsPriorSymbol rebuilds 90s custom from cleaned 1s
+// after a second ReplayTrades (symbol switch / reconnect path).
+func TestCustom90sReplayClearsPriorSymbol(t *testing.T) {
+	a := NewAggregator(4, 3)
+	a.EnableCustom(90*time.Second, "90s")
+	// Symbol A: 90s of prints at price ~10.
+	var aTrades []TradeReplay
+	for i := 0; i < 90; i++ {
+		aTrades = append(aTrades, TradeReplay{
+			Price: 10, Size: 1, Timestamp: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+	a.ReplayTrades(aTrades)
+	snapA := a.SnapshotCustom(10, 0)
+	if len(snapA.Bars) == 0 {
+		t.Fatal("setup: expected custom bars for symbol A")
+	}
+	// Symbol switch: ResetMarket + new replay (as main does).
+	a.ResetMarket()
+	var bTrades []TradeReplay
+	for i := 0; i < 90; i++ {
+		bTrades = append(bTrades, TradeReplay{
+			Price: 500, Size: 1, Timestamp: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+	a.ReplayTrades(bTrades)
+	snapB := a.SnapshotCustom(10, 0)
+	if len(snapB.Bars) == 0 {
+		t.Fatal("expected custom bars after symbol B replay")
+	}
+	for _, b := range snapB.Bars {
+		if b.Close == 10 || b.Open == 10 {
+			t.Fatalf("symbol-A custom bar remained after switch: %+v", b)
+		}
+		if b.Close != 500 {
+			t.Fatalf("unexpected custom bar after B replay: %+v", b)
+		}
+	}
+}
+
+// TestResetMarketClearsCustomBars keeps custom enabled but drops prior bars.
+func TestResetMarketClearsCustomBars(t *testing.T) {
+	a := NewAggregator(2, 3)
+	a.EnableCustom(2*time.Minute, "2m")
+	feed(a, []tick{{0, 100, 10}, {60, 101, 10}})
+	if len(a.SnapshotCustom(10, 0).Bars) == 0 {
+		t.Fatal("setup: expected custom bars")
+	}
+	a.ResetMarket()
+	if name, ok := a.CustomActive(); !ok || name != "2m" {
+		t.Fatalf("custom should stay active after ResetMarket, got %q ok=%v", name, ok)
+	}
+	if n := len(a.SnapshotCustom(10, 0).Bars); n != 0 {
+		t.Fatalf("custom bars after ResetMarket = %d, want 0", n)
+	}
+	if a.HistoryDepth(TF1s) != 0 {
+		t.Fatal("1s should be cleared by ResetMarket")
+	}
+}
+
+func TestParseDurationTokenRejectsOverflow(t *testing.T) {
+	// Pathological magnitudes must fail before Duration wrap.
+	for _, bad := range []string{"999999999h", "100000000s", "999999m", "99d"} {
+		if _, ok := ParseChartTF(bad); ok {
+			t.Fatalf("ParseChartTF(%q) should fail", bad)
+		}
+	}
+}

@@ -4,7 +4,10 @@
 package bars
 
 import (
+	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,7 +15,7 @@ import (
 	"trade-kernel/internal/session"
 )
 
-// TF is a bar resolution.
+// TF is a built-in bar resolution.
 type TF int
 
 const (
@@ -36,21 +39,127 @@ var tfDur = [numTF]time.Duration{
 var tfName = [numTF]string{"1s", "5s", "15s", "1m", "5m", "15m", "1h", "1d"}
 
 // String returns the short name ("1m", "1h", ...).
-func (t TF) String() string { return tfName[t] }
+func (t TF) String() string {
+	if t < 0 || int(t) >= int(numTF) {
+		return "?"
+	}
+	return tfName[t]
+}
+
+// Duration returns the bar length for a built-in TF. Daily is 24h for
+// heuristics (actual daily buckets anchor at 20:00 ET).
+func (t TF) Duration() time.Duration {
+	if t < 0 || int(t) >= int(numTF) {
+		return time.Minute
+	}
+	return tfDur[t]
+}
 
 // All lists every timeframe in increasing order.
 func All() []TF {
 	return []TF{TF1s, TF5s, TF15s, TF1m, TF5m, TF15m, TF1h, TF1d}
 }
 
-// ParseTF converts "1s"/"5m"/"1h"/"1d" etc. to a TF.
+// ParseTF converts "1s"/"5m"/"1h"/"1d" etc. to a built-in TF.
 func ParseTF(s string) (TF, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
 	for i, n := range tfName {
 		if n == s {
 			return TF(i), true
 		}
 	}
 	return 0, false
+}
+
+// ChartTF is a chart resolution: either a built-in TF or a custom bar
+// duration (e.g. 2m, 30s, 4h) set via config or :tf.
+type ChartTF struct {
+	Name    string
+	Builtin TF            // valid when Custom == 0
+	Custom  time.Duration // non-zero for non-built-in durations
+}
+
+// IsCustom reports whether this is a non-built-in duration.
+func (c ChartTF) IsCustom() bool { return c.Custom > 0 }
+
+// String returns the short name ("2m", "1m", ...).
+func (c ChartTF) String() string { return c.Name }
+
+// Duration returns the bar length (24h for daily).
+func (c ChartTF) Duration() time.Duration {
+	if c.IsCustom() {
+		return c.Custom
+	}
+	return c.Builtin.Duration()
+}
+
+// customDurMin / customDurMax bound non-built-in chart resolutions.
+const (
+	customDurMin = time.Second
+	customDurMax = 24 * time.Hour
+)
+
+// ParseChartTF parses a chart resolution string.
+// Accepts built-ins (1s, 5s, 15s, 1m, 5m, 15m, 1h, 1d) and custom forms
+// like 2m, 3m, 10m, 30s, 4h. Durations that match a built-in map to it.
+// Custom durations must be in [1s, 24h].
+func ParseChartTF(s string) (ChartTF, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return ChartTF{}, false
+	}
+	if tf, ok := ParseTF(s); ok {
+		return ChartTF{Name: tf.String(), Builtin: tf}, true
+	}
+	d, name, ok := parseDurationToken(s)
+	if !ok {
+		return ChartTF{}, false
+	}
+	// Collapse to built-in when the duration matches exactly.
+	for tf := TF(0); tf < numTF; tf++ {
+		if tfDur[tf] == d {
+			return ChartTF{Name: tfName[tf], Builtin: tf}, true
+		}
+	}
+	if d < customDurMin || d > customDurMax {
+		return ChartTF{}, false
+	}
+	return ChartTF{Name: name, Custom: d}, true
+}
+
+// parseDurationToken parses "2m", "30s", "4h", "1d" → duration + canonical name.
+// Rejects magnitudes that would overflow time.Duration or exceed 24h after
+// unit conversion (bounds match customDurMax; ParseChartTF re-checks).
+func parseDurationToken(s string) (time.Duration, string, bool) {
+	if len(s) < 2 {
+		return 0, "", false
+	}
+	unit := s[len(s)-1]
+	numStr := s[:len(s)-1]
+	n, err := strconv.Atoi(numStr)
+	if err != nil || n <= 0 {
+		return 0, "", false
+	}
+	// Cap before multiply so multi-million tokens cannot wrap Duration.
+	var maxN int
+	var unitDur time.Duration
+	switch unit {
+	case 's':
+		maxN, unitDur = 86400, time.Second // 24h
+	case 'm':
+		maxN, unitDur = 1440, time.Minute // 24h
+	case 'h':
+		maxN, unitDur = 24, time.Hour
+	case 'd':
+		maxN, unitDur = 1, 24 * time.Hour
+	default:
+		return 0, "", false
+	}
+	if n > maxN {
+		return 0, "", false
+	}
+	d := time.Duration(n) * unitDur
+	return d, fmt.Sprintf("%d%c", n, unit), true
 }
 
 // ChartTFs are the resolutions selectable with Tab, in cycle order.
@@ -175,6 +284,12 @@ type Aggregator struct {
 	emaN   int
 	ema2N  int
 
+	// Optional custom chart resolution (e.g. 2m) — live-fed and rebuilt
+	// from the finest suitable built-in after Load / ReplayTrades.
+	customDur  time.Duration
+	customName string
+	custom     *series
+
 	vwap       indicators.VWAP // session/day-anchored, fed per trade
 	vwapAnchor string          // "session" (default) or "day"
 
@@ -244,6 +359,9 @@ func (a *Aggregator) OnTrade(symbol string, price, size float64, ts time.Time) {
 	for tf := TF(0); tf < numTF; tf++ {
 		a.aggregateInto(tf, price, size, ts)
 	}
+	if a.custom != nil && a.customDur > 0 {
+		a.aggregateIntoCustom(price, size, ts)
+	}
 }
 
 // ReplayTrades feeds a historical trade sequence into the sub-minute
@@ -251,17 +369,35 @@ func (a *Aggregator) OnTrade(symbol string, price, size float64, ts time.Time) {
 // trades endpoint, since the bars endpoint doesn't serve sub-minute
 // resolutions. Trades must be in ascending timestamp order.
 //
+// Sub-minute series are reset before replay so reconnect / symbol switch
+// cannot leave prior-symbol or already-live 1s bars in the ring (which would
+// pollute 1s-sourced custom TFs such as 30s/90s). Live prints that arrived
+// during the REST fetch and fall inside the replay window are re-derived
+// from the trade history; later prints resume via OnTrade.
+//
 // It deliberately does NOT touch the 1m+ TFs (already backfilled from the
 // bars endpoint) nor the session VWAP / last-trade cache (live-only
 // state) — replaying into those would double-count volume and overwrite
 // the live edge with stale prices.
+//
+// When a custom TF that resamples from 1s is active it is rebuilt from the
+// refreshed 1s series after replay (sub-minute and non–minute-aligned
+// durations like 90s).
 func (a *Aggregator) ReplayTrades(trades []TradeReplay) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Clean slate so rebuildCustomLocked sees only this batch (plus nothing
+	// if trades is empty — still clears stale sub-minute history).
+	for _, tf := range []TF{TF1s, TF5s, TF15s} {
+		a.resetSeriesLocked(a.series[tf])
+	}
 	for _, tr := range trades {
 		for _, tf := range []TF{TF1s, TF5s, TF15s} {
 			a.aggregateInto(tf, tr.Price, tr.Size, tr.Timestamp)
 		}
+	}
+	if a.custom != nil && a.customDur > 0 && customSourceTF(a.customDur) == TF1s {
+		a.rebuildCustomLocked()
 	}
 }
 
@@ -277,8 +413,22 @@ type TradeReplay struct {
 // aggregateInto folds one trade into a single timeframe. Caller holds the
 // mutex. Handles bucket rollover and late/out-of-order trades.
 func (a *Aggregator) aggregateInto(tf TF, price, size float64, ts time.Time) {
-	s := a.series[tf]
-	b := bucket(tf, ts)
+	a.foldTrade(a.series[tf], bucket(tf, ts), price, size, func(s *series) {
+		a.closeBar(tf, s)
+	})
+}
+
+// aggregateIntoCustom folds one trade into the active custom series.
+// Caller holds the mutex; a.custom must be non-nil.
+func (a *Aggregator) aggregateIntoCustom(price, size float64, ts time.Time) {
+	a.foldTrade(a.custom, bucketDur(a.customDur, ts), price, size, func(s *series) {
+		a.closeCustomBar(s)
+	})
+}
+
+// foldTrade is the shared bucket-rollover logic for built-in and custom series.
+// closeFn closes the current forming bar (built-in emits BarEvent; custom does not).
+func (a *Aggregator) foldTrade(s *series, b time.Time, price, size float64, closeFn func(*series)) {
 	switch {
 	case !s.open:
 		// If the newest closed bar is this same bucket (e.g. REST partial was
@@ -305,7 +455,7 @@ func (a *Aggregator) aggregateInto(tf TF, price, size float64, ts time.Time) {
 	case b.Equal(s.forming.Start):
 		s.forming.add(price, size)
 	case b.After(s.forming.Start):
-		a.closeBar(tf, s)
+		closeFn(s)
 		s.forming = newBar(b, price, size)
 		s.open = true
 	default:
@@ -344,6 +494,22 @@ func (a *Aggregator) closeBar(tf TF, s *series) {
 	default:
 	}
 	s.open = false
+}
+
+func (a *Aggregator) closeCustomBar(s *series) {
+	b := s.forming
+	emaV := s.ema.Update(b.Close)
+	ema2V := s.ema2.Update(b.Close)
+	s.ring.push(b, emaV, ema2V, a.vwap.Value())
+	s.open = false
+}
+
+// bucketDur truncates ts to a custom bar duration (UTC, same as intraday built-ins).
+func bucketDur(d time.Duration, ts time.Time) time.Time {
+	if d <= 0 {
+		return ts.UTC()
+	}
+	return ts.UTC().Truncate(d)
 }
 
 // OnQuote caches the latest NBBO.
@@ -385,13 +551,39 @@ func (a *Aggregator) ResetVWAP() {
 // ResetMarket clears the cached last trade and NBBO. Called on symbol
 // switch so the status bar and order builder don't price off the previous
 // symbol's quote until a new tick for the new symbol arrives.
+//
+// It also clears sub-minute rings and the custom series (keeping custom
+// duration/name) so live OnTrade during backfill cannot mix the previous
+// symbol into 1s-sourced custom charts. Minute+ series are replaced by
+// Load; custom rebuilds after Load(TF1m) or ReplayTrades as usual.
 func (a *Aggregator) ResetMarket() {
 	a.mu.Lock()
 	a.lastTradePrice = 0
 	a.lastTradeAt = time.Time{}
 	a.bid, a.ask = 0, 0
 	a.quoteAt = time.Time{}
+	for _, tf := range []TF{TF1s, TF5s, TF15s} {
+		a.resetSeriesLocked(a.series[tf])
+	}
+	if a.customDur > 0 {
+		// Keep EnableCustom active; empty series until source history rebuilds.
+		a.custom = &series{
+			ring: newRing(ringCap),
+			ema:  indicators.NewEMA(a.emaN),
+			ema2: indicators.NewEMA(a.ema2N),
+		}
+	}
 	a.mu.Unlock()
+}
+
+// resetSeriesLocked empties one series' ring, EMAs, and forming bar.
+// Caller holds mu.
+func (a *Aggregator) resetSeriesLocked(s *series) {
+	s.ring = newRing(ringCap)
+	s.ema = indicators.NewEMA(a.emaN)
+	s.ema2 = indicators.NewEMA(a.ema2N)
+	s.open = false
+	s.forming = Bar{}
 }
 
 // Load replaces one timeframe's history with backfilled bars (e.g. from
@@ -419,11 +611,7 @@ func (a *Aggregator) Load(tf TF, hist []Bar) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s := a.series[tf]
-	s.ring = newRing(ringCap)
-	s.ema = indicators.NewEMA(a.emaN)
-	s.ema2 = indicators.NewEMA(a.ema2N)
-	s.open = false
-	s.forming = Bar{}
+	a.resetSeriesLocked(s)
 
 	// Incomplete current-bucket bar from REST must stay forming so live
 	// trades extend it instead of creating a second candle for the same start.
@@ -489,6 +677,219 @@ func (a *Aggregator) Load(tf TF, hist []Bar) {
 	if tf == TF1m {
 		a.vwap = sessVWAP
 	}
+	// Custom charts that resample from 1m rebuild after each 1m load.
+	if tf == TF1m && a.custom != nil && a.customDur > 0 && customSourceTF(a.customDur) == TF1m {
+		a.rebuildCustomLocked()
+	}
+}
+
+// EnableCustom activates a non-built-in chart duration (e.g. 2m). History is
+// resampled from the finest suitable built-in series; subsequent OnTrade
+// calls feed the custom series live. Caller should have validated d via
+// ParseChartTF. No-op for non-positive d.
+func (a *Aggregator) EnableCustom(d time.Duration, name string) {
+	if d <= 0 {
+		return
+	}
+	if name == "" {
+		name = d.String()
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.customDur = d
+	a.customName = name
+	a.rebuildCustomLocked()
+}
+
+// ClearCustom disables the custom chart series (Tab cycle / built-in :tf).
+func (a *Aggregator) ClearCustom() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.customDur = 0
+	a.customName = ""
+	a.custom = nil
+}
+
+// CustomActive reports whether a custom TF is enabled and its display name.
+func (a *Aggregator) CustomActive() (name string, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.custom == nil || a.customDur <= 0 {
+		return "", false
+	}
+	return a.customName, true
+}
+
+// SnapshotCustom is Snapshot for the active custom series. Empty if none.
+func (a *Aggregator) SnapshotCustom(n, offset int) Snapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if n <= 0 {
+		return Snapshot{}
+	}
+	if a.custom == nil || a.customDur <= 0 {
+		return Snapshot{}
+	}
+	return a.snapshotSeriesLocked(a.custom, n, offset)
+}
+
+// HistoryDepthCustom returns closed-bar depth for the custom series (0 if none).
+func (a *Aggregator) HistoryDepthCustom() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.custom == nil {
+		return 0
+	}
+	return a.custom.ring.count
+}
+
+// customSourceTF picks the built-in series used to rebuild custom history.
+// Exact multiples of 1m use TF1m; everything else (sub-minute and odd
+// durations like 90s) needs second-level source bars.
+func customSourceTF(d time.Duration) TF {
+	if d >= time.Minute && d%time.Minute == 0 {
+		return TF1m
+	}
+	return TF1s
+}
+
+// rebuildCustomLocked resamples the custom series from 1s or 1m built-in
+// history (see customSourceTF). Caller holds mu; customDur must be set.
+func (a *Aggregator) rebuildCustomLocked() {
+	if a.customDur <= 0 {
+		a.custom = nil
+		return
+	}
+	srcTF := customSourceTF(a.customDur)
+	src := a.series[srcTF]
+	var srcBars []Bar
+	if src.ring.count > 0 {
+		srcBars = make([]Bar, 0, src.ring.count+1)
+		for i := 0; i < src.ring.count; i++ {
+			srcBars = append(srcBars, src.ring.bars[src.ring.at(i)])
+		}
+	}
+	if src.open {
+		srcBars = append(srcBars, src.forming)
+	}
+	hist := resampleTo(srcBars, a.customDur)
+	a.loadCustomLocked(hist)
+}
+
+// resampleTo merges finer OHLCV bars into coarser buckets of duration dur.
+// Per-bar VWAP is blended as volume-weighted average of barVWAPPrice (REST
+// vw when present, else typical price) so loadCustomLocked can use it.
+func resampleTo(src []Bar, dur time.Duration) []Bar {
+	if len(src) == 0 || dur <= 0 {
+		return nil
+	}
+	out := make([]Bar, 0, len(src))
+	var cur Bar
+	var have bool
+	var curBucket time.Time
+	var vwapPxVol, vwapVol float64 // Σ(price_i * vol_i), Σ(vol_i) for VWAP blend
+	finish := func() {
+		if vwapVol > 0 {
+			cur.VWAP = vwapPxVol / vwapVol
+		}
+		out = append(out, cur)
+	}
+	for _, b := range src {
+		bk := bucketDur(dur, b.Start)
+		if !have || !bk.Equal(curBucket) {
+			if have {
+				finish()
+			}
+			cur = Bar{
+				Start:  bk,
+				Open:   b.Open,
+				High:   b.High,
+				Low:    b.Low,
+				Close:  b.Close,
+				Volume: b.Volume,
+			}
+			vwapPxVol, vwapVol = 0, 0
+			if b.Volume > 0 {
+				p := barVWAPPrice(b)
+				vwapPxVol = p * b.Volume
+				vwapVol = b.Volume
+			}
+			curBucket = bk
+			have = true
+			continue
+		}
+		if b.High > cur.High {
+			cur.High = b.High
+		}
+		if b.Low < cur.Low {
+			cur.Low = b.Low
+		}
+		cur.Close = b.Close
+		cur.Volume += b.Volume
+		if b.Volume > 0 {
+			p := barVWAPPrice(b)
+			vwapPxVol += p * b.Volume
+			vwapVol += b.Volume
+		}
+	}
+	if have {
+		finish()
+	}
+	return out
+}
+
+// loadCustomLocked replaces the custom series with hist (same forming-bar
+// rules as Load). Caller holds mu.
+func (a *Aggregator) loadCustomLocked(hist []Bar) {
+	s := &series{
+		ring: newRing(ringCap),
+		ema:  indicators.NewEMA(a.emaN),
+		ema2: indicators.NewEMA(a.ema2N),
+	}
+	curBucket := bucketDur(a.customDur, time.Now())
+	var forming *Bar
+	if n := len(hist); n > 0 && !hist[n-1].Start.Before(curBucket) {
+		b := hist[n-1]
+		forming = &b
+		hist = hist[:n-1]
+	}
+
+	var sessVWAP indicators.VWAP
+	var prevKey string
+	haveKey := false
+	for _, b := range hist {
+		cur := session.At(b.Start)
+		if cur != session.Closed {
+			key := vwapInstanceKey(a.vwapAnchor, b.Start, cur)
+			if haveKey && key != prevKey {
+				sessVWAP.Reset()
+			}
+			prevKey = key
+			haveKey = true
+		}
+		emaV := s.ema.Update(b.Close)
+		ema2V := s.ema2.Update(b.Close)
+		var vwapV float64
+		if cur != session.Closed {
+			vwapV = sessVWAP.Update(barVWAPPrice(b), b.Volume)
+		} else {
+			vwapV = sessVWAP.Value()
+		}
+		s.ring.push(b, emaV, ema2V, vwapV)
+	}
+	if forming != nil {
+		cur := session.At(forming.Start)
+		if cur != session.Closed {
+			key := vwapInstanceKey(a.vwapAnchor, forming.Start, cur)
+			if haveKey && key != prevKey {
+				sessVWAP.Reset()
+			}
+			_ = sessVWAP.Update(barVWAPPrice(*forming), forming.Volume)
+		}
+		s.forming = *forming
+		s.open = true
+	}
+	a.custom = s
 }
 
 // vwapInstanceKey identifies a VWAP accumulation window for reconstruction.
@@ -543,7 +944,12 @@ func (a *Aggregator) Snapshot(tf TF, n, offset int) Snapshot {
 	if n <= 0 {
 		return Snapshot{}
 	}
-	s := a.series[tf]
+	return a.snapshotSeriesLocked(a.series[tf], n, offset)
+}
+
+// snapshotSeriesLocked is the shared Snapshot body for built-in and custom.
+// Caller holds mu; s must be non-nil.
+func (a *Aggregator) snapshotSeriesLocked(s *series, n, offset int) Snapshot {
 	r := s.ring
 	if r.count == 0 && !s.open {
 		return Snapshot{}

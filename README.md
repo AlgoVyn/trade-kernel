@@ -72,7 +72,7 @@ export APCA_API_SECRET_KEY=...
 
 ```
 :buy 250 lmt 152.30      limit buy        :sell 100 mkt     market sell
-:sym NVDA                switch symbol    :tf 5m            chart timeframe
+:sym NVDA                switch symbol    :tf 5m|2m|30s     chart timeframe
 :preset 2                size preset      :flatten          close position
 :cancel                  cancel active    :lock [reason]    engage risk lock
 :unlock                  release lock     :panic             panic active symbol

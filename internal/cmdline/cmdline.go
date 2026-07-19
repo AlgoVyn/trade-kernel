@@ -66,7 +66,7 @@ func Parse(input string) (Command, error) {
 		return Command{Kind: KindSymbol, Symbol: strings.ToUpper(args[0])}, nil
 	case "tf":
 		if len(args) != 1 {
-			return Command{}, fmt.Errorf("usage: tf 1s|5s|15s|1m|5m|15m|1h|1d")
+			return Command{}, fmt.Errorf("usage: tf 1s|5s|15s|1m|5m|15m|1h|1d|2m|30s|…")
 		}
 		return Command{Kind: KindTF, TF: strings.ToLower(args[0])}, nil
 	case "preset", "p":

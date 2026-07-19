@@ -18,10 +18,10 @@ type TradingWS struct {
 
 	firstAuth bool // set on first successful auth; gates OnReconnect
 
-	// OnInitial is invoked once after the first successful auth. OnReconnect
-	// fires after every subsequent re-auth. Both run on the read goroutine.
+	// OnReconnect fires after every re-auth (the initial startup reconcile
+	// is synchronous in cmd/trade-kernel; only live drops need a callback).
+	// Runs on the read goroutine.
 	OnUpdate    func(TradeUpdate)
-	OnInitial   func()
 	OnReconnect func()
 	OnError     func(error)
 }
@@ -115,12 +115,10 @@ func (t *TradingWS) runOnce(ctx context.Context) (authed bool, err error) {
 			}
 			if json.Unmarshal(env.Data, &st) == nil && st.Status == "authorized" {
 				authed = true
-				// First auth → OnInitial; every later auth → OnReconnect.
+				// First auth establishes the session (startup reconcile is
+				// synchronous in main.go); every later auth is a reconnect.
 				if !t.firstAuth {
 					t.firstAuth = true
-					if t.OnInitial != nil {
-						t.OnInitial()
-					}
 				} else if t.OnReconnect != nil {
 					t.OnReconnect()
 				}

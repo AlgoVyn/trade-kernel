@@ -58,6 +58,32 @@ func TestValidateKeyActions(t *testing.T) {
 	}
 }
 
+func TestValidateTimeframe(t *testing.T) {
+	base := Config{APIKeyID: "k", APISecretKey: "s", Paper: true}
+	// Empty → default 1m.
+	c := base
+	if err := c.Validate(); err != nil {
+		t.Fatalf("default: %v", err)
+	}
+	if c.Chart.Timeframe != "1m" {
+		t.Fatalf("Timeframe = %q, want 1m default", c.Chart.Timeframe)
+	}
+	// Built-in and custom accepted.
+	for _, tf := range []string{"5m", "1s", "2m", "30s", "4h"} {
+		c = base
+		c.Chart.Timeframe = tf
+		if err := c.Validate(); err != nil {
+			t.Fatalf("timeframe %q should validate: %v", tf, err)
+		}
+	}
+	// Garbage rejected.
+	c = base
+	c.Chart.Timeframe = "nope"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "timeframe") {
+		t.Fatalf("want timeframe error, got %v", err)
+	}
+}
+
 func TestValidateTickMS(t *testing.T) {
 	base := Config{APIKeyID: "k", APISecretKey: "s", Paper: true}
 	// Zero → default 50.

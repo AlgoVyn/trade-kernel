@@ -557,3 +557,42 @@ func TestRefreshDoesNotFetchWeek(t *testing.T) {
 		t.Fatal("Refresh must not set week PnL (use RefreshWeekPnL)")
 	}
 }
+
+// TestReconciledGate: a fresh store reports Reconciled()==false until the
+// first Reconcile lands. Order entry in the UI gates on this so a failed
+// startup snapshot can't let the operator trade against an empty view.
+func TestReconciledGate(t *testing.T) {
+	s := NewStore()
+	if s.Reconciled() {
+		t.Fatal("fresh store must report Reconciled()==false")
+	}
+	s.Reconcile(alpaca.Account{Equity: 100, LastEquity: 100}, nil, nil)
+	if !s.Reconciled() {
+		t.Fatal("Reconcile must flip Reconciled() to true")
+	}
+}
+
+// TestReconciledRequiresSuccess: a failed Refresh (REST error) must not flip
+// the gate — only a successful Reconcile counts.
+func TestReconciledRequiresSuccess(t *testing.T) {
+	s := NewStore()
+	r := errRefresher{}
+	if err := s.Refresh(context.Background(), r); err == nil {
+		t.Fatal("expected Refresh error from errRefresher")
+	}
+	if s.Reconciled() {
+		t.Fatal("failed Refresh must not flip Reconciled()")
+	}
+}
+
+type errRefresher struct{}
+
+func (errRefresher) Account(context.Context) (alpaca.Account, error) {
+	return alpaca.Account{}, context.DeadlineExceeded
+}
+func (errRefresher) Positions(context.Context) ([]alpaca.Position, error) {
+	return nil, nil
+}
+func (errRefresher) OpenOrders(context.Context, string) ([]alpaca.Order, error) {
+	return nil, nil
+}

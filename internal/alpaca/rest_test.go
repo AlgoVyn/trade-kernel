@@ -2,6 +2,7 @@ package alpaca
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -256,9 +257,12 @@ func TestCancelSymbolEmptyRejected(t *testing.T) {
 
 	rest := NewREST("k", "s", true)
 	rest.SetBaseURL(srv.URL)
-	err := rest.CancelSymbol(t.Context(), "")
+	failures, err := rest.CancelSymbol(t.Context(), "")
 	if err == nil {
 		t.Fatal("expected error for empty symbol")
+	}
+	if failures != 0 {
+		t.Fatalf("failures = %d, want 0 for empty symbol", failures)
 	}
 	if called {
 		t.Fatal("CancelSymbol(\"\") must not hit the API")
@@ -295,8 +299,12 @@ func TestCancelSymbolDeletesAllIDs(t *testing.T) {
 
 	rest := NewREST("k", "s", true)
 	rest.SetBaseURL(srv.URL)
-	if err := rest.CancelSymbol(t.Context(), "AAPL"); err != nil {
+	failures, err := rest.CancelSymbol(t.Context(), "AAPL")
+	if err != nil {
 		t.Fatalf("CancelSymbol: %v", err)
+	}
+	if failures != 0 {
+		t.Fatalf("failures = %d, want 0 when all DELETEs succeed", failures)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -338,5 +346,85 @@ func TestWarmHitsClock(t *testing.T) {
 	}
 	if hits != 1 {
 		t.Fatalf("clock hits = %d, want 1", hits)
+	}
+}
+
+// TestCancelSymbolReturnsFailureCount: when one of several DELETEs fails,
+// CancelSymbol returns failures>0 and the first error, while still
+// attempting the rest. The panic path uses the count to tell the operator
+// how many orders may still be resting.
+func TestCancelSymbolReturnsFailureCount(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		deleted []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[
+				{"id":"o1","symbol":"AAPL","status":"new"},
+				{"id":"o2","symbol":"AAPL","status":"new"},
+				{"id":"o3","symbol":"AAPL","status":"new"}
+			]`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v2/orders/"):
+			id := strings.TrimPrefix(r.URL.Path, "/v2/orders/")
+			// Fail exactly one cancel (o2) so we can assert failures==1 and
+			// that the other two still went through.
+			if id == "o2" {
+				http.Error(w, "boom", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			deleted = append(deleted, id)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	failures, err := rest.CancelSymbol(t.Context(), "AAPL")
+	if err == nil {
+		t.Fatal("expected first error from failed DELETE")
+	}
+	if failures != 1 {
+		t.Fatalf("failures = %d, want 1", failures)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deleted) != 2 {
+		t.Fatalf("deleted = %v, want 2 successful cancels despite one failure", deleted)
+	}
+}
+
+// TestResponseTruncatedDetected: a body larger than the 1 MB cap must return
+// ErrResponseTruncated rather than being silently chopped (which would
+// produce a misleading decode error or a partial parse).
+func TestResponseTruncatedDetected(t *testing.T) {
+	// 2 MB of body — well past the 1 MB read cap in REST.do.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// A single huge array element; size matters, not validity.
+		_, _ = w.Write([]byte("[\""))
+		chunk := make([]byte, 1<<20) // 1 MB
+		for i := range chunk {
+			chunk[i] = 'a'
+		}
+		// Write twice to exceed the cap; the read boundary is 1<<20 bytes.
+		_, _ = w.Write(chunk)
+		_, _ = w.Write(chunk)
+		_, _ = w.Write([]byte("\"]"))
+	}))
+	defer srv.Close()
+
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	_, err := rest.Account(t.Context())
+	if !errors.Is(err, ErrResponseTruncated) {
+		t.Fatalf("err = %v, want ErrResponseTruncated", err)
 	}
 }

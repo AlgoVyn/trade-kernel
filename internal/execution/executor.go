@@ -29,8 +29,11 @@ type Executor interface {
 	Flatten(ctx context.Context, symbol string, positionQty float64) (alpaca.Order, error)
 	// CancelAll cancels every open order.
 	CancelAll(ctx context.Context) error
-	// CancelSymbol cancels open orders for one symbol only.
-	CancelSymbol(ctx context.Context, symbol string) error
+	// CancelSymbol cancels open orders for one symbol only. Returns the
+	// number of per-order DELETEs that failed and the first error; every
+	// cancel is still attempted so a single failure does not leave siblings
+	// open. failures>0 tells the caller (panic path) some may remain resting.
+	CancelSymbol(ctx context.Context, symbol string) (failures int, err error)
 }
 
 // RESTExecutor implements Executor against the Alpaca REST API.
@@ -181,6 +184,6 @@ func (e *RESTExecutor) CancelAll(ctx context.Context) error {
 	return e.rest.CancelAll(ctx)
 }
 
-func (e *RESTExecutor) CancelSymbol(ctx context.Context, symbol string) error {
+func (e *RESTExecutor) CancelSymbol(ctx context.Context, symbol string) (int, error) {
 	return e.rest.CancelSymbol(ctx, symbol)
 }

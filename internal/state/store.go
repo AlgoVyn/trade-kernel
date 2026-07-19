@@ -40,10 +40,16 @@ type AccountPnL struct {
 type Store struct {
 	mu sync.RWMutex
 
-	account   alpaca.Account
-	hasAcct   bool
-	positions map[string]alpaca.Position
-	orders    map[string]alpaca.Order // keyed by order ID
+	account alpaca.Account
+	hasAcct bool
+	// reconciled is true after at least one successful Reconcile. Order entry
+	// is blocked until this flips so an operator never submits against an
+	// empty/stale view (a failed startup Refresh would otherwise show "flat"
+	// while real positions exist). Flatten/panic bypass the gate since they
+	// read PositionQty live and fall back to DELETE /v2/positions.
+	reconciled bool
+	positions  map[string]alpaca.Position
+	orders     map[string]alpaca.Order // keyed by order ID
 
 	// Day: raw equity change and open-intraday snap from last Reconcile.
 	dayChange        float64
@@ -74,6 +80,7 @@ func (s *Store) Reconcile(acct alpaca.Account, positions []alpaca.Position, orde
 	defer s.mu.Unlock()
 	s.account = acct
 	s.hasAcct = true
+	s.reconciled = true
 	s.positions = make(map[string]alpaca.Position, len(positions))
 	for _, p := range positions {
 		s.positions[p.Symbol] = p
@@ -282,6 +289,14 @@ func (s *Store) Account() (alpaca.Account, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.account, s.hasAcct
+}
+
+// Reconciled reports whether at least one REST snapshot has landed. Order
+// entry gates on this (see ui.Model.orderIntent); flatten/panic bypass it.
+func (s *Store) Reconciled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.reconciled
 }
 
 // PositionQty returns the signed quantity for symbol (negative = short).

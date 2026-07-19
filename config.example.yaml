@@ -43,7 +43,9 @@ indicators:
   vwap_anchor: session      # "session" resets each session; "day" resets at 20:00 ET
 
 chart:
-  timeframe: 1m             # initial resolution
+  # Initial resolution: built-ins 1s|5s|15s|1m|5m|15m|1h|1d, or a custom
+  # duration like 2m, 3m, 30s, 4h. Change at runtime with :tf 2m
+  timeframe: 1m
   bars_visible: 120
   session_shading: true
   tick_ms: 50               # base UI refresh (16–500). Short TFs speed up to 33ms
