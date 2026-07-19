@@ -49,7 +49,10 @@ sudo systemctl enable --now trade-kernel
 ```
 
 Secrets live only in `/etc/trade-kernel/env` (mode 600) or GCP Secret
-Manager — never in git.
+Manager — never in git. (You can instead put `api_key_id`/`api_secret_key`
+in `/etc/trade-kernel/trade-kernel.yaml` — also mode 600 — but the
+separate env file keeps them out of a file that's otherwise readable, and
+the env file overrides the config.)
 
 ## 4. Attach
 

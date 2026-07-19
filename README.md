@@ -47,7 +47,10 @@ go build -o trade-kernel ./cmd/trade-kernel
 # 2. Configure
 cp config.example.yaml trade-kernel.yaml   # edit to taste
 
-# 3. Credentials (environment wins over the config file)
+# 3. Credentials — either set them in trade-kernel.yaml:
+#      api_key_id: PK...
+#      api_secret_key: ...
+#    or export env vars (these override the file if both are set):
 export APCA_API_KEY_ID=...
 export APCA_API_SECRET_KEY=...
 
@@ -65,9 +68,10 @@ export APCA_API_SECRET_KEY=...
 | `A` / `D` | Add to / reduce position |
 | `F` | Flatten entire position |
 | `C` | Cancel all open orders |
-| `X` | Panic: cancel all + flatten (no confirmation) |
-| `1`–`4` | Select size preset |
-| `Tab` | Cycle chart resolution |
+| `X` | Panic: cancel all + flatten **all positions** (no confirmation) |
+| `1`–`9` | Select size preset |
+| `Tab` / `Shift+Tab` | Cycle chart resolution forward / backward |
+| `←` / `→` | Pan chart back into history / forward toward live |
 | `i` | Cycle indicator overlays |
 | `:` | Command line |
 | `q` / `Ctrl+C` | Quit / force quit |

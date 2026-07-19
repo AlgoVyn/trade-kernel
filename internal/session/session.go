@@ -18,6 +18,10 @@ import (
 	"context"
 	"sync"
 	"time"
+	// Embed the tzdata database so America/New_York is always available,
+	// even on scratch/distroless images without zoneinfo installed. This
+	// backs up the init() panic-safety claim in this file.
+	_ "time/tzdata"
 )
 
 // Session identifies one of the 24/5 trading sessions.

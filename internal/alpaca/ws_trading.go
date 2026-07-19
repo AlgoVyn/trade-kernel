@@ -16,8 +16,12 @@ type TradingWS struct {
 	keyID     string
 	secretKey string
 
-	// Callbacks run on the read goroutine.
+	firstAuth bool // set on first successful auth; gates OnReconnect
+
+	// OnInitial is invoked once after the first successful auth. OnReconnect
+	// fires after every subsequent re-auth. Both run on the read goroutine.
 	OnUpdate    func(TradeUpdate)
+	OnInitial   func()
 	OnReconnect func()
 	OnError     func(error)
 }
@@ -105,7 +109,13 @@ func (t *TradingWS) runOnce(ctx context.Context) error {
 				Status string `json:"status"`
 			}
 			if json.Unmarshal(env.Data, &st) == nil && st.Status == "authorized" {
-				if t.OnReconnect != nil {
+				// First auth → OnInitial; every later auth → OnReconnect.
+				if !t.firstAuth {
+					t.firstAuth = true
+					if t.OnInitial != nil {
+						t.OnInitial()
+					}
+				} else if t.OnReconnect != nil {
 					t.OnReconnect()
 				}
 			}

@@ -17,15 +17,17 @@ type MarketWS struct {
 	keyID     string
 	secretKey string
 
-	mu     sync.Mutex
-	symbol string
-	conn   *websocket.Conn // non-nil while connected
+	mu       sync.Mutex
+	symbol   string
+	conn     *websocket.Conn // non-nil while connected
+	firstSub bool            // set after the first successful subscribe
 
 	// Callbacks are invoked from the read goroutine; they must be fast
 	// (hand off to channels) and must not call back into MarketWS.
 	OnTrade     func(Trade)
 	OnQuote     func(Quote)
-	OnReconnect func() // fires after every successful re-auth+resubscribe
+	OnInitial   func() // fires once after the first successful auth+resubscribe
+	OnReconnect func() // fires after every subsequent re-auth+resubscribe
 	OnError     func(error)
 }
 
@@ -161,9 +163,16 @@ func (m *MarketWS) runOnce(ctx context.Context) error {
 					}
 				}
 			case "subscription":
+				// First successful auth+subscribe → OnInitial (once);
+				// every later dial → OnReconnect.
 				if !subscribed && authenticated {
 					subscribed = true
-					if m.OnReconnect != nil {
+					if !m.firstSub {
+						m.firstSub = true
+						if m.OnInitial != nil {
+							m.OnInitial()
+						}
+					} else if m.OnReconnect != nil {
 						m.OnReconnect()
 					}
 				}

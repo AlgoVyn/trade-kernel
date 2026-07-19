@@ -2,7 +2,45 @@
 // market-data REST API, and the market-data / trading WebSocket streams.
 package alpaca
 
-import "time"
+import (
+	"encoding/json"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// flexFloat unmarshals from a JSON number, a quoted numeric string, null,
+// or the empty string — all of which Alpaca emits across endpoints (REST
+// sends strings with the occasional null/""; the market WS sends numbers).
+// This sidesteps the brittleness of encoding/json's ,string struct tag,
+// which errors out on "" and is the reason we don't use it.
+type flexFloat float64
+
+func (f *flexFloat) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" || s == `""` || s == "" {
+		*f = 0
+		return nil
+	}
+	// Quoted string: strip the quotes and parse.
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+		if s == "" {
+			*f = 0
+			return nil
+		}
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return err
+	}
+	*f = flexFloat(v)
+	return nil
+}
+
+// MarshalJSON emits a number (never a quoted string) so downstream
+// consumers that expect a JSON number still work.
+func (f flexFloat) MarshalJSON() ([]byte, error) { return json.Marshal(float64(f)) }
 
 // Base URLs.
 const (
@@ -17,24 +55,24 @@ const (
 
 // Account is the /v2/account response (subset of fields used).
 type Account struct {
-	ID               string  `json:"id"`
-	Status           string  `json:"status"`
-	Currency         string  `json:"currency"`
-	Cash             float64 `json:"cash,string"`
-	Equity           float64 `json:"equity,string"`
-	BuyingPower      float64 `json:"buying_power,string"`
-	PortfolioValue   float64 `json:"portfolio_value,string"`
-	PatternDayTrader bool    `json:"pattern_day_trader"`
+	ID               string    `json:"id"`
+	Status           string    `json:"status"`
+	Currency         string    `json:"currency"`
+	Cash             flexFloat `json:"cash"`
+	Equity           flexFloat `json:"equity"`
+	BuyingPower      flexFloat `json:"buying_power"`
+	PortfolioValue   flexFloat `json:"portfolio_value"`
+	PatternDayTrader bool      `json:"pattern_day_trader"`
 }
 
 // Position is a /v2/positions entry.
 type Position struct {
-	Symbol        string  `json:"symbol"`
-	Qty           float64 `json:"qty,string"`
-	AvgEntryPrice float64 `json:"avg_entry_price,string"`
-	MarketValue   float64 `json:"market_value,string"`
-	UnrealizedPL  float64 `json:"unrealized_pl,string"`
-	Side          string  `json:"side"` // "long" or "short"
+	Symbol        string    `json:"symbol"`
+	Qty           flexFloat `json:"qty"`
+	AvgEntryPrice flexFloat `json:"avg_entry_price"`
+	MarketValue   flexFloat `json:"market_value"`
+	UnrealizedPL  flexFloat `json:"unrealized_pl"`
+	Side          string    `json:"side"` // "long" or "short"
 }
 
 // OrderRequest is the POST /v2/orders body.
@@ -54,16 +92,16 @@ type Order struct {
 	ID             string    `json:"id"`
 	ClientOrderID  string    `json:"client_order_id"`
 	Symbol         string    `json:"symbol"`
-	Qty            float64   `json:"qty,string"`
-	FilledQty      float64   `json:"filled_qty,string"`
+	Qty            flexFloat `json:"qty"`
+	FilledQty      flexFloat `json:"filled_qty"`
 	Side           string    `json:"side"`
 	Type           string    `json:"type"`
 	TimeInForce    string    `json:"time_in_force"`
-	LimitPrice     float64   `json:"limit_price,string"`
+	LimitPrice     flexFloat `json:"limit_price"`
 	Status         string    `json:"status"`
 	SubmittedAt    time.Time `json:"submitted_at"`
 	FilledAt       time.Time `json:"filled_at"`
-	FilledAvgPrice float64   `json:"filled_avg_price,string"`
+	FilledAvgPrice flexFloat `json:"filled_avg_price"`
 }
 
 // Clock is the /v2/clock response.
@@ -87,20 +125,20 @@ type Asset struct {
 // Bar is a single OHLCV bar from the market-data API.
 type Bar struct {
 	Timestamp  time.Time `json:"t"`
-	Open       float64   `json:"o"`
-	High       float64   `json:"h"`
-	Low        float64   `json:"l"`
-	Close      float64   `json:"c"`
-	Volume     float64   `json:"v"`
-	VWAP       float64   `json:"vw"`
+	Open       flexFloat `json:"o"`
+	High       flexFloat `json:"h"`
+	Low        flexFloat `json:"l"`
+	Close      flexFloat `json:"c"`
+	Volume     flexFloat `json:"v"`
+	VWAP       flexFloat `json:"vw"`
 	TradeCount int       `json:"n"`
 }
 
 // Trade is a trade message from the market-data WS ("T":"t").
 type Trade struct {
 	Symbol    string    `json:"S"`
-	Price     float64   `json:"p"`
-	Size      float64   `json:"s"`
+	Price     flexFloat `json:"p"`
+	Size      flexFloat `json:"s"`
 	Timestamp time.Time `json:"t"`
 	ID        int64     `json:"i"`
 }
@@ -108,10 +146,10 @@ type Trade struct {
 // Quote is a quote message from the market-data WS ("T":"q").
 type Quote struct {
 	Symbol    string    `json:"S"`
-	BidPrice  float64   `json:"bp"`
-	BidSize   float64   `json:"bs"`
-	AskPrice  float64   `json:"ap"`
-	AskSize   float64   `json:"as"`
+	BidPrice  flexFloat `json:"bp"`
+	BidSize   flexFloat `json:"bs"`
+	AskPrice  flexFloat `json:"ap"`
+	AskSize   flexFloat `json:"as"`
 	Timestamp time.Time `json:"t"`
 }
 
@@ -120,7 +158,7 @@ type TradeUpdate struct {
 	Event string `json:"event"` // fill, partial_fill, canceled, expired, rejected, ...
 	Order Order  `json:"order"`
 	// PositionQty is present on fill events for the affected position.
-	PositionQty float64 `json:"position_qty,string"`
+	PositionQty flexFloat `json:"position_qty"`
 }
 
 // apiError is Alpaca's error envelope.

@@ -43,29 +43,43 @@ var bgColors = map[uint8]lipgloss.Color{
 	bgOvernight: lipgloss.Color("17"),
 }
 
+// Render layers, lowest to highest. A dot's color wins a cell only if its
+// layer is >= the cell's current layer. Indicators layer above candles so
+// an SMA/EMA/VWAP line reads continuously through candle bodies instead of
+// being absorbed into the candle's color.
+const (
+	layerCandle uint8 = iota
+	layerIndicator
+)
+
 // canvas is a braille dot grid, one rune per 2×4 dots.
 type canvas struct {
 	w, h  int // cells
 	dots  []uint8
 	color []uint8
+	layer []uint8 // per-cell highest layer that has written color so far
 	bg    []uint8
 }
 
 func newCanvas(w, h int) *canvas {
 	n := w * h
-	return &canvas{w: w, h: h, dots: make([]uint8, n), color: make([]uint8, n), bg: make([]uint8, n)}
+	return &canvas{w: w, h: h, dots: make([]uint8, n), color: make([]uint8, n), layer: make([]uint8, n), bg: make([]uint8, n)}
 }
 
-// setDot lights one dot at dot-coordinates (x: 0..2w-1, y: 0..4h-1).
-// Existing color is only overwritten by non-indicator (candle) colors
-// when force is set.
-func (c *canvas) setDot(x, y int, col uint8) {
+// setDot lights one dot at dot-coordinates (x: 0..2w-1, y: 0..4h-1). The
+// cell's color is set to col only when layer >= the cell's current layer,
+// so higher layers (indicators) override lower ones (candles) and the
+// most-informative color wins. The dot itself is always lit regardless.
+func (c *canvas) setDot(x, y int, col uint8, layer uint8) {
 	if x < 0 || x >= c.w*2 || y < 0 || y >= c.h*4 {
 		return
 	}
 	idx := (y/4)*c.w + (x / 2)
 	c.dots[idx] |= dotBit[x%2][y%4]
-	c.color[idx] = col
+	if layer >= c.layer[idx] {
+		c.color[idx] = col
+		c.layer[idx] = layer
+	}
 }
 
 func (c *canvas) setColBg(cx int, bg uint8) {
@@ -206,22 +220,23 @@ func renderCandles(snap bars.Snapshot, w, h int, opts ChartOpts) []string {
 		}
 		if opts.ShowSMA && !math.IsNaN(snap.SMA[i]) {
 			y := yOf(snap.SMA[i])
-			cv.setDot(cx*2, y, colSMA)
-			cv.setDot(cx*2+1, y, colSMA)
+			cv.setDot(cx*2, y, colSMA, layerIndicator)
+			cv.setDot(cx*2+1, y, colSMA, layerIndicator)
 		}
 		if opts.ShowEMA && !math.IsNaN(snap.EMA[i]) {
 			y := yOf(snap.EMA[i])
-			cv.setDot(cx*2, y, colEMA)
-			cv.setDot(cx*2+1, y, colEMA)
+			cv.setDot(cx*2, y, colEMA, layerIndicator)
+			cv.setDot(cx*2+1, y, colEMA, layerIndicator)
 		}
 		if opts.ShowVWAP && !math.IsNaN(snap.VWAP[i]) {
 			y := yOf(snap.VWAP[i])
-			cv.setDot(cx*2, y, colVWAP)
-			cv.setDot(cx*2+1, y, colVWAP)
+			cv.setDot(cx*2, y, colVWAP, layerIndicator)
+			cv.setDot(cx*2+1, y, colVWAP, layerIndicator)
 		}
 	}
 
-	// Candles: wick in left dot-column, body across both.
+	// Candles: wick in left dot-column, body across both. Drawn at the
+	// lower layer so indicator overlays (drawn above) win shared cells.
 	for i, b := range snap.Bars {
 		cx := w - n + i
 		col := colUp
@@ -230,7 +245,7 @@ func renderCandles(snap bars.Snapshot, w, h int, opts ChartOpts) []string {
 		}
 		yHi, yLo := yOf(b.High), yOf(b.Low)
 		for y := yHi; y <= yLo; y++ {
-			cv.setDot(cx*2, y, col)
+			cv.setDot(cx*2, y, col, layerCandle)
 		}
 		yO, yC := yOf(b.Open), yOf(b.Close)
 		top, bot := yO, yC
@@ -238,8 +253,8 @@ func renderCandles(snap bars.Snapshot, w, h int, opts ChartOpts) []string {
 			top, bot = bot, top
 		}
 		for y := top; y <= bot; y++ {
-			cv.setDot(cx*2, y, col)
-			cv.setDot(cx*2+1, y, col)
+			cv.setDot(cx*2, y, col, layerCandle)
+			cv.setDot(cx*2+1, y, col, layerCandle)
 		}
 	}
 	return cv.render()
@@ -304,11 +319,11 @@ func renderVolume(snap bars.Snapshot, w, h int, shading bool) []string {
 	for y := 0; y < h; y++ {
 		var sb strings.Builder
 		for x := 0; x < w; x++ {
-			lines_ := styles[y][x]
+			st := styles[y][x]
 			if rows[y][x] == ' ' {
 				sb.WriteRune(' ')
 			} else {
-				sb.WriteString(lines_.Render(string(rows[y][x])))
+				sb.WriteString(st.Render(string(rows[y][x])))
 			}
 		}
 		lines[y] = sb.String()
@@ -321,4 +336,93 @@ func blankLines(h int) []string {
 		h = 0
 	}
 	return make([]string, h)
+}
+
+// renderTimeRuler draws a single-line time axis under the candle pane,
+// TradingView-style: sparse labels aligned to the columns of the bars they
+// describe. Labels are left-aligned at their bar's column and never overlap
+// (a candidate label is dropped if it would collide with the previous one).
+// Format depends on the TF: HH:MM for intraday, MMM DD for daily; a full
+// "MMM DD HH:MM" label marks the first label and each day boundary.
+// Returns exactly one line of width w.
+func renderTimeRuler(snap bars.Snapshot, w int, tf bars.TF) string {
+	if w <= 0 || len(snap.Bars) == 0 {
+		return strings.Repeat(" ", w)
+	}
+	n := len(snap.Bars)
+	if n > w {
+		// Mirror renderCandles' right-align: keep newest w bars.
+		snap.Bars = snap.Bars[n-w:]
+		n = w
+	}
+
+	daily := tf == bars.TF1d
+
+	// Build the candidate label list, oldest→newest.
+	type lbl struct {
+		cx    int
+		text  string
+		isDay bool // marks a day-boundary / first label (gets the date)
+	}
+	var labels []lbl
+	prevDate := ""
+	// Aim for one label every ~10 cells. step = max(1, n / (w/10)).
+	step := n / (w/10 + 1)
+	if step < 1 {
+		step = 1
+	}
+	for i := 0; i < n; i += step {
+		cx := w - n + i
+		t := snap.Bars[i].Start.In(session.Location())
+		date := t.Format("2006-01-02")
+		isDay := date != prevDate
+		prevDate = date
+		var text string
+		if daily {
+			text = t.Format("Jan 02")
+		} else if isDay {
+			text = t.Format("Jan 02 15:04")
+		} else {
+			text = t.Format("15:04")
+		}
+		labels = append(labels, lbl{cx: cx, text: text, isDay: isDay})
+	}
+	// Always include the newest bar for live-edge orientation.
+	if last := n - 1; last >= 0 && (len(labels) == 0 || labels[len(labels)-1].cx != w-1) {
+		t := snap.Bars[last].Start.In(session.Location())
+		var text string
+		if daily {
+			text = t.Format("Jan 02")
+		} else {
+			text = t.Format("15:04")
+		}
+		labels = append(labels, lbl{cx: w - 1, text: text})
+	}
+
+	// Render into a rune buffer, left-aligning each label at its column and
+	// skipping any label that would overlap the previous one's tail.
+	runes := make([]rune, w)
+	for i := range runes {
+		runes[i] = ' '
+	}
+	nextFree := 0 // next writable column
+	for _, l := range labels {
+		start := l.cx
+		if start < nextFree {
+			continue // would collide — skip
+		}
+		end := start + len(l.text)
+		if end > w {
+			// Clip the label rather than skip — the live edge should always show.
+			l.text = l.text[:w-start]
+			end = w
+		}
+		for i, r := range l.text {
+			runes[start+i] = r
+		}
+		nextFree = end + 1 // one-space gap
+	}
+
+	dim := lipgloss.NewStyle().Faint(true)
+	return dim.Render(strings.TrimRight(string(runes), " "))
 }

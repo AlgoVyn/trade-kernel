@@ -40,7 +40,7 @@ risk.LossMonitor <── account equity (5 s refresh) ──> kill-switch:
 | Package | Responsibility |
 |---|---|
 | `cmd/trade-kernel` | Config load, startup banner, wire-up, signal handling, symbol switching, bar backfill, kill-switch action. |
-| `internal/config` | YAML config + env overrides (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`). Validation: live mode requires explicit acknowledgement; fills defaults. |
+| `internal/config` | YAML config (incl. `api_key_id`/`api_secret_key`) + env overrides (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`; env wins). Validation: live mode requires explicit acknowledgement; fills defaults. |
 | `internal/session` | Authoritative session classification in `America/New_York` (tz database, DST-safe). `Engine` emits transition events, accepts `/v2/clock` overrides for holidays/early closes (only ever *narrows* to Closed, never widens). |
 | `internal/alpaca` | REST client (account, positions, orders, clock, assets, bars w/ pagination); SIP market-data WS client (auth, subscribe, hot-switch, exponential-backoff reconnect, resync callback); trading WS client (`trade_updates`). |
 | `internal/bars` | Aggregates trades into 1s/5s/15s/1m/5m/15m/1h/1d bars in preallocated ring buffers (2048/TF). Daily bars anchor at 20:00 ET (the overnight open) so a "day" is one 24/5 trading day. Handles late/out-of-order trades (H/L/V correction in-place). Maintains per-TF SMA/EMA and session VWAP; caches latest NBBO + last trade for the order builder. |
@@ -105,8 +105,11 @@ Live trades aggregate into all 8 timeframes simultaneously (fixed-cost
 per trade). On symbol switch and on every WS reconnect, history is
 backfilled from the REST bars endpoint (SIP feed includes
 extended-hours trades, so overnight bars exist; weekend/holiday gaps
-simply don't appear — collapsed chart). Sub-minute timeframes build
-from the live stream only. A reconnect triggers a backfill so
+simply don't appear — collapsed chart). Sub-minute timeframes (1s/5s/15s)
+are backfilled by replaying recent trades from the REST trades endpoint
+through the aggregator (the bars endpoint doesn't serve sub-minute
+resolutions); the replay touches only the sub-minute series, never the
+1m+ bars or the live session VWAP. A reconnect triggers a backfill so
 sequence gaps are healed from REST rather than interpolated.
 
 ### 6. Indicators
@@ -151,13 +154,17 @@ overlays with 2% padding.
 | `1`–`9` | Select size preset |
 | `:` | Command line: `buy 250 lmt 152.30`, `sell 100 mkt`, `sym NVDA`, `tf 5m`, `preset 2`, `flatten`, `cancel`, `unlock`, `confirm on|off`, `shading on|off`, `quit`, `help` |
 | `Tab` | Cycle resolution (1m/5m/15m/1h/1d/1s/5s/15s) |
+| `Shift+Tab` | Cycle resolution backward |
+| `←` / `→` | Pan chart back into history / forward toward live |
 | `i` | Cycle indicator overlay combos |
 | `q` / `Ctrl+C` | Quit (confirms with open position when confirmations on) / force quit |
 
 ## Configuration
 
-`trade-kernel.yaml` (gitignored; see `config.example.yaml`) plus env
-vars for credentials. Notables: `size_presets`, `limits.{max_order_qty,
+`trade-kernel.yaml` (gitignored; see `config.example.yaml`) holds all
+settings including `api_key_id`/`api_secret_key`. Env vars
+(`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`) override the file when set.
+Notables: `size_presets`, `limits.{max_order_qty,
 max_position_qty, daily_loss_limit, debounce_ms}`,
 `extended_hours.{slippage_bps, quote_stale_ms}`,
 `indicators.{sma_period, ema_period, vwap_anchor}`, `confirm_orders`,

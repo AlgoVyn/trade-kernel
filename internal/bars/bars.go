@@ -208,37 +208,71 @@ func (a *Aggregator) OnTrade(symbol string, price, size float64, ts time.Time) {
 	a.lastTradeAt = ts
 	a.vwap.Update(price, size)
 	for tf := TF(0); tf < numTF; tf++ {
-		s := a.series[tf]
-		b := bucket(tf, ts)
-		switch {
-		case !s.open:
-			s.forming = newBar(b, price, size)
-			s.open = true
-		case b.Equal(s.forming.Start):
-			s.forming.add(price, size)
-		case b.After(s.forming.Start):
-			a.closeBar(tf, s)
-			s.forming = newBar(b, price, size)
-			s.open = true
-		default:
-			// Late/out-of-order trade into an older bucket: adjust H/L/V
-			// if the bar is still in the ring. Close is left alone.
-			r := s.ring
-			for n := 0; n < r.count; n++ {
-				i := (r.start + r.count - 1 - n + len(r.bars)) % len(r.bars)
-				if r.bars[i].Start.Before(b) {
-					break
+		a.aggregateInto(tf, price, size, ts)
+	}
+}
+
+// ReplayTrades feeds a historical trade sequence into the sub-minute
+// timeframes (1s/5s/15s) only. Used to backfill those TFs from the REST
+// trades endpoint, since the bars endpoint doesn't serve sub-minute
+// resolutions. Trades must be in ascending timestamp order.
+//
+// It deliberately does NOT touch the 1m+ TFs (already backfilled from the
+// bars endpoint) nor the session VWAP / last-trade cache (live-only
+// state) — replaying into those would double-count volume and overwrite
+// the live edge with stale prices.
+func (a *Aggregator) ReplayTrades(trades []TradeReplay) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, tr := range trades {
+		for _, tf := range []TF{TF1s, TF5s, TF15s} {
+			a.aggregateInto(tf, tr.Price, tr.Size, tr.Timestamp)
+		}
+	}
+}
+
+// TradeReplay is a historical trade to replay into the aggregator. A
+// narrow type (not alpaca.Trade) keeps the bars package free of the
+// alpaca dependency.
+type TradeReplay struct {
+	Price     float64
+	Size      float64
+	Timestamp time.Time
+}
+
+// aggregateInto folds one trade into a single timeframe. Caller holds the
+// mutex. Handles bucket rollover and late/out-of-order trades.
+func (a *Aggregator) aggregateInto(tf TF, price, size float64, ts time.Time) {
+	s := a.series[tf]
+	b := bucket(tf, ts)
+	switch {
+	case !s.open:
+		s.forming = newBar(b, price, size)
+		s.open = true
+	case b.Equal(s.forming.Start):
+		s.forming.add(price, size)
+	case b.After(s.forming.Start):
+		a.closeBar(tf, s)
+		s.forming = newBar(b, price, size)
+		s.open = true
+	default:
+		// Late/out-of-order trade into an older bucket: adjust H/L/V
+		// if the bar is still in the ring. Close is left alone.
+		r := s.ring
+		for n := 0; n < r.count; n++ {
+			i := (r.start + r.count - 1 - n + len(r.bars)) % len(r.bars)
+			if r.bars[i].Start.Before(b) {
+				break
+			}
+			if r.bars[i].Start.Equal(b) {
+				if price > r.bars[i].High {
+					r.bars[i].High = price
 				}
-				if r.bars[i].Start.Equal(b) {
-					if price > r.bars[i].High {
-						r.bars[i].High = price
-					}
-					if price < r.bars[i].Low {
-						r.bars[i].Low = price
-					}
-					r.bars[i].Volume += size
-					break
+				if price < r.bars[i].Low {
+					r.bars[i].Low = price
 				}
+				r.bars[i].Volume += size
+				break
 			}
 		}
 	}
@@ -292,6 +326,18 @@ func (a *Aggregator) ResetVWAP() {
 	a.mu.Unlock()
 }
 
+// ResetMarket clears the cached last trade and NBBO. Called on symbol
+// switch so the status bar and order builder don't price off the previous
+// symbol's quote until a new tick for the new symbol arrives.
+func (a *Aggregator) ResetMarket() {
+	a.mu.Lock()
+	a.lastTradePrice = 0
+	a.lastTradeAt = time.Time{}
+	a.bid, a.ask = 0, 0
+	a.quoteAt = time.Time{}
+	a.mu.Unlock()
+}
+
 // Load replaces one timeframe's history with backfilled bars (e.g. from
 // the REST bars endpoint) and resets its indicator state accordingly.
 func (a *Aggregator) Load(tf TF, hist []Bar) {
@@ -309,9 +355,22 @@ func (a *Aggregator) Load(tf TF, hist []Bar) {
 	}
 }
 
-// Snapshot returns the last n bars (including the forming bar with
-// Peek'd indicator values) for rendering. n includes the forming bar.
-func (a *Aggregator) Snapshot(tf TF, n int) Snapshot {
+// Snapshot returns up to n bars for rendering.
+//
+// offset shifts the view back from the live edge:
+//
+//	- offset == 0: the live edge. Includes the forming bar (with Peek'd
+//	  indicator values and the live session VWAP) at the right edge.
+//	- offset  > 0: closed bars only. offset counts how many bars back from
+//	  the live edge the right edge of the view sits: offset=1 shows the
+//	  newest closed bar at the right edge, offset=2 the next one back, etc.
+//	  The forming bar is never included when panned back. Closed bars carry
+//	  their own frozen sma/ema/vwapAtClose captured at bar close, so panned
+//	  views are self-contained.
+//
+// offset is clamped to the available closed history; an offset past the
+// oldest retained bar returns the oldest available bars.
+func (a *Aggregator) Snapshot(tf TF, n, offset int) Snapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if n <= 0 {
@@ -319,10 +378,75 @@ func (a *Aggregator) Snapshot(tf TF, n int) Snapshot {
 	}
 	s := a.series[tf]
 	r := s.ring
-	count := r.count
-	if s.open {
-		count++
+	if r.count == 0 && !s.open {
+		return Snapshot{}
 	}
+
+	if offset < 0 {
+		offset = 0
+	}
+	// offset=0 is the live edge (forming bar visible if open). Any offset>0
+	// skips the forming bar and steps back through closed bars.
+	if offset == 0 && s.open {
+		// Live edge: r.count closed bars + the forming bar, newest at right.
+		count := r.count + 1
+		if count > n {
+			count = n
+		}
+		out := Snapshot{
+			Bars: make([]Bar, count),
+			SMA:  make([]float64, count),
+			EMA:  make([]float64, count),
+			VWAP: make([]float64, count),
+		}
+		closed := count - 1 // reserve last slot for the forming bar
+		if closed > r.count {
+			closed = r.count
+		}
+		if closed < 0 {
+			closed = 0
+		}
+		startIdx := r.count - closed
+		for i := 0; i < closed; i++ {
+			j := r.at(startIdx + i)
+			out.Bars[i] = r.bars[j]
+			out.SMA[i] = r.sma[j]
+			out.EMA[i] = r.ema[j]
+			out.VWAP[i] = r.vwapAtClose[j]
+		}
+		f := s.forming
+		i := count - 1
+		out.Bars[i] = f
+		out.SMA[i] = s.sma.Peek(f.Close)
+		out.EMA[i] = s.ema.Peek(f.Close)
+		out.VWAP[i] = a.vwap.Value()
+		return out
+	}
+
+	// Panned back (offset > 0), or offset==0 with no forming bar: show
+	// closed bars only. offset counts bars back from the live edge:
+	//	- forming bar open:  offset=1 → newest closed at right edge;
+	//	  offset=2 → one further back, etc. (offset=0 is handled above.)
+	//	- no forming bar:    offset=0 → newest closed at right edge;
+	//	  offset=1 → one further back, etc.
+	back := offset
+	if s.open {
+		back = offset - 1 // first step just drops the forming bar
+	}
+	if back < 0 {
+		back = 0
+	}
+	if back >= r.count {
+		// Past the oldest retained bar: show just the oldest.
+		back = r.count - 1
+	}
+	// Logical index (0-based from oldest) of the newest visible closed bar.
+	newest := r.count - 1 - back
+	if newest < 0 {
+		return Snapshot{}
+	}
+	// Number of closed bars visible: indices 0..newest.
+	count := newest + 1
 	if count > n {
 		count = n
 	}
@@ -335,29 +459,40 @@ func (a *Aggregator) Snapshot(tf TF, n int) Snapshot {
 		EMA:  make([]float64, count),
 		VWAP: make([]float64, count),
 	}
-	// Fill from oldest to newest.
-	closed := r.count
-	if s.open {
-		closed = count - 1
-	}
-	if closed > count {
-		closed = count
-	}
-	startIdx := r.count - closed
-	for i := 0; i < closed; i++ {
+	startIdx := newest - count + 1
+	for i := 0; i < count; i++ {
 		j := r.at(startIdx + i)
 		out.Bars[i] = r.bars[j]
 		out.SMA[i] = r.sma[j]
 		out.EMA[i] = r.ema[j]
 		out.VWAP[i] = r.vwapAtClose[j]
 	}
-	if s.open {
-		f := s.forming
-		i := count - 1
-		out.Bars[i] = f
-		out.SMA[i] = s.sma.Peek(f.Close)
-		out.EMA[i] = s.ema.Peek(f.Close)
-		out.VWAP[i] = a.vwap.Value()
-	}
 	return out
+}
+
+// HistoryDepth returns the number of closed bars retained for tf, i.e. how
+// many bars back from the live edge the view can pan. Used by the UI to
+// clamp the pan offset.
+func (a *Aggregator) HistoryDepth(tf TF) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.series[tf].ring.count
+}
+
+// LastBarTime returns the start time of the newest retained bar for tf
+// (closed or forming). ok=false if there are no bars at all. Used to
+// anchor history fetches to a real trading time instead of wall-clock
+// now (which may fall outside market hours).
+func (a *Aggregator) LastBarTime(tf TF) (t time.Time, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s := a.series[tf]
+	if s.open {
+		return s.forming.Start, true
+	}
+	r := s.ring
+	if r.count == 0 {
+		return time.Time{}, false
+	}
+	return r.bars[r.at(r.count-1)].Start, true
 }

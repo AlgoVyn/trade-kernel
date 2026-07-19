@@ -1,6 +1,18 @@
 # trade-kernel configuration. Copy to trade-kernel.yaml and edit.
-# Credentials are read from the environment and override this file:
-#   APCA_API_KEY_ID, APCA_API_SECRET_KEY
+#
+# Alpaca API credentials can be provided two ways (environment overrides
+# the file if both are set):
+#   1. Here, as api_key_id / api_secret_key below.
+#   2. As env vars: APCA_API_KEY_ID / APCA_API_SECRET_KEY.
+# SECURITY: if you put keys in this file, keep it out of git (it's in
+# .gitignore as trade-kernel.yaml) and restrict its permissions to 0600.
+# Prefer the env vars or a secret manager when possible.
+api_key_id: ""
+api_secret_key: ""
+#
+# Env var TRADE_KERNEL_LIVE overrides paper mode regardless of the file:
+#   TRADE_KERNEL_LIVE=1  force live (still needs live_trading_acknowledged: true)
+#   TRADE_KERNEL_LIVE=0  force paper
 
 # Paper trading is the default. For live trading you must set BOTH
 # paper: false and live_trading_acknowledged: true.
@@ -38,7 +50,8 @@ chart:
 
 # Optional keybinding overrides (action -> key). Actions:
 # buy, sell, add, reduce, flatten, cancel_all, panic, cmdline,
-# cycle_tf, cycle_indicators, quit, quit_force
+# cycle_tf, cycle_tf_back, pan_left, pan_right, cycle_indicators,
+# quit, quit_force
 # keys:
 #   buy: B
 #   panic: X

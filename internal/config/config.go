@@ -93,7 +93,7 @@ func (c Config) Live() bool { return !c.Paper && c.LiveTradingAcknowledged }
 // Validate enforces invariants and fills defaults.
 func (c *Config) Validate() error {
 	if c.APIKeyID == "" || c.APISecretKey == "" {
-		return fmt.Errorf("API credentials missing: set APCA_API_KEY_ID and APCA_API_SECRET_KEY")
+		return fmt.Errorf("API credentials missing: set api_key_id/api_secret_key in the config file or APCA_API_KEY_ID/APCA_API_SECRET_KEY in the environment")
 	}
 	if !c.Paper && !c.LiveTradingAcknowledged {
 		return fmt.Errorf("paper: false requires live_trading_acknowledged: true; refusing to start")
@@ -130,6 +130,18 @@ func (c *Config) Validate() error {
 	if c.Chart.BarsVisible <= 0 {
 		c.Chart.BarsVisible = 120
 	}
+	// Safety rails: negative values would silently disable checks in
+	// risk.Checker (which treats <=0 as "disabled"). Reject explicitly so a
+	// config typo can't quietly turn off a guardrail.
+	if c.Limits.MaxOrderQty < 0 {
+		return fmt.Errorf("limits.max_order_qty must be >= 0 (0 disables)")
+	}
+	if c.Limits.MaxPositionQty < 0 {
+		return fmt.Errorf("limits.max_position_qty must be >= 0 (0 disables)")
+	}
+	if c.Limits.DailyLossLimit < 0 {
+		return fmt.Errorf("limits.daily_loss_limit must be >= 0 (0 disables)")
+	}
 	return nil
 }
 
@@ -154,8 +166,14 @@ func Load(path string) (Config, error) {
 	if v := os.Getenv("APCA_API_SECRET_KEY"); v != "" {
 		c.APISecretKey = v
 	}
-	if os.Getenv("TRADE_KERNEL_LIVE") == "1" {
+	// TRADE_KERNEL_LIVE overrides paper mode from the environment:
+	// "1" forces live (still requires live_trading_acknowledged to start),
+	// "0" forces paper. Unset leaves the file value alone.
+	switch os.Getenv("TRADE_KERNEL_LIVE") {
+	case "1":
 		c.Paper = false
+	case "0":
+		c.Paper = true
 	}
 	if err := c.Validate(); err != nil {
 		return c, err

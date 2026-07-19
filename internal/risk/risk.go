@@ -4,6 +4,7 @@ package risk
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"time"
 )
@@ -85,7 +86,7 @@ func (c *Checker) Check(symbol, side string, qty int) error {
 			signed = -signed
 		}
 		proj := cur + signed
-		if abs(proj) > float64(c.limits.MaxPositionQty) && abs(proj) > abs(cur) {
+		if math.Abs(proj) > float64(c.limits.MaxPositionQty) && math.Abs(proj) > math.Abs(cur) {
 			return fmt.Errorf("projected position %.0f exceeds max position size %d", proj, c.limits.MaxPositionQty)
 		}
 	}
@@ -96,13 +97,6 @@ func (c *Checker) Check(symbol, side string, qty int) error {
 	c.lastKey = key
 	c.lastAt = c.now()
 	return nil
-}
-
-func abs(f float64) float64 {
-	if f < 0 {
-		return -f
-	}
-	return f
 }
 
 // LossMonitor tracks account equity against a daily-loss limit. The

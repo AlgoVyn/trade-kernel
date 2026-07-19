@@ -18,9 +18,6 @@ type Store struct {
 	hasAcct   bool
 	positions map[string]alpaca.Position
 	orders    map[string]alpaca.Order // keyed by order ID
-
-	// changed is closed and replaced on every mutation (broadcast).
-	changed chan struct{}
 }
 
 // NewStore creates an empty Store.
@@ -28,21 +25,7 @@ func NewStore() *Store {
 	return &Store{
 		positions: make(map[string]alpaca.Position),
 		orders:    make(map[string]alpaca.Order),
-		changed:   make(chan struct{}),
 	}
-}
-
-// Changed returns a channel closed on the next mutation. Callers should
-// re-fetch after every wait (classic condition broadcast).
-func (s *Store) Changed() <-chan struct{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.changed
-}
-
-func (s *Store) notify() {
-	close(s.changed)
-	s.changed = make(chan struct{})
 }
 
 // Reconcile replaces the store with a fresh REST snapshot.
@@ -59,7 +42,6 @@ func (s *Store) Reconcile(acct alpaca.Account, positions []alpaca.Position, orde
 	for _, o := range orders {
 		s.orders[o.ID] = o
 	}
-	s.notify()
 }
 
 // ApplyUpdate folds one trading-WS trade update into the store.
@@ -77,7 +59,6 @@ func (s *Store) ApplyUpdate(u alpaca.TradeUpdate) {
 		// new, accepted, pending_new, replaced, etc.
 		s.orders[o.ID] = o
 	}
-	s.notify()
 }
 
 // Account returns the cached account (hasAcct=false until reconciled).
@@ -96,9 +77,9 @@ func (s *Store) PositionQty(symbol string) float64 {
 		return 0
 	}
 	if p.Side == "short" {
-		return -p.Qty
+		return -float64(p.Qty)
 	}
-	return p.Qty
+	return float64(p.Qty)
 }
 
 // Position returns the cached position for symbol, or nil.

@@ -30,22 +30,12 @@ type Executor interface {
 	CancelAll(ctx context.Context) error
 }
 
-// ResultHook receives the order request and warning before submission
-// (UI confirmation / status line) and the result after.
-type ResultHook interface {
-	// BeforeSubmit is called synchronously before submission. Returning
-	// false aborts the order.
-	BeforeSubmit(req alpaca.OrderRequest, warning string) bool
-	AfterSubmit(req alpaca.OrderRequest, order alpaca.Order, err error, latency time.Duration)
-}
-
 // RESTExecutor implements Executor against the Alpaca REST API.
 type RESTExecutor struct {
 	rest       *alpaca.REST
 	builder    *Builder
 	sessionNow func() session.Session
 	regularTIF string // "day" | "ioc"
-	hook       ResultHook
 }
 
 // NewRESTExecutor wires an executor. sessionNow reports the current
@@ -56,9 +46,6 @@ func NewRESTExecutor(rest *alpaca.REST, builder *Builder, sessionNow func() sess
 	}
 	return &RESTExecutor{rest: rest, builder: builder, sessionNow: sessionNow, regularTIF: regularTIF}
 }
-
-// SetHook installs the submission hook (confirmation, latency tracking).
-func (e *RESTExecutor) SetHook(h ResultHook) { e.hook = h }
 
 // SetRegularTIF switches the regular-hours time-in-force ("day"/"ioc").
 func (e *RESTExecutor) SetRegularTIF(tif string) {
@@ -76,20 +63,12 @@ func clientOrderID() string {
 }
 
 func (e *RESTExecutor) submit(ctx context.Context, in BuildInput) (alpaca.Order, error) {
-	req, warn, err := e.builder.Build(ctx, in)
+	req, _, err := e.builder.Build(ctx, in)
 	if err != nil {
 		return alpaca.Order{}, err
 	}
 	req.ClientOrderID = clientOrderID()
-	if e.hook != nil && !e.hook.BeforeSubmit(req, warn) {
-		return alpaca.Order{}, fmt.Errorf("aborted by user")
-	}
-	start := time.Now()
-	order, err := e.rest.PlaceOrder(ctx, req)
-	if e.hook != nil {
-		e.hook.AfterSubmit(req, order, err, time.Since(start))
-	}
-	return order, err
+	return e.rest.PlaceOrder(ctx, req)
 }
 
 func (e *RESTExecutor) Buy(ctx context.Context, symbol string, qty int) (alpaca.Order, error) {
@@ -120,7 +99,10 @@ func (e *RESTExecutor) LimitSell(ctx context.Context, symbol string, qty int, pr
 	})
 }
 
-// Flatten submits the opposite-side order for the full position size.
+// Flatten submits the opposite-side order for the full position size. If
+// the market is locally Closed (weekend halt, holiday override), it falls
+// back to DELETE /v2/positions/{symbol}, which liquidates regardless of
+// order-form rules — the emergency exit must always work.
 func (e *RESTExecutor) Flatten(ctx context.Context, symbol string, positionQty float64) (alpaca.Order, error) {
 	if positionQty == 0 {
 		return alpaca.Order{}, fmt.Errorf("no position in %s", symbol)
@@ -128,6 +110,14 @@ func (e *RESTExecutor) Flatten(ctx context.Context, symbol string, positionQty f
 	qty := int(math.Abs(positionQty))
 	if qty == 0 {
 		return alpaca.Order{}, fmt.Errorf("no position in %s", symbol)
+	}
+	// Closed locally ⇒ the builder would reject ("market is closed"). Use
+	// the position-close endpoint, which works outside any session.
+	if e.sessionNow() == session.Closed {
+		if err := e.rest.ClosePosition(ctx, symbol); err != nil {
+			return alpaca.Order{}, err
+		}
+		return alpaca.Order{Symbol: symbol, Status: "close_requested"}, nil
 	}
 	side := "sell"
 	if positionQty < 0 {

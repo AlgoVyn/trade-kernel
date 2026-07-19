@@ -45,6 +45,14 @@ func NewREST(keyID, secretKey string, paper bool) *REST {
 	}
 }
 
+// SetBaseURL overrides the trading base URL. Intended for httptest-based
+// integration tests; not used in production.
+func (c *REST) SetBaseURL(u string) { c.tradingBase = u }
+
+// SetDataURL overrides the market-data base URL. Intended for httptest-
+// based integration tests; not used in production.
+func (c *REST) SetDataURL(u string) { c.dataBase = u }
+
 func (c *REST) do(ctx context.Context, method, base, path string, query url.Values, body any, out any) error {
 	u := base + path
 	if len(query) > 0 {
@@ -201,5 +209,41 @@ func (c *REST) Bars(ctx context.Context, symbol, timeframe string, start, end ti
 			return out, nil
 		}
 		page = br.NextPageToken
+	}
+}
+
+// tradesResponse is the market-data trades envelope.
+type tradesResponse struct {
+	Trades        []Trade `json:"trades"`
+	NextPageToken string  `json:"next_page_token"`
+}
+
+// Trades fetches historical trades for symbol between start and end,
+// following pagination. Used to backfill the sub-minute timeframes
+// (1s/5s/15s), which the bars endpoint doesn't serve — replaying these
+// through the aggregator produces their bars.
+func (c *REST) Trades(ctx context.Context, symbol string, start, end time.Time, limit int) ([]Trade, error) {
+	var out []Trade
+	page := ""
+	for {
+		q := url.Values{
+			"start": {start.UTC().Format(time.RFC3339)},
+			"end":   {end.UTC().Format(time.RFC3339)},
+			"limit": {strconv.Itoa(limit)},
+			"feed":  {"sip"},
+			"sort":  {"asc"},
+		}
+		if page != "" {
+			q.Set("page_token", page)
+		}
+		var tr tradesResponse
+		if err := c.data(ctx, http.MethodGet, "/v2/stocks/"+url.PathEscape(symbol)+"/trades", q, &tr); err != nil {
+			return nil, err
+		}
+		out = append(out, tr.Trades...)
+		if tr.NextPageToken == "" {
+			return out, nil
+		}
+		page = tr.NextPageToken
 	}
 }

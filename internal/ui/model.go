@@ -6,6 +6,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -72,6 +73,11 @@ type Model struct {
 	width  int
 	height int
 
+	// panOffset is how many bars the chart view is shifted back from the
+	// live edge. 0 = live (forming bar at the right edge); >0 = viewing
+	// history. Reset to 0 on symbol/resolution switch.
+	panOffset int
+
 	cmdActive bool
 	cmdBuf    string
 
@@ -129,18 +135,21 @@ func NewModel(d Deps) *Model {
 
 func defaultKeys() map[string]string {
 	return map[string]string{
-		"B":      "buy",
-		"S":      "sell",
-		"A":      "add",
-		"D":      "reduce",
-		"F":      "flatten",
-		"C":      "cancel_all",
-		"X":      "panic",
-		":":      "cmdline",
-		"tab":    "cycle_tf",
-		"i":      "cycle_indicators",
-		"q":      "quit",
-		"ctrl+c": "quit_force",
+		"B":        "buy",
+		"S":        "sell",
+		"A":        "add",
+		"D":        "reduce",
+		"F":        "flatten",
+		"C":        "cancel_all",
+		"X":        "panic",
+		":":        "cmdline",
+		"tab":      "cycle_tf",
+		"shift+tab": "cycle_tf_back",
+		"left":     "pan_left",
+		"right":    "pan_right",
+		"i":        "cycle_indicators",
+		"q":        "quit",
+		"ctrl+c":   "quit_force",
 	}
 }
 
@@ -183,6 +192,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setStatus(fmt.Sprintf("switch %s: %v", msg.symbol, msg.err), true)
 		} else {
 			m.symbol = msg.symbol
+			m.panOffset = 0
 			m.setStatus("symbol → "+msg.symbol, false)
 		}
 		return m, nil
@@ -284,6 +294,17 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "cycle_tf":
 		m.tfIdx = (m.tfIdx + 1) % len(m.tfs)
+		m.panOffset = 0
+		return m, nil
+	case "cycle_tf_back":
+		m.tfIdx = (m.tfIdx - 1 + len(m.tfs)) % len(m.tfs)
+		m.panOffset = 0
+		return m, nil
+	case "pan_left":
+		m.pan(-1)
+		return m, nil
+	case "pan_right":
+		m.pan(1)
 		return m, nil
 	case "cycle_indicators":
 		m.cycleIndicators()
@@ -315,6 +336,59 @@ func (m *Model) cycleIndicators() {
 		m.showVWAP = false
 	default:
 		m.showSMA, m.showEMA, m.showVWAP = true, true, true
+	}
+}
+
+// chartWidth returns the number of cells available for candles. Mirrors
+// the layout math in View().
+func (m *Model) chartWidth() int {
+	sideW := 0
+	if m.width >= 100 {
+		sideW = 38
+	}
+	w := m.width - sideW
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+// pan shifts the chart view through history. dir < 0 pans back to older
+// bars (←), dir > 0 pans forward toward live (→). Each press jumps a
+// quarter of the chart width so scrolling feels responsive.
+func (m *Model) pan(dir int) {
+	depth := m.d.Agg.HistoryDepth(m.tfs[m.tfIdx])
+	if depth <= 0 {
+		return
+	}
+	// offset=0 is live (forming bar); offset=depth shows the oldest
+	// retained closed bar. Snapshot clamps anything beyond that, but we
+	// clamp here too so the status-bar counter stays truthful.
+	maxBack := depth
+	step := m.chartWidth() / 4
+	if step < 1 {
+		step = 1
+	}
+	switch {
+	case dir < 0:
+		m.panOffset += step
+		if m.panOffset > maxBack {
+			m.panOffset = maxBack
+		}
+		m.setStatus(fmt.Sprintf("◀ back %d bars", m.panOffset), false)
+	default: // dir > 0: forward toward live
+		if m.panOffset == 0 {
+			return
+		}
+		m.panOffset -= step
+		if m.panOffset < 0 {
+			m.panOffset = 0
+		}
+		if m.panOffset == 0 {
+			m.setStatus("back to live", false)
+		} else {
+			m.setStatus(fmt.Sprintf("▶ forward, now −%d", m.panOffset), false)
+		}
 	}
 }
 
@@ -399,7 +473,7 @@ func (m *Model) flattenIntent(skipRisk bool) tea.Cmd {
 		m.setStatus("no position in "+symbol, true)
 		return nil
 	}
-	qty := int(abs(pos))
+	qty := int(math.Abs(pos))
 	side := "sell"
 	if pos < 0 {
 		side = "buy"
@@ -411,6 +485,16 @@ func (m *Model) flattenIntent(skipRisk bool) tea.Cmd {
 		}
 	}
 	label := fmt.Sprintf("FLATTEN %s (%s %d)", symbol, strings.ToUpper(side), qty)
+	// Show the converted limit price + any stale-quote warning in extended
+	// sessions, mirroring orderIntent.
+	if session.Extended(m.sess) && m.d.Builder != nil {
+		if px, warn := m.d.Builder.PreviewLimit(side); px > 0 {
+			label += fmt.Sprintf(" ~lmt %.2f", px)
+			if warn != "" {
+				label += " [" + warn + "]"
+			}
+		}
+	}
 	p := &pendingAction{
 		label: label,
 		run:   func(ctx context.Context) (alpaca.Order, error) { return m.d.Exec.Flatten(ctx, symbol, pos) },
@@ -432,23 +516,37 @@ func (m *Model) cancelAllIntent() tea.Cmd {
 	return m.execAsync(p)
 }
 
-// panicIntent: cancel all + flatten, bypassing the risk checker and
-// confirmation. This is the emergency exit.
+// panicIntent: cancel all + flatten every position, bypassing the risk
+// checker and confirmation. This is the emergency exit — it must flatten
+// the whole account, not just the active symbol.
 func (m *Model) panicIntent() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		start := time.Now()
 		_ = m.d.Exec.CancelAll(ctx)
-		pos := m.d.Store.PositionQty(m.symbol)
-		if pos == 0 {
+		var flats []string
+		var errs []string
+		for _, p := range m.d.Store.Positions() {
+			qty := m.d.Store.PositionQty(p.Symbol)
+			if qty == 0 {
+				continue
+			}
+			o, err := m.d.Exec.Flatten(ctx, p.Symbol, qty)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", p.Symbol, err))
+				continue
+			}
+			flats = append(flats, p.Symbol+" "+o.ID)
+		}
+		switch {
+		case len(flats) == 0 && len(errs) == 0:
 			return orderResultMsg{label: "PANIC", detail: "cancelled all; already flat", latency: time.Since(start)}
+		case len(errs) > 0:
+			return orderResultMsg{label: "PANIC", err: fmt.Errorf("flatten errors: %s", strings.Join(errs, "; ")), latency: time.Since(start)}
+		default:
+			return orderResultMsg{label: "PANIC", detail: "flatten " + strings.Join(flats, ", "), latency: time.Since(start)}
 		}
-		o, err := m.d.Exec.Flatten(ctx, m.symbol, pos)
-		if err != nil {
-			return orderResultMsg{label: "PANIC", err: err, latency: time.Since(start)}
-		}
-		return orderResultMsg{label: "PANIC", detail: "flatten order " + o.ID, latency: time.Since(start)}
 	}
 }
 
@@ -500,6 +598,7 @@ func (m *Model) runCommand(input string) tea.Cmd {
 				m.tfIdx = i
 			}
 		}
+		m.panOffset = 0
 		return nil
 	case cmdline.KindPreset:
 		if c.Preset < 1 || c.Preset > len(m.d.Cfg.SizePresets) {
@@ -528,7 +627,7 @@ func (m *Model) runCommand(input string) tea.Cmd {
 		m.done = true
 		return nil
 	case cmdline.KindHelp:
-		m.setStatus("B/S buy/sell A/D add/reduce F flatten C cancel X panic 1-4 preset : cmd tab tf i indicators q quit", false)
+		m.setStatus("B/S buy/sell A/D add/reduce F flatten C cancel X panic 1-9 preset : cmd ←/→ pan tab/shift-tab tf i indicators q quit", false)
 		return nil
 	}
 	return nil
@@ -539,13 +638,6 @@ func onOff(b bool) string {
 		return "on"
 	}
 	return "off"
-}
-
-func abs(f float64) float64 {
-	if f < 0 {
-		return -f
-	}
-	return f
 }
 
 // View renders the full screen.
@@ -566,19 +658,22 @@ func (m *Model) View() string {
 	if volH > 8 {
 		volH = 8
 	}
-	candleH := m.height - statusH - bottomH - volH
+	rulerH := 1 // time axis between candles and volume
+	candleH := m.height - statusH - bottomH - volH - rulerH
 	if candleH < 1 {
 		candleH = 1
 	}
 
-	snap := m.d.Agg.Snapshot(m.tfs[m.tfIdx], chartW)
+	snap := m.d.Agg.Snapshot(m.tfs[m.tfIdx], chartW, m.panOffset)
 	chartLines := renderCandles(snap, chartW, candleH, ChartOpts{
 		ShowSMA: m.showSMA, ShowEMA: m.showEMA, ShowVWAP: m.showVWAP,
 		SessionShading: m.shading,
 	})
+	rulerLine := renderTimeRuler(snap, chartW, m.tfs[m.tfIdx])
 	volLines := renderVolume(snap, chartW, volH, m.shading)
 
-	left := lipgloss.JoinVertical(lipgloss.Left, append(chartLines, volLines...)...)
+	// Stack: candles, then the time ruler, then volume.
+	left := lipgloss.JoinVertical(lipgloss.Left, append(append(chartLines, rulerLine), volLines...)...)
 
 	var body string
 	if sideW > 0 {
@@ -626,6 +721,13 @@ func (m *Model) renderStatusBar() string {
 		lock = lipgloss.NewStyle().Background(lipgloss.Color("9")).Foreground(lipgloss.Color("15")).Bold(true).
 			Render(" LOCKED: " + reason + " ")
 	}
+	// When panned back, flag it loudly: acting on a stale chart thinking
+	// it's live is dangerous in a trading app.
+	panned := ""
+	if m.panOffset > 0 {
+		panned = lipgloss.NewStyle().Background(lipgloss.Color("94")).Foreground(lipgloss.Color("0")).Bold(true).
+			Render(fmt.Sprintf(" ◀ HISTORY −%d ", m.panOffset))
+	}
 	stale := ""
 	if !lastAt.IsZero() && time.Since(lastAt) > 10*time.Second && m.sess != session.Closed {
 		stale = fg.Faint(true).Render(" (feed quiet)")
@@ -636,7 +738,7 @@ func (m *Model) renderStatusBar() string {
 		price, spread,
 		time.Now().In(session.Location()).Format("15:04:05 ET"),
 		m.qty(), m.tfs[m.tfIdx], lat, stale)
-	return lipgloss.NewStyle().Width(m.width).Render(line + lock)
+	return lipgloss.NewStyle().Width(m.width).Render(line + lock + panned)
 }
 
 func (m *Model) renderBottom() string {
