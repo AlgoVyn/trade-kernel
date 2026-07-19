@@ -3,9 +3,13 @@ package execution
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"trade-kernel/internal/alpaca"
 	"trade-kernel/internal/session"
 )
 
@@ -152,5 +156,71 @@ func TestBuildExtendedExplicitLimit(t *testing.T) {
 	}
 	if req.LimitPrice != "99.50" || !req.ExtendedHours {
 		t.Fatalf("req = %+v", req)
+	}
+}
+
+// TestEligibilityCacheHit: first OvernightTradable hits assets once; second
+// within TTL is served from cache (no second HTTP call).
+func TestEligibilityCacheHit(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/assets/AAPL" {
+			http.NotFound(w, r)
+			return
+		}
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"symbol":"AAPL","tradable":true,"overnight_tradable":true}`))
+	}))
+	defer srv.Close()
+
+	rest := alpaca.NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	cache := NewEligibilityCache(rest)
+
+	ok, err := cache.OvernightTradable(context.Background(), "AAPL")
+	if err != nil || !ok {
+		t.Fatalf("first: ok=%v err=%v", ok, err)
+	}
+	ok, err = cache.OvernightTradable(context.Background(), "AAPL")
+	if err != nil || !ok {
+		t.Fatalf("second: ok=%v err=%v", ok, err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("asset hits = %d, want 1 (second call cached)", hits.Load())
+	}
+}
+
+// TestEligibilityCacheExpiry: after TTL elapses, OvernightTradable refetches.
+func TestEligibilityCacheExpiry(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/assets/AAPL" {
+			http.NotFound(w, r)
+			return
+		}
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"symbol":"AAPL","tradable":true,"overnight_tradable":true}`))
+	}))
+	defer srv.Close()
+
+	rest := alpaca.NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	cache := NewEligibilityCache(rest)
+	cache.ttl = 20 * time.Millisecond
+
+	if _, err := cache.OvernightTradable(context.Background(), "AAPL"); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("hits after first = %d", hits.Load())
+	}
+	time.Sleep(40 * time.Millisecond)
+	if _, err := cache.OvernightTradable(context.Background(), "AAPL"); err != nil {
+		t.Fatalf("after expiry: %v", err)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("asset hits = %d, want 2 after TTL expiry", hits.Load())
 	}
 }

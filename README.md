@@ -59,9 +59,8 @@ export APCA_API_SECRET_KEY=...
 | `B` / `S` | Buy / sell preset size |
 | `A` / `D` | Add to / reduce position |
 | `F` | Flatten entire position |
-| `C` | Cancel all open orders |
-| `X` | Panic: cancel **active symbol** orders + flatten it (no confirmation) |
-| `Ctrl+X` | Panic **all**: cancel every open order + flatten all positions |
+| `C` | Cancel open orders for the active symbol |
+| `X` | Panic: cancel active-symbol orders + flatten it (no confirmation) |
 | `1`–`9` | Select size preset |
 | `Tab` / `Shift+Tab` | Cycle chart resolution forward / backward |
 | `←` / `→` | Pan chart back into history / forward toward live |
@@ -75,8 +74,8 @@ export APCA_API_SECRET_KEY=...
 :buy 250 lmt 152.30      limit buy        :sell 100 mkt     market sell
 :sym NVDA                switch symbol    :tf 5m            chart timeframe
 :preset 2                size preset      :flatten          close position
-:cancel                  cancel all       :lock [reason]    engage risk lock
-:unlock                  release lock     :panic / :panic all  symbol / account panic
+:cancel                  cancel active    :lock [reason]    engage risk lock
+:unlock                  release lock     :panic             panic active symbol
 :confirm on|off          toggle confirms  :shading on|off   toggle shading
 :quit                    quit             :help             key summary
 ```
@@ -99,9 +98,8 @@ warning. Flatten/reduce are direction-aware from the position sign.
   `live_trading_acknowledged: true`, and prints a warning banner.
 - **Size rails.** Max order qty and projected max position qty (reducing
   exposure is always allowed); short duplicate-order debounce.
-- **Panic (X).** Cancels open orders for the active symbol and flattens
-  that symbol only (other names left alone). **Ctrl+X** / `:panic all`
-  cancels all orders and flattens every cached position.
+- **Panic (X / `:panic`).** Cancels open orders for the active symbol and
+  flattens that symbol only.
 - **Manual lock.** `:lock [reason]` engages the kill-switch until
   `:unlock` (orders rejected; flatten/panic still work).
 - **Confirmations.** `confirm_orders: true` shows every order (with the
@@ -115,6 +113,25 @@ go build ./... && go vet ./... && go test -race ./...
 
 See [DESIGN.md](DESIGN.md) for the architecture, package map, order
 builder rules, failure handling, and testing strategy.
+
+## Local latency tips
+
+Order RTT is dominated by network distance to Alpaca; the app cannot beat
+that from a laptop. It *does* warm the trading HTTPS connection at startup,
+prefetch overnight eligibility per symbol, and refresh the chart on a
+configurable tick (`chart.tick_ms`, default 50 ms, adaptive by TF).
+
+When measuring buy/sell speed:
+
+1. Set `confirm_orders: false` (or `:confirm off`) — y/n dominates otherwise.
+2. Ignore the first order after a long idle; watch status-bar **p50/p99** after a few submits.
+3. Prefer a low-jitter network (wired, no extra VPN hop when testing).
+4. Use `1s`/`5s` for price-action feel. Raising `tick_ms` mainly slows mid TFs
+   (e.g. `1m`); live short TFs stay at `min(base, 33ms)`, while high TF / pan /
+   closed already floor at ≥100 ms. On a low-power laptop, switch to a higher TF
+   or pan history rather than expecting `tick_ms: 100` alone to cut short-TF CPU.
+
+For the lowest order RTT, still deploy near Alpaca (see below).
 
 ## Deployment
 

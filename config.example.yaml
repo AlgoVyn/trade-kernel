@@ -46,11 +46,15 @@ chart:
   timeframe: 1m             # initial resolution
   bars_visible: 120
   session_shading: true
+  tick_ms: 50               # base UI refresh (16–500). Short TFs speed up to 33ms
+                            # when base is higher; panned/closed slow to ≥100ms.
 
 # Optional keybinding overrides (action -> key). Actions:
-# buy, sell, add, reduce, flatten, cancel_all, panic, cmdline,
+# buy, sell, add, reduce, flatten, cancel, panic, cmdline,
 # cycle_tf, cycle_tf_back, pan_left, pan_right, cycle_indicators,
 # quit, quit_force
+# Legacy aliases (same as cancel/panic — symbol-scoped only):
+# cancel_all, panic_all
 # keys:
 #   buy: B
 #   panic: X

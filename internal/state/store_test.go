@@ -1,8 +1,11 @@
 package state
 
 import (
+	"context"
+	"encoding/json"
 	"math"
 	"testing"
+	"time"
 
 	"trade-kernel/internal/alpaca"
 )
@@ -334,5 +337,223 @@ func TestApplyUpdateScaleInUsesFillSizeNotPositionDelta(t *testing.T) {
 	want := (100.0*100 + 50*120 + 50*100) / 200
 	if math.Abs(float64(p.AvgEntryPrice)-want) > 1e-9 {
 		t.Fatalf("avg = %v, want %v (fill size + residual@prevAvg)", p.AvgEntryPrice, want)
+	}
+}
+
+func TestReconcileDayPnLRealizedOnly(t *testing.T) {
+	s := NewStore()
+	// Equity +1500 vs prior close, of which +200 is open intraday mark → realized +1300.
+	// Total unrealized vs cost is +500 (includes multi-day mark).
+	s.Reconcile(
+		alpaca.Account{Equity: 101500, LastEquity: 100000, Cash: 50000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 10, Side: "long", UnrealizedIntradayPL: 200, UnrealizedPL: 500}},
+		nil,
+	)
+	p := s.PnL()
+	if !p.HasDay || p.Day != 1300 {
+		t.Fatalf("day realized = %+v, want HasDay Day=1300", p)
+	}
+	s.SetWeekPnL(3200)
+	p = s.PnL()
+	// Week raw 3200 − total open unrealized 500 → 2700 (multi-day marks stripped).
+	if !p.HasWeek || p.Week != 2700 {
+		t.Fatalf("week realized = %+v, want 2700", p)
+	}
+}
+
+func TestPnLIgnoresFillZeroedUnrealized(t *testing.T) {
+	s := NewStore()
+	s.Reconcile(
+		alpaca.Account{Equity: 101500, LastEquity: 100000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 10, Side: "long", UnrealizedIntradayPL: 200, UnrealizedPL: 500, AvgEntryPrice: 100}},
+		nil,
+	)
+	s.SetWeekPnL(3200)
+	// Scale-in fill rebuilds position without mark fields (zeros).
+	s.ApplyUpdate(alpaca.TradeUpdate{
+		Event: "fill",
+		Order: alpaca.Order{
+			ID: "f1", Symbol: "AAPL", Qty: 5, FilledQty: 5, Side: "buy",
+			FilledAvgPrice: 110,
+		},
+		Price:       110,
+		Qty:         5,
+		PositionQty: qty(15),
+	})
+	p := s.PnL()
+	if !p.HasDay || p.Day != 1300 {
+		t.Fatalf("day must stay snapshotted after fill: %+v", p)
+	}
+	if !p.HasWeek || p.Week != 2700 {
+		t.Fatalf("week must stay snapshotted after fill: %+v", p)
+	}
+}
+
+// TestSetWeekPnLUsesRESTMarkSnap: week history refresh after a WS fill that
+// zeroed mark fields must still strip the last REST open-unrealized snap.
+func TestSetWeekPnLUsesRESTMarkSnap(t *testing.T) {
+	s := NewStore()
+	s.Reconcile(
+		alpaca.Account{Equity: 101500, LastEquity: 100000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 10, Side: "long", UnrealizedIntradayPL: 200, UnrealizedPL: 500, AvgEntryPrice: 100}},
+		nil,
+	)
+	// Fill zeros mark fields on the live positions map.
+	s.ApplyUpdate(alpaca.TradeUpdate{
+		Event: "fill",
+		Order: alpaca.Order{
+			ID: "f1", Symbol: "AAPL", Qty: 5, FilledQty: 5, Side: "buy",
+			FilledAvgPrice: 110,
+		},
+		Price:       110,
+		Qty:         5,
+		PositionQty: qty(15),
+	})
+	// Week refresh lands in the WS-zeroed window (no Reconcile yet).
+	s.SetWeekPnL(3200)
+	p := s.PnL()
+	if !p.HasWeek || p.Week != 2700 {
+		t.Fatalf("week must use REST mark snap not WS-zeroed map: %+v, want Week=2700", p)
+	}
+}
+
+func TestReconcileClearsDayWhenLastEquityMissing(t *testing.T) {
+	s := NewStore()
+	s.Reconcile(
+		alpaca.Account{Equity: 101500, LastEquity: 100000},
+		nil, nil,
+	)
+	if p := s.PnL(); !p.HasDay {
+		t.Fatal("expected day after first reconcile")
+	}
+	s.Reconcile(alpaca.Account{Equity: 101500, LastEquity: 0}, nil, nil)
+	if p := s.PnL(); p.HasDay {
+		t.Fatalf("missing last_equity must clear day PnL: %+v", p)
+	}
+}
+
+type fakeRefresher struct {
+	acct    alpaca.Account
+	pos     []alpaca.Position
+	ord     []alpaca.Order
+	hist    alpaca.PortfolioHistory
+	histErr error
+}
+
+func (f fakeRefresher) Account(context.Context) (alpaca.Account, error) { return f.acct, nil }
+func (f fakeRefresher) Positions(context.Context) ([]alpaca.Position, error) {
+	return f.pos, nil
+}
+func (f fakeRefresher) OpenOrders(context.Context, string) ([]alpaca.Order, error) {
+	return f.ord, nil
+}
+func (f fakeRefresher) PortfolioHistory(context.Context, string, string) (alpaca.PortfolioHistory, error) {
+	return f.hist, f.histErr
+}
+
+func TestRefreshDayPnLFromAccount(t *testing.T) {
+	s := NewStore()
+	r := fakeRefresher{
+		acct: alpaca.Account{Equity: 102000, LastEquity: 100000},
+	}
+	if err := s.Refresh(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	p := s.PnL()
+	if !p.HasDay || p.Day != 2000 {
+		t.Fatalf("after refresh day = %+v, want Day=2000", p)
+	}
+	// Refresh no longer pulls week history.
+	if p.HasWeek {
+		t.Fatalf("week should stay unset without RefreshWeekPnL: %+v", p)
+	}
+}
+
+func TestRefreshWeekPnLFromHistory(t *testing.T) {
+	s := NewStore()
+	var hist alpaca.PortfolioHistory
+	if err := json.Unmarshal([]byte(`{"profit_loss":["0","800","2500"],"base_value":"100000"}`), &hist); err != nil {
+		t.Fatal(err)
+	}
+	r := fakeRefresher{
+		acct: alpaca.Account{Equity: 102000, LastEquity: 100000},
+		pos:  []alpaca.Position{{Symbol: "AAPL", Qty: 10, Side: "long", UnrealizedPL: 400, UnrealizedIntradayPL: 100}},
+		hist: hist,
+	}
+	if err := s.Refresh(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RefreshWeekPnL(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	p := s.PnL()
+	if !p.HasDay || p.Day != 1900 { // 2000 − 100 open intraday
+		t.Fatalf("day = %+v, want Day=1900", p)
+	}
+	// Week 2500 − total open unrealized 400.
+	if !p.HasWeek || p.Week != 2100 {
+		t.Fatalf("week = %+v, want 2100", p)
+	}
+}
+
+func TestRefreshWeekPnLErrorKeepsPriorSample(t *testing.T) {
+	s := NewStore()
+	s.Reconcile(alpaca.Account{Equity: 102000, LastEquity: 100000}, nil, nil)
+	s.SetWeekPnL(2500)
+	if !s.PnL().HasWeek {
+		t.Fatal("setup: want week set")
+	}
+	r := fakeRefresher{histErr: context.DeadlineExceeded}
+	if err := s.RefreshWeekPnL(context.Background(), r); err == nil {
+		t.Fatal("expected history error")
+	}
+	p := s.PnL()
+	// Transient error must not wipe a recent good sample (TTL handles freeze).
+	if !p.HasWeek || p.Week != 2500 {
+		t.Fatalf("history error must keep prior week: %+v", p)
+	}
+	if !p.HasDay || p.Day != 2000 {
+		t.Fatalf("day must remain: %+v", p)
+	}
+}
+
+func TestRefreshWeekPnLEmptySeriesClearsWeek(t *testing.T) {
+	s := NewStore()
+	s.SetWeekPnL(2500)
+	r := fakeRefresher{hist: alpaca.PortfolioHistory{}} // no profit_loss / equity
+	if err := s.RefreshWeekPnL(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if s.PnL().HasWeek {
+		t.Fatal("empty history series must clear week")
+	}
+}
+
+func TestWeekPnLStaleHidden(t *testing.T) {
+	s := NewStore()
+	s.SetWeekPnL(1000)
+	s.mu.Lock()
+	s.weekUpdatedAt = time.Now().Add(-weekPnLStaleAfter - time.Minute)
+	s.mu.Unlock()
+	if s.PnL().HasWeek {
+		t.Fatal("stale week sample must be hidden")
+	}
+}
+
+func TestRefreshDoesNotFetchWeek(t *testing.T) {
+	s := NewStore()
+	var hist alpaca.PortfolioHistory
+	if err := json.Unmarshal([]byte(`{"profit_loss":["2500"]}`), &hist); err != nil {
+		t.Fatal(err)
+	}
+	r := fakeRefresher{
+		acct: alpaca.Account{Equity: 102000, LastEquity: 100000},
+		hist: hist,
+	}
+	if err := s.Refresh(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if s.PnL().HasWeek {
+		t.Fatal("Refresh must not set week PnL (use RefreshWeekPnL)")
 	}
 }

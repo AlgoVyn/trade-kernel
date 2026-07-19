@@ -17,8 +17,9 @@ on a GCP VM near Alpaca's servers; the user attaches via SSH + tmux.
 ## Architecture
 
 Single process, goroutines connected by channels, mutex-guarded state at
-package boundaries. The render loop pulls snapshots on a 100 ms ticker
-and never touches the ingest hot path.
+package boundaries. The render loop pulls snapshots on a configurable
+tick (`chart.tick_ms`, default 50 ms, adaptive by TF) and never touches
+the ingest hot path.
 
 ```
 SIP WS (trades/quotes) ──> bars.Aggregator ──(pull: Snapshot/LatestQuote)──┐
@@ -40,14 +41,14 @@ Keyboard ──> ui.Model ──> risk.Checker ──> execution.Executor ──
 | `cmd/trade-kernel` | Config load, startup banner, wire-up, signal handling, symbol switching, bar backfill. |
 | `internal/config` | YAML config (incl. `api_key_id`/`api_secret_key`) + env overrides (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`; env wins). Validation: live mode requires explicit acknowledgement; fills defaults. |
 | `internal/session` | Authoritative session classification in `America/New_York` (tz database, DST-safe). `Engine` emits transition events, accepts `/v2/clock` overrides for holidays/early closes (only ever *narrows* to Closed, never widens). |
-| `internal/alpaca` | REST client (account, positions, orders, clock, assets, bars w/ pagination); SIP market-data WS client (auth, subscribe, hot-switch, exponential-backoff reconnect, resync callback); trading WS client (`trade_updates`). |
+| `internal/alpaca` | REST client (account, positions, orders, clock, assets, portfolio history, bars w/ pagination); SIP market-data WS client (auth, subscribe, hot-switch, exponential-backoff reconnect, resync callback); trading WS client (`trade_updates`). |
 | `internal/bars` | Aggregates trades into 1s/5s/15s/1m/5m/15m/1h/1d bars in preallocated ring buffers (2048/TF). Daily bars anchor at 20:00 ET (the overnight open) so a "day" is one 24/5 trading day. Handles late/out-of-order trades (H/L/V correction in-place). Maintains per-TF dual EMA and session VWAP; caches latest NBBO + last trade for the order builder. |
 | `internal/indicators` | Pure incremental O(1) EMA, resettable VWAP (SMA retained as a utility), each with non-mutating `Peek` for live forming-bar values. |
-| `internal/state` | Mutex-guarded cache of account/positions/open orders. REST snapshot at startup + every 5 s; trading-WS events applied incrementally; full refresh on WS reconnect. |
+| `internal/state` | Mutex-guarded cache of account/positions/open orders. REST snapshot at startup + every 5 s; trading-WS events applied incrementally; full refresh on WS reconnect. Account **day/week PnL** (open marks stripped at REST time): day = equity−last_equity − Σ `unrealized_intraday_pl`; week = 1W portfolio history − Σ `unrealized_pl` (refreshed every 5 min, not on the 5 s path). Snapshots avoid WS fill rewrites zeroing marks. |
 | `internal/execution` | `Executor` interface (`Buy/Sell/LimitBuy/LimitSell/Flatten/CancelAll/CancelSymbol`). `Builder` applies session rules. `RESTExecutor` submits with generated client order IDs. `EligibilityCache` caches overnight-tradability per symbol (1 h TTL). |
 | `internal/risk` | `Checker`: optional lock, max order qty, projected max position qty (reducing exposure always allowed), duplicate-order debounce (Check/Record split). |
 | `internal/cmdline` | `:` command parser → typed `Command` structs. |
-| `internal/ui` | bubbletea model, solid-block candlestick renderer with braille indicator overlays, volume pane, bottom info bar, status bar, latency tracker, confirmation state machine. Panic (X) is symbol-scoped via `CancelSymbol` + flatten. |
+| `internal/ui` | bubbletea model, solid-block candlestick renderer with braille indicator overlays, volume pane, bottom info bar, status bar, latency tracker, confirmation state machine. Cancel (C) and panic (X) are symbol-scoped via `CancelSymbol` (+ flatten for panic). |
 
 ## Key design decisions
 
@@ -55,9 +56,9 @@ Keyboard ──> ui.Model ──> risk.Checker ──> execution.Executor ──
 
 The TUI does not consume per-trade events. Ingest goroutines write into
 `bars.Aggregator` and `state.Store` (both mutex-guarded); the render
-loop snapshots every 100 ms. This caps render work, keeps GC pressure
-off the ingest path, and makes the UI trivially correct under bursts —
-a trade burst just changes the next snapshot.
+loop snapshots on a short adaptive ticker. This caps render work, keeps
+GC pressure off the ingest path, and makes the UI trivially correct under
+bursts — a trade burst just changes the next snapshot.
 
 ### 2. Session engine is the single source of truth for order form
 
@@ -89,13 +90,11 @@ price in extended sessions.
    cap, 300 ms duplicate-order debounce, manual kill-switch
    (`:lock [reason]` / `:unlock`). There is no automatic daily-loss
    lock; operators engage the switch deliberately.
-2. **Panic key (X)**: cancel open orders for the *active* symbol +
-   flatten that symbol only, bypassing the checker and confirmation.
-   Other symbols' orders and positions are left alone (switch with
-   `:sym` and flatten/panic each). Status reports other symbols that
-   still have positions or resting orders. **Ctrl+X** / `:panic all`
-   is the account-wide emergency: CancelAll + flatten every cached
-   position.
+2. **Panic key (X / `:panic`)**: cancel open orders for the *active*
+   symbol + flatten that symbol only, bypassing the checker and
+   confirmation. Scope is always the selected symbol (switch with
+   `:sym` and panic each name separately). When other symbols remain
+   open, the status line reminds the operator (`:sym` then `X`).
 3. **Idempotency**: every order carries a generated client order ID;
    state reconciliation after reconnect prevents duplicates.
 
@@ -141,10 +140,20 @@ overlays with 2% padding.
   WS message; ring buffers preallocated at startup.
 - Order path: hotkey → risk check (in-memory) → one REST call. No
   logging on the hot path; logs go to `trade-kernel.log`.
-- Keypress→ack latency recorded per order; p50/p99 shown in the status
-  bar.
+- Keypress→ack (or confirm-accept→ack) latency recorded per order from
+  submit commit through broker HTTP response; p50/p99 in the status bar.
+- Trading REST client: keep-alive + long idle timeout; startup
+  `/v2/clock` warms TLS. Overnight eligibility is prefetched on symbol
+  switch so hotkeys do not serialize `GET /assets` before `POST /orders`.
+- UI pull tick: `chart.tick_ms` (default 50 ms), adaptive — short TFs
+  speed up to 33 ms when base is higher (aggressive configs below 33 ms
+  stay as-is); high TFs / pan / closed slow to ≥100 ms. Quiet-tape status
+  price reuses the frame chart Snapshot when live; when panned, takes a
+  live-edge Snapshot so history does not overwrite the quote.
 - `GOGC`/ballast tuning deliberately deferred: measure with
   `GODEBUG=gctrace` on the target VM first.
+- Local laptop vs near-Alpaca VM: app optimizations remove *extra* RTTs
+  and UI floor; geo still sets the order RTT floor (see `deploy/SETUP.md`).
 
 ## Keyboard spec (defaults, all rebindable)
 
@@ -153,11 +162,10 @@ overlays with 2% padding.
 | `B` / `S` | Buy / sell preset size (market regular, aggressive limit extended) |
 | `A` / `D` | Add to / reduce position (direction-aware from position sign) |
 | `F` | Flatten (session-appropriate form) |
-| `C` | Cancel all open orders |
+| `C` | Cancel open orders for the active symbol |
 | `X` | Panic: cancel active-symbol orders + flatten active symbol (bypasses checks/confirmation) |
-| `Ctrl+X` | Panic all: CancelAll + flatten every cached position |
 | `1`–`9` | Select size preset |
-| `:` | Command line: `buy 250 lmt 152.30`, `sell 100 mkt`, `sym NVDA`, `tf 5m`, `preset 2`, `flatten`, `cancel`, `lock [reason]`, `unlock`, `panic` / `panic all`, `confirm on|off`, `shading on|off`, `quit`, `help` |
+| `:` | Command line: `buy 250 lmt 152.30`, `sell 100 mkt`, `sym NVDA`, `tf 5m`, `preset 2`, `flatten`, `cancel`, `lock [reason]`, `unlock`, `panic`, `confirm on|off`, `shading on|off`, `quit`, `help` |
 | `Tab` | Cycle resolution (1m/5m/15m/1h/1d/1s/5s/15s) |
 | `Shift+Tab` | Cycle resolution backward |
 | `←` / `→` | Pan chart back into history / forward toward live |

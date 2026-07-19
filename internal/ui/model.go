@@ -143,9 +143,8 @@ func defaultKeys() map[string]string {
 		"A":         "add",
 		"D":         "reduce",
 		"F":         "flatten",
-		"C":         "cancel_all",
+		"C":         "cancel",
 		"X":         "panic",
-		"ctrl+x":    "panic_all",
 		":":         "cmdline",
 		"tab":       "cycle_tf",
 		"shift+tab": "cycle_tf_back",
@@ -159,11 +158,59 @@ func defaultKeys() map[string]string {
 
 // Init starts the render ticker.
 func (m *Model) Init() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return m.tick()
+}
+
+// tickInterval returns the render period for the current view state.
+// Adaptive: short TFs refresh faster (down to 33ms when base is higher);
+// panned history and closed sessions slow down to save CPU. Base comes
+// from config chart.tick_ms (default 50).
+func (m *Model) tickInterval() time.Duration {
+	base := 50 * time.Millisecond
+	if m.d.Cfg != nil {
+		base = m.d.Cfg.Tick()
+	}
+	return TickFor(m.tfs[m.tfIdx], m.panOffset, m.sess, base)
+}
+
+// TickFor chooses a render interval from TF, pan, session, and configured base.
+// Exported for unit tests.
+//
+//	short TFs (1s/5s/15s): min(base, 33ms) — faster than a default 50ms base;
+//	  aggressive configs (e.g. 16ms) are honored, not forced up to 33ms.
+//	high TFs (1h/1d), pan, closed: max(base, 100ms) — slower redraw is fine.
+//	mid TFs (1m etc.): base unchanged.
+func TickFor(tf bars.TF, panOffset int, sess session.Session, base time.Duration) time.Duration {
+	if base <= 0 {
+		base = 50 * time.Millisecond
+	}
+	// History pan or closed market: slower redraw is fine.
+	if panOffset > 0 || sess == session.Closed {
+		if base < 100*time.Millisecond {
+			return 100 * time.Millisecond
+		}
+		return base
+	}
+	switch tf {
+	case bars.TF1s, bars.TF5s, bars.TF15s:
+		// Speed up from a slower base (50→33); keep aggressive configs as-is.
+		if base > 33*time.Millisecond {
+			return 33 * time.Millisecond
+		}
+		return base
+	case bars.TF1h, bars.TF1d:
+		if base < 100*time.Millisecond {
+			return 100 * time.Millisecond
+		}
+		return base
+	default:
+		return base
+	}
 }
 
 func (m *Model) tick() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+	d := m.tickInterval()
+	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 // Update handles messages.
@@ -183,7 +230,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.tick()
 
 	case orderResultMsg:
-		m.d.Latency.Record(msg.latency)
+		if m.d.Latency != nil {
+			m.d.Latency.Record(msg.latency)
+		}
 		if msg.err != nil {
 			m.setStatus(fmt.Sprintf("%s FAILED: %v", msg.label, msg.err), true)
 		} else {
@@ -289,12 +338,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.addReduce(false)
 	case "flatten":
 		return m, m.flattenIntent(false)
-	case "cancel_all":
-		return m, m.cancelAllIntent()
-	case "panic":
+	case "cancel", "cancel_all": // cancel_all is a legacy alias
+		return m, m.cancelIntent()
+	case "panic", "panic_all": // panic_all is a legacy alias (now symbol-scoped)
 		return m, m.panicIntent()
-	case "panic_all":
-		return m, m.panicAllIntent()
 	case "cmdline":
 		m.cmdActive = true
 		m.cmdBuf = ""
@@ -547,114 +594,22 @@ func formatFlattenQty(pos float64) string {
 	return fmt.Sprintf("%.4g", abs)
 }
 
-func (m *Model) cancelAllIntent() tea.Cmd {
+// cancelIntent cancels open orders for the active symbol only.
+func (m *Model) cancelIntent() tea.Cmd {
+	symbol := m.symbol
 	p := &pendingAction{
-		label: "CANCEL ALL ORDERS",
+		label: "CANCEL " + symbol,
 		run: func(ctx context.Context) (alpaca.Order, error) {
-			return alpaca.Order{}, m.d.Exec.CancelAll(ctx)
+			return alpaca.Order{}, m.d.Exec.CancelSymbol(ctx, symbol)
 		},
 	}
 	return m.execAsync(p)
 }
 
-// panicIntent: cancel open orders for the *active* symbol + flatten that
-// symbol only, bypassing the risk checker and confirmation. Other symbols'
-// orders and positions are left alone (use Ctrl+X / :panic all for account-
-// wide emergency exit, or :sym + F/X per name).
-func (m *Model) panicIntent() tea.Cmd {
-	symbol := m.symbol
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		start := time.Now()
-		otherOpen := countOtherOpenSymbols(m.d.Store, symbol)
-		cancelErr := m.d.Exec.CancelSymbol(ctx, symbol)
-		qty := m.d.Store.PositionQty(symbol)
-		if qty == 0 {
-			detail := "cancelled " + symbol + " orders; already flat"
-			if cancelErr != nil {
-				detail += "; cancel err: " + cancelErr.Error()
-			}
-			if otherOpen > 0 {
-				detail += fmt.Sprintf("; +%d other symbols still open (pos/orders) — Ctrl+X for all", otherOpen)
-			}
-			return orderResultMsg{
-				label: "PANIC", detail: detail,
-				latency: time.Since(start),
-			}
-		}
-		o, err := m.d.Exec.Flatten(ctx, symbol, qty)
-		if err != nil {
-			if cancelErr != nil {
-				err = fmt.Errorf("%w (also cancel err: %v)", err, cancelErr)
-			}
-			return orderResultMsg{label: "PANIC", err: err, latency: time.Since(start)}
-		}
-		id := o.ID
-		if id == "" {
-			id = "done"
-		}
-		detail := "flatten " + symbol + " " + id
-		if cancelErr != nil {
-			detail += "; cancel err: " + cancelErr.Error()
-		}
-		if otherOpen > 0 {
-			detail += fmt.Sprintf("; +%d other symbols still open (pos/orders) — Ctrl+X for all", otherOpen)
-		}
-		return orderResultMsg{
-			label: "PANIC", detail: detail,
-			latency: time.Since(start),
-		}
-	}
-}
-
-// panicAllIntent: CancelAll + flatten every cached position. True emergency
-// exit (Ctrl+X / :panic all). Bypasses risk checker and confirmation.
-func (m *Model) panicAllIntent() tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		start := time.Now()
-		cancelErr := m.d.Exec.CancelAll(ctx)
-		var (
-			flattened int
-			errs      []string
-		)
-		if m.d.Store != nil {
-			for _, p := range m.d.Store.Positions() {
-				qty := m.d.Store.PositionQty(p.Symbol)
-				if qty == 0 || p.Symbol == "" {
-					continue
-				}
-				if _, err := m.d.Exec.Flatten(ctx, p.Symbol, qty); err != nil {
-					errs = append(errs, p.Symbol+": "+err.Error())
-					continue
-				}
-				flattened++
-			}
-		}
-		detail := fmt.Sprintf("cancel all + flatten %d symbols", flattened)
-		if cancelErr != nil {
-			detail += "; cancel err: " + cancelErr.Error()
-		}
-		if len(errs) > 0 {
-			detail += "; flatten errs: " + strings.Join(errs, "; ")
-			return orderResultMsg{
-				label: "PANIC ALL", detail: detail,
-				err:     fmt.Errorf("%d flatten failure(s)", len(errs)),
-				latency: time.Since(start),
-			}
-		}
-		return orderResultMsg{
-			label: "PANIC ALL", detail: detail,
-			latency: time.Since(start),
-		}
-	}
-}
-
-// countOtherOpenSymbols returns how many other symbols have a cached
-// position and/or open orders (so panic status is not false-clean when only
-// resting orders remain on another name).
+// countOtherOpenSymbols returns how many symbols other than active have a
+// non-zero position and/or resting open order. Used for post-panic reminders
+// and the info-bar "+N open" badge so multi-name risk is not silent when the
+// book is flat but orders remain.
 func countOtherOpenSymbols(st *state.Store, symbol string) int {
 	if st == nil {
 		return 0
@@ -673,6 +628,56 @@ func countOtherOpenSymbols(st *state.Store, symbol string) int {
 	return len(seen)
 }
 
+// panicIntent: cancel open orders for the active symbol + flatten that
+// symbol, bypassing the risk checker and confirmation. Scope is always
+// the currently selected symbol only.
+func (m *Model) panicIntent() tea.Cmd {
+	symbol := m.symbol
+	// Same as execAsync: start before the bubbletea Cmd so dispatch delay
+	// is included in keypress→ack (status-bar p50/p99).
+	start := time.Now()
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cancelErr := m.d.Exec.CancelSymbol(ctx, symbol)
+		qty := m.d.Store.PositionQty(symbol)
+		otherOpen := countOtherOpenSymbols(m.d.Store, symbol)
+		otherNote := ""
+		if otherOpen > 0 {
+			otherNote = fmt.Sprintf("; %d other symbol(s) still open — :sym then X", otherOpen)
+		}
+		if qty == 0 {
+			detail := "cancelled " + symbol + " orders; already flat" + otherNote
+			if cancelErr != nil {
+				detail += "; cancel err: " + cancelErr.Error()
+			}
+			return orderResultMsg{
+				label: "PANIC", detail: detail,
+				latency: time.Since(start),
+			}
+		}
+		o, err := m.d.Exec.Flatten(ctx, symbol, qty)
+		if err != nil {
+			if cancelErr != nil {
+				err = fmt.Errorf("%w (also cancel err: %v)", err, cancelErr)
+			}
+			return orderResultMsg{label: "PANIC", err: err, latency: time.Since(start)}
+		}
+		id := o.ID
+		if id == "" {
+			id = "done"
+		}
+		detail := "flatten " + symbol + " " + id + otherNote
+		if cancelErr != nil {
+			detail += "; cancel err: " + cancelErr.Error()
+		}
+		return orderResultMsg{
+			label: "PANIC", detail: detail,
+			latency: time.Since(start),
+		}
+	}
+}
+
 func (m *Model) execAsync(p *pendingAction) tea.Cmd {
 	// Record debounce as soon as we commit to submit so a second identical
 	// hotkey during broker RTT cannot pass Check. Declined confirm never
@@ -680,10 +685,12 @@ func (m *Model) execAsync(p *pendingAction) tea.Cmd {
 	if p.record != nil {
 		p.record()
 	}
+	// Keypress→ack (or confirm-accept→ack): start before the bubbletea
+	// command goroutine so dispatch delay is included, matching DESIGN.
+	start := time.Now()
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		start := time.Now()
 		o, err := p.run(ctx)
 		lat := time.Since(start)
 		if err != nil {
@@ -740,7 +747,7 @@ func (m *Model) runCommand(input string) tea.Cmd {
 	case cmdline.KindFlatten:
 		return m.flattenIntent(false)
 	case cmdline.KindCancel:
-		return m.cancelAllIntent()
+		return m.cancelIntent()
 	case cmdline.KindLock:
 		reason := c.Reason
 		if reason == "" {
@@ -754,9 +761,6 @@ func (m *Model) runCommand(input string) tea.Cmd {
 		m.setStatus("kill-switch unlocked", false)
 		return nil
 	case cmdline.KindPanic:
-		if c.All {
-			return m.panicAllIntent()
-		}
 		return m.panicIntent()
 	case cmdline.KindConfirm:
 		m.d.Cfg.ConfirmOrders = c.On
@@ -769,7 +773,7 @@ func (m *Model) runCommand(input string) tea.Cmd {
 		m.done = true
 		return nil
 	case cmdline.KindHelp:
-		m.setStatus("B/S buy/sell A/D add/reduce F flatten C cancel X panic(active) Ctrl+X panic all 1-9 preset :lock/:unlock : cmd ←/→ pan tab/shift-tab tf i q", false)
+		m.setStatus("B/S buy/sell A/D add/reduce F flatten C cancel(active) X panic(active only) 1-9 preset :lock/:unlock : cmd ←/→ pan tab/shift-tab tf i q", false)
 		return nil
 	}
 	return nil
@@ -866,7 +870,9 @@ func (m *Model) View() string {
 	// Stack: candles (+ price axis), then the time ruler, then volume.
 	chart := lipgloss.JoinVertical(lipgloss.Left, append(append(chartLines, rulerLine), volLines...)...)
 
-	parts := []string{m.renderStatusBar()}
+	// Pass chart snap into the status bar so quiet-tape OHLCV fallback does
+	// not take a second Aggregator.Snapshot (same mutex as ingest).
+	parts := []string{m.renderStatusBar(snap)}
 	if panelH > 0 {
 		parts = append(parts, m.renderInfoBar(m.width, panelH))
 	}
@@ -874,86 +880,122 @@ func (m *Model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-// statusBar palette (Tokyo Night accents; matches info strip).
+// statusBar palette + cached styles (Tokyo Night; rebuilt every frame was
+// pure CPU on the 10–30 Hz render path).
 var (
 	statusMutedFg = lipgloss.Color("#565f89")
 	statusSymFg   = lipgloss.Color("#c0caf5")
 	statusPriceFg = lipgloss.Color("#e0af68")
 	statusTFFg    = lipgloss.Color("#bb9af7")
 	statusSepFg   = lipgloss.Color("#3b4261")
+	statusFgOnBg  = lipgloss.Color("#1a1b26")
+
+	stMuted     = lipgloss.NewStyle().Foreground(statusMutedFg)
+	stSym       = lipgloss.NewStyle().Foreground(statusSymFg).Bold(true)
+	stPrice     = lipgloss.NewStyle().Foreground(statusPriceFg).Bold(true)
+	stTF        = lipgloss.NewStyle().Foreground(statusTFFg).Bold(true)
+	stSep       = lipgloss.NewStyle().Foreground(statusSepFg)
+	stPaper     = lipgloss.NewStyle().Background(lipgloss.Color("#9ece6a")).Foreground(statusFgOnBg).Bold(true)
+	stLive      = lipgloss.NewStyle().Background(lipgloss.Color("#f7768e")).Foreground(statusFgOnBg).Bold(true)
+	stSessDef   = lipgloss.NewStyle().Background(lipgloss.Color("#414868")).Foreground(statusSymFg).Bold(true)
+	stSessReg   = lipgloss.NewStyle().Background(lipgloss.Color("#9ece6a")).Foreground(statusFgOnBg).Bold(true)
+	stSessExt   = lipgloss.NewStyle().Background(lipgloss.Color("#e0af68")).Foreground(statusFgOnBg).Bold(true)
+	stSessON    = lipgloss.NewStyle().Background(lipgloss.Color("#7aa2f7")).Foreground(statusFgOnBg).Bold(true)
+	stSizeOn    = lipgloss.NewStyle().Background(infoSizeOnBg).Foreground(infoSizeOnFg).Bold(true)
+	stIndOn     = lipgloss.NewStyle().Foreground(infoIndOnFg).Bold(true)
+	stLocked    = lipgloss.NewStyle().Background(lipgloss.Color("#f7768e")).Foreground(statusFgOnBg).Bold(true)
+	stHistory   = lipgloss.NewStyle().Background(lipgloss.Color("#e0af68")).Foreground(statusFgOnBg).Bold(true)
+	stStatusBar = lipgloss.NewStyle().Background(lipgloss.Color("#16161e"))
+
+	// Info-bar signed PnL / side colors (avoid NewStyle per frame).
+	stPLUp    = lipgloss.NewStyle().Foreground(infoUpFg).Bold(true)
+	stPLDown  = lipgloss.NewStyle().Foreground(infoDownFg).Bold(true)
+	stPLMuted = lipgloss.NewStyle().Foreground(infoMutedFg)
+	stSideUp  = lipgloss.NewStyle().Foreground(infoUpFg)
+	stSideDn  = lipgloss.NewStyle().Foreground(infoDownFg)
 )
 
-func (m *Model) renderStatusBar() string {
-	muted := lipgloss.NewStyle().Foreground(statusMutedFg)
-	sep := lipgloss.NewStyle().Foreground(statusSepFg).Render(" │ ")
+func (m *Model) renderStatusBar(chartSnap bars.Snapshot) string {
+	sep := stSep.Render(" │ ")
 	sepW := lipgloss.Width(sep)
 
 	// Mode badge.
-	mode := lipgloss.NewStyle().Background(lipgloss.Color("#9ece6a")).Foreground(lipgloss.Color("#1a1b26")).Bold(true).Render(" PAPER ")
+	mode := stPaper.Render(" PAPER ")
 	if !m.d.Paper {
-		mode = lipgloss.NewStyle().Background(lipgloss.Color("#f7768e")).Foreground(lipgloss.Color("#1a1b26")).Bold(true).Render(" LIVE ")
+		mode = stLive.Render(" LIVE ")
 	}
 
 	// Session badge.
-	sessBg, sessFg := lipgloss.Color("#414868"), lipgloss.Color("#c0caf5")
+	sessStyle := stSessDef
 	switch m.sess {
 	case session.Regular:
-		sessBg, sessFg = lipgloss.Color("#9ece6a"), lipgloss.Color("#1a1b26")
+		sessStyle = stSessReg
 	case session.PreMarket, session.AfterHours:
-		sessBg, sessFg = lipgloss.Color("#e0af68"), lipgloss.Color("#1a1b26")
+		sessStyle = stSessExt
 	case session.Overnight:
-		sessBg, sessFg = lipgloss.Color("#7aa2f7"), lipgloss.Color("#1a1b26")
+		sessStyle = stSessON
 	}
-	sessBadge := lipgloss.NewStyle().Background(sessBg).Foreground(sessFg).Bold(true).
-		Render(" " + m.sess.String() + " ")
+	sessBadge := sessStyle.Render(" " + m.sess.String() + " ")
 
 	// Quote block: SYMBOL  price  bid×ask. When the tape is quiet, fall
-	// back to the newest chart bar close + compact OHLCV so a closed
-	// session still shows a print comparable to TradingView's header.
-	last, lastAt := m.d.Agg.LatestTrade()
+	// back to the newest (live-edge) chart bar close + compact OHLCV so a
+	// closed session still shows a print comparable to TradingView's header.
+	// Reuse the frame chart snap only when live (panOffset==0); when panned
+	// the chart window is historical and must not overwrite the status price.
+	// Agg is always set in production; nil-guard for partial test Deps.
+	var last float64
+	var lastAt time.Time
+	if m.d.Agg != nil {
+		last, lastAt = m.d.Agg.LatestTrade()
+	}
 	price := "—"
 	var lastBarOHLCV string
 	if last > 0 {
 		price = fmt.Sprintf("%.2f", last)
-	} else if m.d.Agg != nil {
-		if snap := m.d.Agg.Snapshot(m.tfs[m.tfIdx], 1, 0); len(snap.Bars) > 0 {
-			b := snap.Bars[len(snap.Bars)-1]
+	} else {
+		var edge bars.Snapshot
+		if m.panOffset == 0 {
+			edge = chartSnap
+		} else if m.d.Agg != nil {
+			edge = m.d.Agg.Snapshot(m.tfs[m.tfIdx], 1, 0)
+		}
+		if len(edge.Bars) > 0 {
+			b := edge.Bars[len(edge.Bars)-1]
 			price = fmt.Sprintf("%.2f", b.Close)
 			lastBarOHLCV = fmt.Sprintf(" O%.2f H%.2f L%.2f V%.0f", b.Open, b.High, b.Low, b.Volume)
 		}
 	}
-	quote := lipgloss.NewStyle().Foreground(statusSymFg).Bold(true).Render(m.symbol) + " " +
-		lipgloss.NewStyle().Foreground(statusPriceFg).Bold(true).Render(price)
+	quote := stSym.Render(m.symbol) + " " + stPrice.Render(price)
 	if lastBarOHLCV != "" {
-		quote += muted.Render(lastBarOHLCV)
+		quote += stMuted.Render(lastBarOHLCV)
 	}
-	if bid, ask, _ := m.d.Agg.LatestQuote(); bid > 0 && ask > 0 {
-		quote += muted.Render(fmt.Sprintf("  %.2f×%.2f", bid, ask))
+	if m.d.Agg != nil {
+		if bid, ask, _ := m.d.Agg.LatestQuote(); bid > 0 && ask > 0 {
+			quote += stMuted.Render(fmt.Sprintf("  %.2f×%.2f", bid, ask))
+		}
 	}
 
 	// Clock.
-	clock := muted.Render(time.Now().In(session.Location()).Format("15:04:05 ET"))
+	clock := stMuted.Render(time.Now().In(session.Location()).Format("15:04:05 ET"))
 
 	// Size presets (chips) — top row only.
 	var sizeBits []string
 	for i, p := range m.d.Cfg.SizePresets {
 		txt := fmt.Sprintf("%d", p)
 		if i == m.preset {
-			sizeBits = append(sizeBits, lipgloss.NewStyle().
-				Background(infoSizeOnBg).Foreground(infoSizeOnFg).Bold(true).
-				Render(" "+txt+" "))
+			sizeBits = append(sizeBits, stSizeOn.Render(" "+txt+" "))
 		} else {
-			sizeBits = append(sizeBits, muted.Render(txt))
+			sizeBits = append(sizeBits, stMuted.Render(txt))
 		}
 	}
-	sizeSeg := muted.Render("sz ") + strings.Join(sizeBits, " ")
+	sizeSeg := stMuted.Render("sz ") + strings.Join(sizeBits, " ")
 
 	// Indicator chips — top row only.
 	chip := func(tag string, on bool) string {
 		if on {
-			return lipgloss.NewStyle().Foreground(infoIndOnFg).Bold(true).Render(tag)
+			return stIndOn.Render(tag)
 		}
-		return muted.Render(tag)
+		return stMuted.Render(tag)
 	}
 	indsSeg := chip("ema", m.showEMA) + " " +
 		chip("ema2", m.showEMA2) + " " +
@@ -961,27 +1003,27 @@ func (m *Model) renderStatusBar() string {
 		chip("sh", m.shading)
 
 	// Timeframe.
-	tfSeg := lipgloss.NewStyle().Foreground(statusTFFg).Bold(true).Render(m.tfs[m.tfIdx].String())
+	tfSeg := stTF.Render(m.tfs[m.tfIdx].String())
 
 	// Latency.
 	latSeg := ""
-	if p50, p99 := m.d.Latency.Percentiles(); p50 > 0 {
-		latSeg = muted.Render(fmt.Sprintf("p50 %s p99 %s",
-			p50.Round(time.Millisecond), p99.Round(time.Millisecond)))
+	if m.d.Latency != nil {
+		if p50, p99 := m.d.Latency.Percentiles(); p50 > 0 {
+			latSeg = stMuted.Render(fmt.Sprintf("p50 %s p99 %s",
+				p50.Round(time.Millisecond), p99.Round(time.Millisecond)))
+		}
 	}
 
 	// Alerts: lock / history pan / stale feed.
 	alerts := ""
 	if locked, reason := m.d.Risk.Locked(); locked {
-		alerts += lipgloss.NewStyle().Background(lipgloss.Color("#f7768e")).Foreground(lipgloss.Color("#1a1b26")).Bold(true).
-			Render(" LOCKED: " + reason + " ")
+		alerts += stLocked.Render(" LOCKED: " + reason + " ")
 	}
 	if m.panOffset > 0 {
-		alerts += lipgloss.NewStyle().Background(lipgloss.Color("#e0af68")).Foreground(lipgloss.Color("#1a1b26")).Bold(true).
-			Render(fmt.Sprintf(" ◀ HISTORY −%d ", m.panOffset))
+		alerts += stHistory.Render(fmt.Sprintf(" ◀ HISTORY −%d ", m.panOffset))
 	}
 	if !lastAt.IsZero() && time.Since(lastAt) > 10*time.Second && m.sess != session.Closed {
-		alerts += muted.Render(" feed quiet")
+		alerts += stMuted.Render(" feed quiet")
 	}
 
 	// Fit segments under terminal width (alerts always appended last if room).
@@ -1015,9 +1057,7 @@ func (m *Model) renderStatusBar() string {
 		{latSeg, pLat},
 	})
 	line := core + alerts
-	return lipgloss.NewStyle().Width(m.width).MaxWidth(m.width).
-		Background(lipgloss.Color("#16161e")).
-		Render(line)
+	return stStatusBar.Width(m.width).MaxWidth(m.width).Render(line)
 }
 
 func (m *Model) renderBottom() string {
@@ -1063,23 +1103,34 @@ type infoSeg struct {
 }
 
 // infoBarRows returns how many rows the info strip should use (0–2).
-// A second row is only used for open orders. Size presets and indicators
-// live exclusively on the status bar (top row).
+// A second row is only used when the active symbol has open orders.
+// Size presets and indicators live exclusively on the status bar (top row).
 func (m *Model) infoBarRows() int {
 	if m.width <= 0 {
 		return 0
 	}
-	if len(m.d.Store.OpenOrders()) > 0 {
+	if m.openOrderCount(m.symbol) > 0 {
 		return 2
 	}
 	return 1
+}
+
+// openOrderCount returns how many cached open orders belong to symbol.
+func (m *Model) openOrderCount(symbol string) int {
+	n := 0
+	for _, o := range m.d.Store.OpenOrders() {
+		if o.Symbol == symbol {
+			n++
+		}
+	}
+	return n
 }
 
 // renderInfoBar draws a width-aware strip under the status bar.
 //
 // Quote/symbol/size/indicators live on the status line. This strip is book
 // + risk + working orders: richer POS metrics, priority-trimmed account
-// segments, and active-symbol-first open orders.
+// segments, and open orders for the active symbol only.
 func (m *Model) renderInfoBar(w, h int) string {
 	if h <= 0 || w <= 0 {
 		return ""
@@ -1107,22 +1158,26 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 	sep := muted.Render("  ·  ")
 	sepW := lipgloss.Width(sep)
 
-	last, _ := m.d.Agg.LatestTrade()
-	vwapVal := m.d.Agg.SessionVWAP()
-	hasVWAP := vwapVal == vwapVal // NaN check
+	var last, vwapVal float64
+	hasVWAP := false
+	if m.d.Agg != nil {
+		last, _ = m.d.Agg.LatestTrade()
+		vwapVal = m.d.Agg.SessionVWAP()
+		hasVWAP = vwapVal == vwapVal // NaN check
+	}
 
 	// --- POS (priority 1) ---
 	posText := lbl.Render("POS") + " " + muted.Render("flat")
 	if p := m.d.Store.Position(m.symbol); p != nil {
 		side := "L"
-		sideSt := lipgloss.NewStyle().Foreground(infoUpFg)
+		sideSt := stSideUp
 		if p.Side == "short" {
 			side = "S"
-			sideSt = lipgloss.NewStyle().Foreground(infoDownFg)
+			sideSt = stSideDn
 		}
-		plSt := lipgloss.NewStyle().Foreground(infoUpFg).Bold(true)
+		plSt := stPLUp
 		if p.UnrealizedPL < 0 {
-			plSt = lipgloss.NewStyle().Foreground(infoDownFg).Bold(true)
+			plSt = stPLDown
 		}
 		posText = lbl.Render("POS") + " " +
 			value.Render(fmt.Sprintf("%.0f", p.Qty)) +
@@ -1139,9 +1194,9 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 		// Distance to session VWAP (last − vwap).
 		if hasVWAP && last > 0 {
 			d := last - vwapVal
-			dSt := lipgloss.NewStyle().Foreground(infoUpFg)
+			dSt := stSideUp
 			if d < 0 {
-				dSt = lipgloss.NewStyle().Foreground(infoDownFg)
+				dSt = stSideDn
 			}
 			posText += " " + dSt.Render(fmt.Sprintf("Δv%+.2f", d))
 		}
@@ -1155,26 +1210,29 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 		}
 	}
 
-	// Other symbols with positions (panic/F only touch active symbol).
-	otherN := 0
-	for _, p := range m.d.Store.Positions() {
-		if p.Symbol != m.symbol {
-			otherN++
-		}
-	}
+	// Other symbols with positions or resting orders (C/X only touch active).
+	otherN := countOtherOpenSymbols(m.d.Store, m.symbol)
 	otherPos := ""
 	if otherN > 0 {
-		otherPos = muted.Render(fmt.Sprintf("+%d sym", otherN))
+		// Reminder that C/X are symbol-scoped when multi-name risk is open.
+		otherPos = muted.Render(fmt.Sprintf("+%d open (:sym+X)", otherN))
 	}
 
-	// --- Account: eq + bp high priority; cash lower ---
-	eqText, cashText, bpText := "", "", ""
+	// --- Account: eq + day/week PnL (open marks stripped at REST) + bp; cash lower ---
+	eqText, cashText, bpText, dayText, weekText := "", "", "", "", ""
 	if a, ok := m.d.Store.Account(); ok {
 		eqText = lbl.Render("eq") + " " + value.Bold(true).Render(compactMoney(float64(a.Equity)))
 		bpText = lbl.Render("bp") + " " + value.Render(compactMoney(float64(a.BuyingPower)))
 		cashText = lbl.Render("cash") + " " + value.Render(compactMoney(float64(a.Cash)))
 	} else {
 		eqText = lbl.Render("eq") + " " + muted.Render("—")
+	}
+	pnl := m.d.Store.PnL()
+	if pnl.HasDay {
+		dayText = lbl.Render("day") + " " + signedPLStyle(pnl.Day).Render(signedCompactMoney(pnl.Day))
+	}
+	if pnl.HasWeek {
+		weekText = lbl.Render("wk") + " " + signedPLStyle(pnl.Week).Render(signedCompactMoney(pnl.Week))
 	}
 
 	// --- VWAP absolute (delta already on POS) ---
@@ -1184,17 +1242,14 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 			lipgloss.NewStyle().Foreground(infoVwapFg).Render(fmt.Sprintf("%.2f", vwapVal))
 	}
 
-	// --- Orders: active symbol first; omit symbol when it matches ---
-	orders := m.d.Store.OpenOrders()
-	var activeOrds, otherOrds []alpaca.Order
-	for _, o := range orders {
+	// --- Orders: active symbol only (trading focus) ---
+	var activeOrds []alpaca.Order
+	for _, o := range m.d.Store.OpenOrders() {
 		if o.Symbol == m.symbol {
 			activeOrds = append(activeOrds, o)
-		} else {
-			otherOrds = append(otherOrds, o)
 		}
 	}
-	formatOrd := func(o alpaca.Order, showSym bool) string {
+	formatOrd := func(o alpaca.Order) string {
 		sideCol := infoUpFg
 		sideMark := "B"
 		if strings.EqualFold(o.Side, "sell") {
@@ -1202,9 +1257,6 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 			sideMark = "S"
 		}
 		s := lipgloss.NewStyle().Foreground(sideCol).Bold(true).Render(sideMark)
-		if showSym {
-			s += value.Render(" " + o.Symbol)
-		}
 		s += value.Render(fmt.Sprintf(" %.0f", o.Qty-o.FilledQty))
 		if o.FilledQty > 0 {
 			s += muted.Render(fmt.Sprintf("(%.0f/%.0f)", o.FilledQty, o.Qty))
@@ -1215,7 +1267,7 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 		return s
 	}
 	ordText := ""
-	busyOrders := len(orders) > 0
+	busyOrders := len(activeOrds) > 0
 	if busyOrders {
 		var bits []string
 		n := 0
@@ -1223,18 +1275,11 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 			if n >= 3 {
 				break
 			}
-			bits = append(bits, formatOrd(o, false))
+			bits = append(bits, formatOrd(o))
 			n++
 		}
-		for _, o := range otherOrds {
-			if n >= 3 {
-				break
-			}
-			bits = append(bits, formatOrd(o, true))
-			n++
-		}
-		extra := len(orders) - n
-		head := lbl.Render(fmt.Sprintf("ORD %d", len(orders)))
+		extra := len(activeOrds) - n
+		head := lbl.Render(fmt.Sprintf("ORD %d", len(activeOrds)))
 		ordText = head + " " + strings.Join(bits, " ")
 		if extra > 0 {
 			ordText += muted.Render(fmt.Sprintf(" +%d", extra))
@@ -1247,17 +1292,21 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 		pPOS   = 1
 		pORD   = 2
 		pEQ    = 3
-		pBP    = 4
-		pVWAP  = 5
-		pCash  = 6
-		pOther = 7
+		pDay   = 4
+		pWeek  = 5
+		pBP    = 6
+		pVWAP  = 7
+		pCash  = 8
+		pOther = 9
 	)
 
 	if busyOrders {
-		// Row 1: book + account. Row 2: orders only.
+		// Row 1: book + account + PnL. Row 2: orders only.
 		r1 := fitInfoSegs(w, sep, sepW, []infoSeg{
 			{posText, pPOS},
 			{eqText, pEQ},
+			{dayText, pDay},
+			{weekText, pWeek},
 			{bpText, pBP},
 			{vwapText, pVWAP},
 			{cashText, pCash},
@@ -1269,10 +1318,12 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 		return r1, r2
 	}
 
-	// Quiet row: POS · eq · bp · vwap · cash · +N sym (no size/inds here).
+	// Quiet row: POS · eq · day · wk · bp · vwap · cash · +N sym.
 	r1 := fitInfoSegs(w, sep, sepW, []infoSeg{
 		{posText, pPOS},
 		{eqText, pEQ},
+		{dayText, pDay},
+		{weekText, pWeek},
 		{bpText, pBP},
 		{vwapText, pVWAP},
 		{cashText, pCash},
@@ -1366,4 +1417,25 @@ func compactMoney(v float64) string {
 		return "-" + s
 	}
 	return s
+}
+
+// signedCompactMoney formats PnL with an explicit +/− sign.
+func signedCompactMoney(v float64) string {
+	if v > 0 {
+		return "+" + compactMoney(v)
+	}
+	if v < 0 {
+		return compactMoney(v) // already has leading "-"
+	}
+	return "0"
+}
+
+func signedPLStyle(v float64) lipgloss.Style {
+	if v > 0 {
+		return stPLUp
+	}
+	if v < 0 {
+		return stPLDown
+	}
+	return stPLMuted
 }

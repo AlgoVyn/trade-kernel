@@ -114,6 +114,85 @@ func TestHotkeyBuyFlow(t *testing.T) {
 	}
 }
 
+// slowExec delays Buy so keypress→ack latency includes the wait.
+type slowExec struct {
+	fakeExec
+	delay time.Duration
+}
+
+func (s *slowExec) Buy(ctx context.Context, sym string, qty int) (alpaca.Order, error) {
+	time.Sleep(s.delay)
+	return s.fakeExec.Buy(ctx, sym, qty)
+}
+
+// TestOrderLatencyIncludesBrokerWait checks that recorded latency includes
+// the broker RTT (slowExec sleep). Combined with the pre-Cmd sleep below, it
+// also pins the design invariant that the timer starts at submit commit
+// (outside the bubbletea Cmd), not only inside the Cmd body.
+func TestOrderLatencyIncludesBrokerWait(t *testing.T) {
+	d, _, _, _ := testDeps(t)
+	const brokerWait = 25 * time.Millisecond
+	const dispatchDelay = 30 * time.Millisecond
+	sx := &slowExec{delay: brokerWait}
+	d.Exec = sx
+	m := NewModel(d)
+	_, cmd := m.handleKey(key('B'))
+	if cmd == nil {
+		t.Fatal("expected submit cmd")
+	}
+	// Simulate bubbletea scheduling delay between Cmd construction and run.
+	// If start were inside the Cmd, latency would exclude this sleep.
+	time.Sleep(dispatchDelay)
+	msg := cmd()
+	orm, ok := msg.(orderResultMsg)
+	if !ok {
+		t.Fatalf("msg type %T", msg)
+	}
+	if orm.err != nil {
+		t.Fatalf("order err: %v", orm.err)
+	}
+	// Must cover both pre-Cmd dispatch delay and broker wait.
+	minWant := dispatchDelay + brokerWait - 5*time.Millisecond
+	if orm.latency < minWant {
+		t.Fatalf("latency %v < %v (timer must start at submit commit, before Cmd)", orm.latency, minWant)
+	}
+	// Record into tracker the same way Update does.
+	m.d.Latency.Record(orm.latency)
+	p50, _ := m.d.Latency.Percentiles()
+	if p50 < minWant {
+		t.Fatalf("tracker p50 = %v, want >= %v", p50, minWant)
+	}
+}
+
+func TestTickForAdaptive(t *testing.T) {
+	base := 50 * time.Millisecond
+	// Short TFs speed up from default base (50→33).
+	if g := TickFor(bars.TF1s, 0, session.Regular, base); g != 33*time.Millisecond {
+		t.Fatalf("1s live: %v", g)
+	}
+	// Aggressive configs are honored (not forced up to 33ms).
+	if g := TickFor(bars.TF1s, 0, session.Regular, 20*time.Millisecond); g != 20*time.Millisecond {
+		t.Fatalf("1s aggressive: %v", g)
+	}
+	if g := TickFor(bars.TF1s, 0, session.Regular, 16*time.Millisecond); g != 16*time.Millisecond {
+		t.Fatalf("1s min config: %v", g)
+	}
+	// Mid TFs keep base.
+	if g := TickFor(bars.TF1m, 0, session.Regular, base); g != base {
+		t.Fatalf("1m live: %v", g)
+	}
+	// High TFs / pan / closed slow to ≥100ms.
+	if g := TickFor(bars.TF1h, 0, session.Regular, base); g != 100*time.Millisecond {
+		t.Fatalf("1h live: %v", g)
+	}
+	if g := TickFor(bars.TF1m, 5, session.Regular, base); g != 100*time.Millisecond {
+		t.Fatalf("panned: %v", g)
+	}
+	if g := TickFor(bars.TF1s, 0, session.Closed, base); g != 100*time.Millisecond {
+		t.Fatalf("closed: %v", g)
+	}
+}
+
 func TestConfirmationFlow(t *testing.T) {
 	d, fx, _, _ := testDeps(t)
 	d.Cfg.ConfirmOrders = true
@@ -157,6 +236,148 @@ func TestAddReduceDirection(t *testing.T) {
 	}
 }
 
+func TestCancelActiveSymbolOnly(t *testing.T) {
+	d, fx, _, _ := testDeps(t)
+	m := NewModel(d)
+	_, cmd := m.handleKey(key('C'))
+	drain(m, cmd)
+	if len(fx.calls) != 1 || fx.calls[0] != "cancelsym AAPL" {
+		t.Fatalf("cancel: calls = %v, want [cancelsym AAPL]", fx.calls)
+	}
+}
+
+// TestInfoBarShowsDayWeekPnL renders account day/wk with open marks stripped.
+func TestInfoBarShowsDayWeekPnL(t *testing.T) {
+	d, _, st, _ := testDeps(t)
+	// +1500 equity day, +200 open intraday mark → day +1300.
+	// Week raw +3200 − total open unrealized 500 → +2700.
+	st.Reconcile(
+		alpaca.Account{Equity: 101500, LastEquity: 100000, Cash: 50000, BuyingPower: 200000},
+		[]alpaca.Position{{
+			Symbol: "AAPL", Qty: 100, Side: "long", AvgEntryPrice: 150,
+			UnrealizedIntradayPL: 200, UnrealizedPL: 500,
+		}},
+		nil,
+	)
+	st.SetWeekPnL(3200)
+	m := NewModel(d)
+	m.width = 160
+	row1, _ := m.buildInfoBarRows(160)
+	if !strings.Contains(row1, "day") || !strings.Contains(row1, "+1.3k") {
+		t.Fatalf("row1 missing day PnL: %q", row1)
+	}
+	if !strings.Contains(row1, "wk") || !strings.Contains(row1, "+2.7k") {
+		t.Fatalf("row1 missing week PnL: %q", row1)
+	}
+}
+
+// TestInfoBarOrdersActiveSymbolOnly: ORD strip lists active symbol only, but
+// the "+N open" badge counts other symbols with positions or resting orders.
+func TestInfoBarOrdersActiveSymbolOnly(t *testing.T) {
+	d, _, st, _ := testDeps(t)
+	st.Reconcile(
+		alpaca.Account{Equity: 100000, Cash: 50000, BuyingPower: 200000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 100, Side: "long", AvgEntryPrice: 150}},
+		[]alpaca.Order{
+			{ID: "1", Symbol: "NVDA", Side: "buy", Qty: 10, Type: "limit", LimitPrice: 900, Status: "open"},
+			{ID: "2", Symbol: "AAPL", Side: "sell", Qty: 50, Type: "limit", LimitPrice: 160, Status: "open"},
+			{ID: "3", Symbol: "MSFT", Side: "buy", Qty: 5, Type: "market", Status: "open"},
+		},
+	)
+	m := NewModel(d)
+	m.width = 120
+	if m.infoBarRows() != 2 {
+		t.Fatalf("infoBarRows = %d, want 2 (active has open order)", m.infoBarRows())
+	}
+	if m.openOrderCount("AAPL") != 1 {
+		t.Fatalf("openOrderCount AAPL = %d", m.openOrderCount("AAPL"))
+	}
+	row1, row2 := m.buildInfoBarRows(120)
+	if !strings.Contains(row2, "ORD 1") {
+		t.Fatalf("row2 should show ORD 1 for AAPL only, got %q", row2)
+	}
+	if strings.Contains(row2, "NVDA") || strings.Contains(row2, "MSFT") {
+		t.Fatalf("row2 must not list other symbols: %q", row2)
+	}
+	// NVDA + MSFT have resting orders only → +2 open badge on row1.
+	if !strings.Contains(row1, "+2 open") {
+		t.Fatalf("row1 should show +2 open for other symbols with orders, got %q", row1)
+	}
+	// Flat active with only other-symbol orders: still one info row, but +N open.
+	m.symbol = "TSLA"
+	if m.infoBarRows() != 1 {
+		t.Fatalf("infoBarRows for TSLA = %d, want 1 (no active open orders)", m.infoBarRows())
+	}
+	row1, row2 = m.buildInfoBarRows(120)
+	if row2 != "" {
+		t.Fatalf("expected empty order row for TSLA, got %q", row2)
+	}
+	// AAPL position + NVDA/MSFT orders → 3 other open symbols.
+	if !strings.Contains(row1, "+3 open") {
+		t.Fatalf("row1 should show +3 open (AAPL pos + NVDA/MSFT orders), got %q", row1)
+	}
+}
+
+func TestCountOtherOpenSymbolsUnionsPosAndOrders(t *testing.T) {
+	st := state.NewStore()
+	st.Reconcile(
+		alpaca.Account{},
+		[]alpaca.Position{{Symbol: "NVDA", Qty: 1, Side: "long"}},
+		[]alpaca.Order{
+			{ID: "1", Symbol: "MSFT", Side: "buy", Qty: 1, Status: "open"},
+			{ID: "2", Symbol: "NVDA", Side: "sell", Qty: 1, Status: "open"}, // same as pos
+			{ID: "3", Symbol: "AAPL", Side: "buy", Qty: 1, Status: "open"},  // active — ignored
+		},
+	)
+	if n := countOtherOpenSymbols(st, "AAPL"); n != 2 {
+		t.Fatalf("countOtherOpenSymbols = %d, want 2 (NVDA pos+order, MSFT order)", n)
+	}
+	if n := countOtherOpenSymbols(nil, "AAPL"); n != 0 {
+		t.Fatalf("nil store = %d, want 0", n)
+	}
+}
+
+func TestPanicRemindsOtherOpenOrders(t *testing.T) {
+	d, fx, st, _ := testDeps(t)
+	// Flat AAPL, resting order on NVDA only — must still remind after panic.
+	st.Reconcile(
+		alpaca.Account{Equity: 100000, Cash: 50000, BuyingPower: 200000},
+		nil,
+		[]alpaca.Order{{ID: "1", Symbol: "NVDA", Side: "buy", Qty: 10, Type: "limit", LimitPrice: 900, Status: "open"}},
+	)
+	m := NewModel(d)
+	_, cmd := m.handleKey(key('X'))
+	if cmd == nil {
+		t.Fatal("expected panic cmd")
+	}
+	msg := cmd()
+	orm, ok := msg.(orderResultMsg)
+	if !ok {
+		t.Fatalf("msg type %T", msg)
+	}
+	if orm.err != nil {
+		t.Fatalf("panic err: %v", orm.err)
+	}
+	if !strings.Contains(orm.detail, "1 other symbol") {
+		t.Fatalf("detail should remind about other open orders, got %q", orm.detail)
+	}
+	if len(fx.calls) != 1 || fx.calls[0] != "cancelsym AAPL" {
+		t.Fatalf("calls = %v, want cancelsym only (already flat)", fx.calls)
+	}
+}
+
+func TestPanicAllLegacyAlias(t *testing.T) {
+	d, fx, _, _ := testDeps(t)
+	m := NewModel(d)
+	// Simulate config override mapping a key to panic_all.
+	m.keyFor["ctrl+x"] = "panic_all"
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlX})
+	drain(m, cmd)
+	if len(fx.calls) != 2 || fx.calls[0] != "cancelsym AAPL" || fx.calls[1] != "flatten AAPL" {
+		t.Fatalf("panic_all alias should run symbol panic: %v", fx.calls)
+	}
+}
+
 func TestPanicFlow(t *testing.T) {
 	d, fx, _, _ := testDeps(t)
 	m := NewModel(d)
@@ -168,7 +389,7 @@ func TestPanicFlow(t *testing.T) {
 }
 
 // TestPanicFlattensActiveSymbolOnly verifies that X cancels and flattens
-// only the currently selected symbol — other positions/orders remain.
+// only the currently selected symbol — other positions remain untouched.
 func TestPanicFlattensActiveSymbolOnly(t *testing.T) {
 	d, fx, st, _ := testDeps(t)
 	st.Reconcile(
@@ -192,38 +413,10 @@ func TestPanicFlattensActiveSymbolOnly(t *testing.T) {
 	if fx.calls[1] != "flatten AAPL" {
 		t.Fatalf("second call = %q, want flatten AAPL (not other symbols)", fx.calls[1])
 	}
-	if !strings.Contains(m.status, "+1 other symbols still open") {
-		t.Fatalf("panic status should warn about other open symbols, got %q", m.status)
-	}
-}
-
-// TestPanicAllCancelsAndFlattensEverySymbol covers Ctrl+X / :panic all.
-func TestPanicAllCancelsAndFlattensEverySymbol(t *testing.T) {
-	d, fx, st, _ := testDeps(t)
-	st.Reconcile(
-		alpaca.Account{Equity: 100000, Cash: 50000, BuyingPower: 200000},
-		[]alpaca.Position{
-			{Symbol: "AAPL", Qty: 300, Side: "long", AvgEntryPrice: 150},
-			{Symbol: "NVDA", Qty: 100, Side: "long", AvgEntryPrice: 900},
-		},
-		nil,
-	)
-	m := NewModel(d)
-	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlX})
-	drain(m, cmd)
-
-	if len(fx.calls) < 3 {
-		t.Fatalf("want cancelall + flatten AAPL + flatten NVDA, got %v", fx.calls)
-	}
-	if fx.calls[0] != "cancelall" {
-		t.Fatalf("first call = %q, want cancelall", fx.calls[0])
-	}
-	seen := map[string]bool{}
-	for _, c := range fx.calls[1:] {
-		seen[c] = true
-	}
-	if !seen["flatten AAPL"] || !seen["flatten NVDA"] {
-		t.Fatalf("flatten calls incomplete: %v", fx.calls)
+	for _, c := range fx.calls {
+		if strings.Contains(c, "NVDA") || c == "cancelall" {
+			t.Fatalf("panic must not touch other symbols or cancel-all: %v", fx.calls)
+		}
 	}
 }
 

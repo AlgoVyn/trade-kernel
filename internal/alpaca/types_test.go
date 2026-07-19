@@ -63,15 +63,36 @@ func TestOrderDecodesNullLimitPrice(t *testing.T) {
 func TestAccountDecodes(t *testing.T) {
 	// Account sends everything as quoted strings.
 	var a Account
-	raw := `{"equity":"100000.50","cash":"50000","buying_power":"200000"}`
+	raw := `{"equity":"100000.50","last_equity":"99000.00","cash":"50000","buying_power":"200000"}`
 	if err := json.Unmarshal([]byte(raw), &a); err != nil {
 		t.Fatal(err)
 	}
 	if float64(a.Equity) != 100000.50 {
 		t.Fatalf("Equity = %v", a.Equity)
 	}
+	if float64(a.LastEquity) != 99000 {
+		t.Fatalf("LastEquity = %v", a.LastEquity)
+	}
 	if float64(a.Cash) != 50000 {
 		t.Fatalf("Cash = %v", a.Cash)
+	}
+}
+
+func TestPortfolioHistoryLatestPnL(t *testing.T) {
+	h := PortfolioHistory{
+		Equity:     []flexFloat{100000, 100500, 101200},
+		ProfitLoss: []flexFloat{0, 500, 1200},
+		BaseValue:  100000,
+	}
+	v, ok := h.LatestPnL()
+	if !ok || v != 1200 {
+		t.Fatalf("LatestPnL = %v %v, want 1200 true", v, ok)
+	}
+	// Fall back to equity − base when profit_loss omitted.
+	h2 := PortfolioHistory{Equity: []flexFloat{100000, 100250}, BaseValue: 100000}
+	v, ok = h2.LatestPnL()
+	if !ok || v != 250 {
+		t.Fatalf("fallback LatestPnL = %v %v", v, ok)
 	}
 }
 

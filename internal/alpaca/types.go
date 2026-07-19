@@ -60,19 +60,43 @@ type Account struct {
 	Currency         string    `json:"currency"`
 	Cash             flexFloat `json:"cash"`
 	Equity           flexFloat `json:"equity"`
+	LastEquity       flexFloat `json:"last_equity"` // prior trading-day close equity
 	BuyingPower      flexFloat `json:"buying_power"`
 	PortfolioValue   flexFloat `json:"portfolio_value"`
 	PatternDayTrader bool      `json:"pattern_day_trader"`
 }
 
+// PortfolioHistory is /v2/account/portfolio/history (subset).
+// Equity and profit_loss are parallel series; base_value is the PnL baseline.
+type PortfolioHistory struct {
+	Timestamp  []int64     `json:"timestamp"`
+	Equity     []flexFloat `json:"equity"`
+	ProfitLoss []flexFloat `json:"profit_loss"`
+	BaseValue  flexFloat   `json:"base_value"`
+	Timeframe  string      `json:"timeframe"`
+}
+
+// LatestPnL returns the most recent profit/loss vs base_value.
+// Prefer the last profit_loss sample; fall back to equity − base_value.
+func (h PortfolioHistory) LatestPnL() (float64, bool) {
+	if n := len(h.ProfitLoss); n > 0 {
+		return float64(h.ProfitLoss[n-1]), true
+	}
+	if n := len(h.Equity); n > 0 && float64(h.BaseValue) != 0 {
+		return float64(h.Equity[n-1]) - float64(h.BaseValue), true
+	}
+	return 0, false
+}
+
 // Position is a /v2/positions entry.
 type Position struct {
-	Symbol        string    `json:"symbol"`
-	Qty           flexFloat `json:"qty"`
-	AvgEntryPrice flexFloat `json:"avg_entry_price"`
-	MarketValue   flexFloat `json:"market_value"`
-	UnrealizedPL  flexFloat `json:"unrealized_pl"`
-	Side          string    `json:"side"` // "long" or "short"
+	Symbol               string    `json:"symbol"`
+	Qty                  flexFloat `json:"qty"`
+	AvgEntryPrice        flexFloat `json:"avg_entry_price"`
+	MarketValue          flexFloat `json:"market_value"`
+	UnrealizedPL         flexFloat `json:"unrealized_pl"`          // total vs cost basis
+	UnrealizedIntradayPL flexFloat `json:"unrealized_intraday_pl"` // mark change since prior close
+	Side                 string    `json:"side"`                   // "long" or "short"
 }
 
 // SetQty sets the absolute position quantity (package-external writers).

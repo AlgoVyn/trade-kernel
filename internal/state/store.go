@@ -1,14 +1,40 @@
 // Package state keeps the local view of account, positions, and open
 // orders, reconciled from REST at startup and updated from the trading
-// WebSocket stream.
+// WebSocket stream. Account day/week PnL is realized-oriented: equity
+// deltas are snapshotted with open marks at REST time so WebSocket fills
+// cannot desync the strip.
 package state
 
 import (
 	"context"
 	"sync"
+	"time"
 
 	"trade-kernel/internal/alpaca"
 )
+
+// weekPnLStaleAfter hides week PnL when portfolio history has not been
+// refreshed successfully for this long (avoids multi-hour frozen "wk").
+const weekPnLStaleAfter = 30 * time.Minute
+
+// AccountPnL is cached day/week account profit-and-loss with open marks
+// stripped at the last REST snapshot (not recomputed from live WS positions).
+//
+//	Day  = (equity − last_equity) − Σ unrealized_intraday_pl
+//	Week = portfolio-history PnL − Σ unrealized_pl (total vs cost)
+//
+// Day is realized since prior close (intraday open marks only). Week strips
+// all current open MTM so multi-day holds do not dominate the 1W curve; if a
+// position was already open at the period start with prior unrealized, that
+// start-of-period mark is also removed (conservative understate). Figures
+// move on REST reconcile / history refresh, not on quote drift or fill
+// rewrites of position mark fields.
+type AccountPnL struct {
+	Day     float64
+	Week    float64
+	HasDay  bool
+	HasWeek bool
+}
 
 // Store is a mutex-guarded cache of account state.
 type Store struct {
@@ -18,6 +44,16 @@ type Store struct {
 	hasAcct   bool
 	positions map[string]alpaca.Position
 	orders    map[string]alpaca.Order // keyed by order ID
+
+	// Day: raw equity change and open-intraday snap from last Reconcile.
+	dayChange        float64
+	openIntradaySnap float64
+	hasDayPnL        bool
+	// Week: raw history PnL and total-open-unrealized snap from SetWeekPnL.
+	weekChange          float64
+	openTotalUnrealSnap float64
+	hasWeekPnL          bool
+	weekUpdatedAt       time.Time
 }
 
 // NewStore creates an empty Store.
@@ -29,6 +65,10 @@ func NewStore() *Store {
 }
 
 // Reconcile replaces the store with a fresh REST snapshot.
+// Day equity change and open mark sums are snapshotted here so PnL() does
+// not re-read mark fields that WebSocket fills zero out. Week total-open
+// unrealized is also refreshed from REST so RefreshWeekPnL never pairs
+// history with a WS-zeroed positions map.
 func (s *Store) Reconcile(acct alpaca.Account, positions []alpaca.Position, orders []alpaca.Order) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -41,6 +81,19 @@ func (s *Store) Reconcile(acct alpaca.Account, positions []alpaca.Position, orde
 	s.orders = make(map[string]alpaca.Order, len(orders))
 	for _, o := range orders {
 		s.orders[o.ID] = o
+	}
+	// Total open unrealized from REST positions (week strip); never from WS fills.
+	s.openTotalUnrealSnap = openTotalUnrealized(s.positions)
+	// Raw day equity change (realized + open intraday marks) + snap for strip.
+	if float64(acct.LastEquity) > 0 {
+		s.dayChange = float64(acct.Equity) - float64(acct.LastEquity)
+		s.openIntradaySnap = openIntradayUnrealized(s.positions)
+		s.hasDayPnL = true
+	} else {
+		// Missing/zero last_equity: hide day rather than show a stale figure.
+		s.dayChange = 0
+		s.openIntradaySnap = 0
+		s.hasDayPnL = false
 	}
 }
 
@@ -278,6 +331,63 @@ func (s *Store) OpenOrders() []alpaca.Order {
 	return out
 }
 
+func openIntradayUnrealized(positions map[string]alpaca.Position) float64 {
+	var u float64
+	for _, p := range positions {
+		u += float64(p.UnrealizedIntradayPL)
+	}
+	return u
+}
+
+func openTotalUnrealized(positions map[string]alpaca.Position) float64 {
+	var u float64
+	for _, p := range positions {
+		u += float64(p.UnrealizedPL)
+	}
+	return u
+}
+
+// PnL returns day/week account PnL with open marks stripped using the
+// snapshots taken at the last REST reconcile / week history refresh.
+func (s *Store) PnL() AccountPnL {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := AccountPnL{HasDay: s.hasDayPnL, HasWeek: s.hasWeekPnL}
+	if s.hasDayPnL {
+		out.Day = s.dayChange - s.openIntradaySnap
+	}
+	if s.hasWeekPnL {
+		if !s.weekUpdatedAt.IsZero() && time.Since(s.weekUpdatedAt) > weekPnLStaleAfter {
+			out.HasWeek = false
+		} else {
+			out.Week = s.weekChange - s.openTotalUnrealSnap
+		}
+	}
+	return out
+}
+
+// SetWeekPnL stores the raw week equity change from portfolio history.
+// Open-mark stripping uses openTotalUnrealSnap from the last Reconcile
+// (REST positions), not the live map — WS fill rewrites can zero mark
+// fields between reconciles. Prefer calling after a successful Refresh.
+func (s *Store) SetWeekPnL(v float64) {
+	s.mu.Lock()
+	s.weekChange = v
+	s.hasWeekPnL = true
+	s.weekUpdatedAt = time.Now()
+	s.mu.Unlock()
+}
+
+// ClearWeekPnL hides week PnL (history failure or empty series).
+// Leaves openTotalUnrealSnap intact — it is owned by Reconcile.
+func (s *Store) ClearWeekPnL() {
+	s.mu.Lock()
+	s.weekChange = 0
+	s.hasWeekPnL = false
+	s.weekUpdatedAt = time.Time{}
+	s.mu.Unlock()
+}
+
 // Refresher fetches a snapshot from REST.
 type Refresher interface {
 	Account(ctx context.Context) (alpaca.Account, error)
@@ -285,7 +395,14 @@ type Refresher interface {
 	OpenOrders(ctx context.Context, symbol string) ([]alpaca.Order, error)
 }
 
-// Refresh pulls a full snapshot from REST into the store.
+// PnLRefresher supplies week PnL (portfolio history).
+type PnLRefresher interface {
+	PortfolioHistory(ctx context.Context, period, timeframe string) (alpaca.PortfolioHistory, error)
+}
+
+// Refresh pulls account/positions/orders from REST into the store.
+// Week portfolio history is intentionally not fetched here — use
+// RefreshWeekPnL on a slower cadence so the 5 s reconcile path stays light.
 func (s *Store) Refresh(ctx context.Context, r Refresher) error {
 	acct, err := r.Account(ctx)
 	if err != nil {
@@ -300,5 +417,23 @@ func (s *Store) Refresh(ctx context.Context, r Refresher) error {
 		return err
 	}
 	s.Reconcile(acct, pos, ord)
+	return nil
+}
+
+// RefreshWeekPnL updates week PnL from portfolio history (1W / 1D).
+// Transient history errors leave the prior sample in place; PnL() hides
+// week when the last successful sample is older than weekPnLStaleAfter.
+// An empty series clears week (no data to show). Day reconcile is unaffected.
+func (s *Store) RefreshWeekPnL(ctx context.Context, r PnLRefresher) error {
+	h, err := r.PortfolioHistory(ctx, "1W", "1D")
+	if err != nil {
+		return err
+	}
+	v, ok := h.LatestPnL()
+	if !ok {
+		s.ClearWeekPnL()
+		return nil
+	}
+	s.SetWeekPnL(v)
 	return nil
 }

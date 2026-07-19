@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateRejectsNegativeLimits(t *testing.T) {
@@ -35,6 +36,73 @@ func TestValidateZeroLimitsAllowed(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("zero limits should validate: %v", err)
+	}
+}
+
+func TestValidateKeyActions(t *testing.T) {
+	base := Config{APIKeyID: "k", APISecretKey: "s", Paper: true}
+	// Known actions + legacy aliases OK.
+	c := base
+	c.Keys = map[string]string{
+		"buy": "B", "cancel_all": "C", "panic_all": "ctrl+x",
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid keys: %v", err)
+	}
+	// Unknown action rejected.
+	c = base
+	c.Keys = map[string]string{"nope": "Z"}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "unknown action") {
+		t.Fatalf("want unknown action error, got %v", err)
+	}
+}
+
+func TestValidateTickMS(t *testing.T) {
+	base := Config{APIKeyID: "k", APISecretKey: "s", Paper: true}
+	// Zero → default 50.
+	c := base
+	if err := c.Validate(); err != nil {
+		t.Fatalf("default tick: %v", err)
+	}
+	if c.Chart.TickMS != 50 {
+		t.Fatalf("TickMS = %d, want 50 default", c.Chart.TickMS)
+	}
+	if c.Tick() != 50*time.Millisecond {
+		t.Fatalf("Tick() = %v", c.Tick())
+	}
+	// Out of range rejected.
+	c = base
+	c.Chart.TickMS = 10
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "tick_ms") {
+		t.Fatalf("want tick_ms error, got %v", err)
+	}
+	c = base
+	c.Chart.TickMS = 501
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for tick_ms > 500")
+	}
+}
+
+// TestTickClampsUnvalidated ensures Tick() is safe when Validate was skipped.
+func TestTickClampsUnvalidated(t *testing.T) {
+	cases := []struct {
+		ms   int
+		want time.Duration
+	}{
+		{0, 50 * time.Millisecond},
+		{-5, 50 * time.Millisecond},
+		{10, 16 * time.Millisecond},
+		{16, 16 * time.Millisecond},
+		{100, 100 * time.Millisecond},
+		{500, 500 * time.Millisecond},
+		{900, 500 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		c := Config{Chart: Chart{TickMS: tc.ms}}
+		if g := c.Tick(); g != tc.want {
+			t.Fatalf("TickMS=%d: Tick()=%v, want %v", tc.ms, g, tc.want)
+		}
 	}
 }
 

@@ -26,6 +26,31 @@ func runPaginated(t *testing.T, pages [][]byte) *httptest.Server {
 	}))
 }
 
+func TestPortfolioHistory(t *testing.T) {
+	body := []byte(`{"timestamp":[1,2],"equity":["100000","101500"],"profit_loss":["0","1500"],"base_value":"100000","timeframe":"1D"}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/account/portfolio/history" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("period") != "1W" || r.URL.Query().Get("timeframe") != "1D" {
+			t.Fatalf("query = %s", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	h, err := rest.PortfolioHistory(t.Context(), "1W", "1D")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, ok := h.LatestPnL()
+	if !ok || v != 1500 {
+		t.Fatalf("LatestPnL = %v %v", v, ok)
+	}
+}
+
 func TestTradesPagination(t *testing.T) {
 	// Two pages: first carries a next-page token, second terminates.
 	tr1 := []byte(`{"trades":[{"S":"AAPL","p":150.25,"s":10,"t":"2026-07-15T14:00:00Z"},{"S":"AAPL","p":150.30,"s":5,"t":"2026-07-15T14:00:01Z"}],"next_page_token":"tok2"}`)
@@ -286,5 +311,32 @@ func TestCancelSymbolDeletesAllIDs(t *testing.T) {
 		if !seen[id] {
 			t.Fatalf("missing delete for %s in %v", id, deleted)
 		}
+	}
+}
+
+func TestWarmHitsClock(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/clock" {
+			http.NotFound(w, r)
+			return
+		}
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"is_open":true,"next_open":"2026-07-20T13:30:00Z","next_close":"2026-07-20T20:00:00Z","timestamp":"2026-07-19T15:00:00Z"}`))
+	}))
+	defer srv.Close()
+
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	cl, err := rest.Warm(t.Context())
+	if err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	if !cl.IsOpen {
+		t.Fatalf("Warm clock IsOpen = false, want true")
+	}
+	if hits != 1 {
+		t.Fatalf("clock hits = %d, want 1", hits)
 	}
 }

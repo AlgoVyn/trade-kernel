@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -14,14 +15,37 @@ import (
 )
 
 // REST is a client for the Alpaca trading and market-data REST APIs.
-// The zero values of http.Client settings are tuned for low latency:
-// keep-alive connections are reused across calls.
+// Trading and market-data use separate HTTP clients so order/account paths
+// can fail fast on header stalls while multi-page bar/trade backfills
+// tolerate slower first-byte latency under load.
 type REST struct {
 	tradingBase string
 	dataBase    string
 	keyID       string
 	secretKey   string
-	hc          *http.Client
+	tradingHC   *http.Client
+	dataHC      *http.Client
+}
+
+func newHTTPClient(timeout, headerTimeout time.Duration) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   3 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           dialer.DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          16,
+			MaxIdleConnsPerHost:   8,
+			IdleConnTimeout:       5 * time.Minute,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: headerTimeout,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
 }
 
 // NewREST builds a REST client. paper selects the paper trading endpoint.
@@ -35,15 +59,19 @@ func NewREST(keyID, secretKey string, paper bool) *REST {
 		dataBase:    DataURL,
 		keyID:       keyID,
 		secretKey:   secretKey,
-		hc: &http.Client{
-			Timeout: 10 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        8,
-				MaxIdleConnsPerHost: 8,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
+		// Trading: tight header timeout so hung order/account calls fail quickly.
+		tradingHC: newHTTPClient(10*time.Second, 5*time.Second),
+		// Data: longer budgets for paginated bars/trades under load.
+		dataHC: newHTTPClient(30*time.Second, 15*time.Second),
 	}
+}
+
+// Warm primes the trading-host TLS/HTTP connection with a cheap GET so the
+// first hotkey order does not pay DNS+TCP+TLS. Returns the /v2/clock payload
+// so callers can seed the session engine with the same RTT. Failures are
+// returned to the caller (log and continue — order path will surface real errors).
+func (c *REST) Warm(ctx context.Context) (Clock, error) {
+	return c.Clock(ctx)
 }
 
 // SetBaseURL overrides the trading base URL. Intended for httptest-based
@@ -54,7 +82,7 @@ func (c *REST) SetBaseURL(u string) { c.tradingBase = u }
 // based integration tests; not used in production.
 func (c *REST) SetDataURL(u string) { c.dataBase = u }
 
-func (c *REST) do(ctx context.Context, method, base, path string, query url.Values, body any, out any) error {
+func (c *REST) do(ctx context.Context, hc *http.Client, method, base, path string, query url.Values, body any, out any) error {
 	u := base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -76,7 +104,7 @@ func (c *REST) do(ctx context.Context, method, base, path string, query url.Valu
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
@@ -102,11 +130,11 @@ func (c *REST) do(ctx context.Context, method, base, path string, query url.Valu
 }
 
 func (c *REST) trading(ctx context.Context, method, path string, q url.Values, body, out any) error {
-	return c.do(ctx, method, c.tradingBase, path, q, body, out)
+	return c.do(ctx, c.tradingHC, method, c.tradingBase, path, q, body, out)
 }
 
 func (c *REST) data(ctx context.Context, method, path string, q url.Values, out any) error {
-	return c.do(ctx, method, c.dataBase, path, q, nil, out)
+	return c.do(ctx, c.dataHC, method, c.dataBase, path, q, nil, out)
 }
 
 // Account fetches /v2/account.
@@ -114,6 +142,26 @@ func (c *REST) Account(ctx context.Context) (Account, error) {
 	var a Account
 	err := c.trading(ctx, http.MethodGet, "/v2/account", nil, nil, &a)
 	return a, err
+}
+
+// PortfolioHistory fetches equity/PnL timeseries.
+// period examples: "1D", "1W", "1M". timeframe examples: "1Min", "15Min", "1D".
+// For equities extended-hours sessions use intraday_reporting=extended_hours.
+func (c *REST) PortfolioHistory(ctx context.Context, period, timeframe string) (PortfolioHistory, error) {
+	q := url.Values{}
+	if period != "" {
+		q.Set("period", period)
+	}
+	if timeframe != "" {
+		q.Set("timeframe", timeframe)
+	}
+	// Include pre/post so overnight/extended marks are reflected in day/week PnL.
+	if timeframe != "" && timeframe != "1D" {
+		q.Set("intraday_reporting", "extended_hours")
+	}
+	var h PortfolioHistory
+	err := c.trading(ctx, http.MethodGet, "/v2/account/portfolio/history", q, nil, &h)
+	return h, err
 }
 
 // Positions fetches all open positions.
@@ -251,7 +299,7 @@ type barsResponse struct {
 // feed selects the data source:
 //   - "sip"   — regular + pre-market + after-hours (default when empty)
 //   - "boats" — overnight session (20:00–04:00 ET); required for 24/5
-//               historical overnight bars (SIP does not include them)
+//     historical overnight bars (SIP does not include them)
 //
 // For a full 24/5 series, call Bars twice (sip + boats) and MergeBars.
 func (c *REST) Bars(ctx context.Context, symbol, timeframe string, start, end time.Time, limit int, feed string) ([]Bar, error) {

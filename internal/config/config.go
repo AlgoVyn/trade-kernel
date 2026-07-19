@@ -71,6 +71,28 @@ type Chart struct {
 	Timeframe      string `yaml:"timeframe"` // initial resolution
 	BarsVisible    int    `yaml:"bars_visible"`
 	SessionShading bool   `yaml:"session_shading"`
+	// TickMS is the base UI render interval in milliseconds (default 50).
+	// Short timeframes refresh slightly faster (capped at 33ms when base is
+	// higher; aggressive configs below 33ms are honored). Panned history and
+	// closed sessions slow to ≥100ms. Range: 16–500.
+	TickMS int `yaml:"tick_ms"`
+}
+
+// Tick returns the base UI render interval.
+// Matches Validate bounds (16–500): zero/negative → 50 default; out of range
+// is clamped so callers outside Load/Validate never get a silent absurd value.
+func (c Config) Tick() time.Duration {
+	ms := c.Chart.TickMS
+	if ms <= 0 {
+		ms = 50
+	}
+	if ms < 16 {
+		ms = 16
+	}
+	if ms > 500 {
+		ms = 500
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func (c Config) QuoteStaleAfter() time.Duration {
@@ -138,6 +160,12 @@ func (c *Config) Validate() error {
 	if c.Chart.BarsVisible <= 0 {
 		c.Chart.BarsVisible = 120
 	}
+	if c.Chart.TickMS == 0 {
+		c.Chart.TickMS = 50
+	}
+	if c.Chart.TickMS < 16 || c.Chart.TickMS > 500 {
+		return fmt.Errorf("chart.tick_ms must be between 16 and 500 (got %d)", c.Chart.TickMS)
+	}
 	// Safety rails: negative values would silently disable checks in
 	// risk.Checker (which treats <=0 as "disabled"). Reject explicitly so a
 	// config typo can't quietly turn off a guardrail.
@@ -147,7 +175,27 @@ func (c *Config) Validate() error {
 	if c.Limits.MaxPositionQty < 0 {
 		return fmt.Errorf("limits.max_position_qty must be >= 0 (0 disables)")
 	}
+	for action := range c.Keys {
+		if !knownKeyAction(action) {
+			return fmt.Errorf("keys: unknown action %q (valid: buy, sell, add, reduce, flatten, cancel, panic, cmdline, cycle_tf, cycle_tf_back, pan_left, pan_right, cycle_indicators, quit, quit_force; legacy aliases: cancel_all, panic_all)", action)
+		}
+	}
 	return nil
+}
+
+// knownKeyAction reports whether action is a supported keys: map value
+// (including legacy cancel_all / panic_all aliases).
+func knownKeyAction(action string) bool {
+	switch action {
+	case "buy", "sell", "add", "reduce", "flatten",
+		"cancel", "cancel_all", "panic", "panic_all",
+		"cmdline", "cycle_tf", "cycle_tf_back",
+		"pan_left", "pan_right", "cycle_indicators",
+		"quit", "quit_force":
+		return true
+	default:
+		return false
+	}
 }
 
 // Load reads the YAML file at path (missing file is allowed) and applies

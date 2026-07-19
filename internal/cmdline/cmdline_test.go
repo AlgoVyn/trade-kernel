@@ -79,11 +79,11 @@ func TestParseOther(t *testing.T) {
 	if c, err := Parse("lock too hot"); err != nil || c.Kind != KindLock || c.Reason != "too hot" {
 		t.Fatalf("lock reason: %+v err=%v", c, err)
 	}
-	if c, err := Parse("panic"); err != nil || c.Kind != KindPanic || c.All {
+	if c, err := Parse("panic"); err != nil || c.Kind != KindPanic {
 		t.Fatalf("panic: %+v err=%v", c, err)
 	}
-	if c, err := Parse("panic all"); err != nil || c.Kind != KindPanic || !c.All {
-		t.Fatalf("panic all: %+v err=%v", c, err)
+	if _, err := Parse("panic all"); err == nil {
+		t.Fatal("expected error for panic all (active symbol only)")
 	}
 	if c, err := Parse("quit"); err != nil || c.Kind != KindQuit {
 		t.Fatalf("%+v err=%v", c, err)

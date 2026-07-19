@@ -1,5 +1,5 @@
-# Binaries
-trade-kernel
+# Binaries (root only — do not ignore cmd/trade-kernel/)
+/trade-kernel
 *.exe
 *.exe~
 *.dll
