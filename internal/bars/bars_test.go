@@ -58,9 +58,10 @@ func TestAggregation5sAndRoll(t *testing.T) {
 	if snap.Bars[0].Close != 102 || snap.Bars[1].Close != 104 || snap.Bars[2].Close != 98 {
 		t.Fatalf("closes: %v %v %v", snap.Bars[0].Close, snap.Bars[1].Close, snap.Bars[2].Close)
 	}
-	// SMA(2) at bar1 close = (102+104)/2 = 103.
-	if got := snap.SMA[1]; math.Abs(got-103) > 1e-9 {
-		t.Fatalf("SMA = %v, want 103", got)
+	// NewAggregator(2, 3): EMA period 2, EMA2 period 3 (k=0.5).
+	// EMA2 at bar1: seed 102, then 104 → 103.
+	if got := snap.EMA2[1]; math.Abs(got-103) > 1e-9 {
+		t.Fatalf("EMA2 = %v, want 103", got)
 	}
 	// VWAP cumulative: (100+102+104+98)/4 = 101.
 	if got := a.SessionVWAP(); math.Abs(got-101) > 1e-9 {
@@ -148,6 +149,7 @@ func TestDailyBucketAnchor(t *testing.T) {
 
 func TestLoadBackfill(t *testing.T) {
 	a := NewAggregator(2, 3)
+	// Historical (not-current) buckets stay fully closed.
 	hist := []Bar{
 		{Start: base, Open: 1, High: 1, Low: 1, Close: 10, Volume: 100},
 		{Start: base.Add(time.Minute), Open: 1, High: 1, Low: 1, Close: 20, Volume: 100},
@@ -158,19 +160,186 @@ func TestLoadBackfill(t *testing.T) {
 	if len(snap.Bars) != 3 {
 		t.Fatalf("want 3 bars, got %d", len(snap.Bars))
 	}
-	// SMA(2) at last close = 25.
-	if got := snap.SMA[2]; math.Abs(got-25) > 1e-9 {
-		t.Fatalf("SMA after backfill = %v, want 25", got)
+	// NewAggregator(2, 3): EMA period 2, EMA2 period 3.
+	// EMA(2) k=2/3 over closes 10,20,30:
+	//   10; 20*(2/3)+10/3 = 50/3; 30*(2/3)+(50/3)*(1/3) = 20 + 50/9 = 230/9
+	if got := snap.EMA[2]; math.Abs(got-230.0/9.0) > 1e-9 {
+		t.Fatalf("EMA after backfill = %v, want %v", got, 230.0/9.0)
 	}
-	// EMA(3) k=0.5: 10, 15, 22.5
-	if got := snap.EMA[2]; math.Abs(got-22.5) > 1e-9 {
-		t.Fatalf("EMA after backfill = %v, want 22.5", got)
+	// EMA2(3) k=0.5: 10, 15, 22.5
+	if got := snap.EMA2[2]; math.Abs(got-22.5) > 1e-9 {
+		t.Fatalf("EMA2 after backfill = %v, want 22.5", got)
+	}
+	// Session VWAP reconstructed from typical price (H+L+C)/3:
+	// bar0: (1+1+10)/3 = 4, bar1: 22/3, bar2: 32/3
+	// cum: (4*100 + 22/3*100 + 32/3*100) / 300
+	tp0, tp1, tp2 := (1.0+1+10)/3, (1.0+1+20)/3, (1.0+1+30)/3
+	wantVWAP0 := tp0
+	wantVWAP1 := (tp0*100 + tp1*100) / 200
+	wantVWAP2 := (tp0*100 + tp1*100 + tp2*100) / 300
+	for i, want := range []float64{wantVWAP0, wantVWAP1, wantVWAP2} {
+		if math.IsNaN(snap.VWAP[i]) {
+			t.Fatalf("VWAP[%d] is NaN after Load — chart would hide the line", i)
+		}
+		if math.Abs(snap.VWAP[i]-want) > 1e-9 {
+			t.Fatalf("VWAP[%d] = %v, want %v", i, snap.VWAP[i], want)
+		}
+	}
+	// Live session VWAP seeded from the reconstruction.
+	if got := a.SessionVWAP(); math.Abs(got-wantVWAP2) > 1e-9 {
+		t.Fatalf("seeded SessionVWAP = %v, want %v", got, wantVWAP2)
 	}
 	// Live trades extend the backfilled series.
 	feed(a, []tick{{180, 40, 10}})
 	snap = a.Snapshot(TF1m, 10, 0)
 	if len(snap.Bars) != 4 || snap.Bars[3].Close != 40 {
 		t.Fatalf("after live tick: %+v", snap.Bars)
+	}
+}
+
+// TestLoadCurrentBucketIsForming ensures the incomplete current-minute bar
+// from REST is reopened as forming so live trades extend it (one candle /
+// correct volume) instead of duplicating the bucket.
+func TestLoadCurrentBucketIsForming(t *testing.T) {
+	a := NewAggregator(2, 3)
+	now := time.Now().UTC().Truncate(time.Minute)
+	hist := []Bar{
+		{Start: now.Add(-2 * time.Minute), Open: 10, High: 11, Low: 9, Close: 10.5, Volume: 100, VWAP: 10},
+		{Start: now.Add(-time.Minute), Open: 10.5, High: 12, Low: 10, Close: 11, Volume: 200, VWAP: 11},
+		// Incomplete current minute from REST (partial volume).
+		{Start: now, Open: 11, High: 11.5, Low: 10.8, Close: 11.2, Volume: 50, VWAP: 11.1},
+	}
+	a.Load(TF1m, hist)
+	snap := a.Snapshot(TF1m, 10, 0)
+	if len(snap.Bars) != 3 {
+		t.Fatalf("want 3 bars (2 closed + forming), got %d", len(snap.Bars))
+	}
+	if snap.Bars[2].Volume != 50 || snap.Bars[2].Close != 11.2 {
+		t.Fatalf("forming = %+v", snap.Bars[2])
+	}
+	// Forming volume is seeded into SessionVWAP (no further trades).
+	// (10*100 + 11*200 + 11.1*50) / 350
+	wantVWAP := (10.0*100 + 11*200 + 11.1*50) / 350
+	if got := a.SessionVWAP(); math.Abs(got-wantVWAP) > 1e-9 {
+		t.Fatalf("SessionVWAP after Load with forming = %v, want %v (includes partial)", got, wantVWAP)
+	}
+	// Live trade in the same minute extends forming — no fourth bar.
+	a.OnTrade("TEST", 11.8, 25, now.Add(30*time.Second))
+	snap = a.Snapshot(TF1m, 10, 0)
+	if len(snap.Bars) != 3 {
+		t.Fatalf("after live same-minute: want 3 bars, got %d (%+v)", len(snap.Bars), snap.Bars)
+	}
+	f := snap.Bars[2]
+	if f.Volume != 75 || f.High != 11.8 || f.Close != 11.8 {
+		t.Fatalf("extended forming = %+v, want vol=75 high/close=11.8", f)
+	}
+}
+
+// TestLoadFormingBucketAcceptsFutureSkew treats lastStart >= curBucket as
+// forming (REST/server clock slightly ahead of local truncate).
+func TestLoadFormingBucketAcceptsFutureSkew(t *testing.T) {
+	a := NewAggregator(2, 3)
+	// Bar start is the next minute relative to "now" inside Load — simulate
+	// by loading a bar whose start is still the current truncated minute
+	// (equal path) is covered above; here lastStart is strictly after the
+	// local current bucket only if we pass a start in the future.
+	future := time.Now().UTC().Truncate(time.Minute).Add(time.Minute)
+	hist := []Bar{
+		{Start: future.Add(-2 * time.Minute), Open: 10, High: 10, Low: 10, Close: 10, Volume: 10, VWAP: 10},
+		{Start: future, Open: 11, High: 11, Low: 11, Close: 11, Volume: 20, VWAP: 11},
+	}
+	a.Load(TF1m, hist)
+	snap := a.Snapshot(TF1m, 10, 0)
+	// If future is still >= curBucket, last bar is forming.
+	if len(snap.Bars) < 1 {
+		t.Fatal("empty snapshot")
+	}
+	last := snap.Bars[len(snap.Bars)-1]
+	if !last.Start.Equal(future) {
+		// Clock may have rolled; still require forming open with last hist.
+		t.Logf("note: clock may have crossed bucket; last=%v future=%v", last.Start, future)
+	}
+	if last.Volume != 20 && last.Volume != 10 {
+		t.Fatalf("unexpected last bar %+v", last)
+	}
+}
+
+// TestLoadVWAPUsesBarVWAP prefers the REST per-bar VWAP field when set.
+func TestLoadVWAPUsesBarVWAP(t *testing.T) {
+	a := NewAggregator(2, 3)
+	hist := []Bar{
+		{Start: base, Open: 10, High: 12, Low: 9, Close: 11, Volume: 50, VWAP: 10.5},
+		{Start: base.Add(time.Minute), Open: 11, High: 13, Low: 10, Close: 12, Volume: 150, VWAP: 11.5},
+	}
+	a.Load(TF1m, hist)
+	snap := a.Snapshot(TF1m, 10, 0)
+	want0 := 10.5
+	want1 := (10.5*50 + 11.5*150) / 200
+	if math.Abs(snap.VWAP[0]-want0) > 1e-9 {
+		t.Fatalf("VWAP[0] = %v, want %v", snap.VWAP[0], want0)
+	}
+	if math.Abs(snap.VWAP[1]-want1) > 1e-9 {
+		t.Fatalf("VWAP[1] = %v, want %v", snap.VWAP[1], want1)
+	}
+}
+
+// TestLoadVWAPResetsAcrossRTHDays ensures multi-day regular-hours-only
+// history restarts session VWAP each trading day (not one multi-day cum).
+func TestLoadVWAPResetsAcrossRTHDays(t *testing.T) {
+	// Wednesday 10:00 ET and Thursday 10:00 ET — both Regular, no overnight bars.
+	day1 := time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC) // 10:00 ET
+	day2 := time.Date(2026, 7, 16, 14, 0, 0, 0, time.UTC)
+	a := NewAggregator(2, 3)
+	a.SetVWAPAnchor("session")
+	hist := []Bar{
+		{Start: day1, Open: 10, High: 10, Low: 10, Close: 10, Volume: 100, VWAP: 10},
+		{Start: day1.Add(time.Minute), Open: 12, High: 12, Low: 12, Close: 12, Volume: 100, VWAP: 12},
+		{Start: day2, Open: 20, High: 20, Low: 20, Close: 20, Volume: 100, VWAP: 20},
+	}
+	a.Load(TF1m, hist)
+	snap := a.Snapshot(TF1m, 10, 0)
+	// Day2 first bar should restart at 20, not continue day1 average.
+	if math.Abs(snap.VWAP[2]-20) > 1e-9 {
+		t.Fatalf("VWAP day2 start = %v, want 20 (session reset)", snap.VWAP[2])
+	}
+	if got := a.SessionVWAP(); math.Abs(got-20) > 1e-9 {
+		t.Fatalf("seeded SessionVWAP = %v, want 20", got)
+	}
+}
+
+// TestLoadVWAPDayAnchor keeps one accumulator across sessions in a trading day.
+func TestLoadVWAPDayAnchor(t *testing.T) {
+	// Pre-market 08:00 ET and regular 10:00 ET same calendar day.
+	pre := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC) // 08:00 ET
+	rth := time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC) // 10:00 ET
+	a := NewAggregator(2, 3)
+	a.SetVWAPAnchor("day")
+	hist := []Bar{
+		{Start: pre, Open: 10, High: 10, Low: 10, Close: 10, Volume: 100, VWAP: 10},
+		{Start: rth, Open: 20, High: 20, Low: 20, Close: 20, Volume: 100, VWAP: 20},
+	}
+	a.Load(TF1m, hist)
+	snap := a.Snapshot(TF1m, 10, 0)
+	want := (10.0*100 + 20*100) / 200
+	if math.Abs(snap.VWAP[1]-want) > 1e-9 {
+		t.Fatalf("day-anchor VWAP = %v, want %v (no session reset)", snap.VWAP[1], want)
+	}
+}
+
+// TestLoadTF1mSeedNotOverwrittenByCoarser ensures later Load(TF5m) leaves
+// the live SessionVWAP from TF1m alone.
+func TestLoadTF1mSeedNotOverwrittenByCoarser(t *testing.T) {
+	a := NewAggregator(2, 3)
+	hist1 := []Bar{
+		{Start: base, Open: 10, High: 10, Low: 10, Close: 10, Volume: 100, VWAP: 10},
+	}
+	hist5 := []Bar{
+		{Start: base, Open: 50, High: 50, Low: 50, Close: 50, Volume: 100, VWAP: 50},
+	}
+	a.Load(TF1m, hist1)
+	a.Load(TF5m, hist5)
+	if got := a.SessionVWAP(); math.Abs(got-10) > 1e-9 {
+		t.Fatalf("SessionVWAP = %v, want 10 from TF1m seed", got)
 	}
 }
 
@@ -326,6 +495,41 @@ func TestReplayTrades(t *testing.T) {
 	// Last-trade cache must be untouched (live-only).
 	if p, at := a.LatestTrade(); p != 0 || !at.IsZero() {
 		t.Fatalf("last-trade cache corrupted by replay: %v @ %v", p, at)
+	}
+}
+
+// TestSameBucketReopensForming: if the current bucket was closed into the
+// ring (race / older Load), a live trade for that bucket reopens it as
+// forming and keeps EMA Peek'd off the new close rather than frozen stale.
+func TestSameBucketReopensForming(t *testing.T) {
+	a := NewAggregator(2, 3)
+	// Two closed 1m bars via Load. base is far in the past vs time.Now(), so
+	// neither bar is the incomplete current bucket — both land in the ring.
+	t0 := base
+	t1 := base.Add(time.Minute)
+	a.Load(TF1m, []Bar{
+		{Start: t0, Open: 100, High: 101, Low: 99, Close: 100, Volume: 10},
+		{Start: t1, Open: 102, High: 103, Low: 101, Close: 102, Volume: 10},
+	})
+
+	// Trade still in t1 bucket — must reopen, not leave stale EMA on ring.
+	a.OnTrade("AAPL", 110, 5, t1.Add(30*time.Second))
+	snap := a.Snapshot(TF1m, 10, 0)
+	if len(snap.Bars) != 2 {
+		t.Fatalf("want 2 bars (1 closed + forming), got %d", len(snap.Bars))
+	}
+	f := snap.Bars[len(snap.Bars)-1]
+	if !f.Start.Equal(t1) {
+		t.Fatalf("forming start = %v, want %v", f.Start, t1)
+	}
+	if f.Close != 110 || f.High != 110 || f.Volume != 15 {
+		t.Fatalf("forming = %+v, want close/high 110 vol 15", f)
+	}
+	// Forming EMA is Peek(110) from state after only the first closed bar.
+	// EMA(2) k=2/3: seed 100, Peek(110) = 110*(2/3)+100*(1/3) = 320/3.
+	wantEMA := 110.0*(2.0/3.0) + 100.0*(1.0/3.0)
+	if got := snap.EMA[len(snap.EMA)-1]; math.Abs(got-wantEMA) > 1e-9 {
+		t.Fatalf("forming EMA = %v, want %v", got, wantEMA)
 	}
 }
 

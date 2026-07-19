@@ -75,6 +75,12 @@ type Position struct {
 	Side          string    `json:"side"` // "long" or "short"
 }
 
+// SetQty sets the absolute position quantity (package-external writers).
+func (p *Position) SetQty(q float64) { p.Qty = flexFloat(q) }
+
+// SetAvgEntryPrice sets the average entry price (package-external writers).
+func (p *Position) SetAvgEntryPrice(v float64) { p.AvgEntryPrice = flexFloat(v) }
+
 // OrderRequest is the POST /v2/orders body.
 type OrderRequest struct {
 	Symbol        string `json:"symbol"`
@@ -153,12 +159,51 @@ type Quote struct {
 	Timestamp time.Time `json:"t"`
 }
 
+// OptionalFloat is a JSON number/string that also tracks whether the field
+// was present. Missing and null both yield Valid=false so callers can
+// distinguish "omitted" from an explicit zero (e.g. position_qty on fills).
+type OptionalFloat struct {
+	V     float64
+	Valid bool
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (o *OptionalFloat) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	// null and empty string are "absent" — same class of bug as omit for
+	// position_qty (treating "" as valid 0 would wipe a cached position).
+	if s == "null" || s == `""` || s == "" {
+		o.V, o.Valid = 0, false
+		return nil
+	}
+	var f flexFloat
+	if err := f.UnmarshalJSON(b); err != nil {
+		return err
+	}
+	o.V = float64(f)
+	o.Valid = true
+	return nil
+}
+
+// MarshalJSON emits null when invalid, otherwise a number.
+func (o OptionalFloat) MarshalJSON() ([]byte, error) {
+	if !o.Valid {
+		return []byte("null"), nil
+	}
+	return json.Marshal(o.V)
+}
+
 // TradeUpdate is an event from the trading WS stream ("trade_updates").
 type TradeUpdate struct {
 	Event string `json:"event"` // fill, partial_fill, canceled, expired, rejected, ...
 	Order Order  `json:"order"`
+	// Price and Qty are the individual fill for this event (not cumulative).
+	// Prefer these over Order.FilledAvgPrice when recomputing average entry.
+	Price flexFloat `json:"price"`
+	Qty   flexFloat `json:"qty"`
 	// PositionQty is present on fill events for the affected position.
-	PositionQty flexFloat `json:"position_qty"`
+	// Valid=false when the field is omitted or null — do not treat that as flat.
+	PositionQty OptionalFloat `json:"position_qty"`
 }
 
 // apiError is Alpaca's error envelope.

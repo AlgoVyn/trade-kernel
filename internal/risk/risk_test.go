@@ -38,8 +38,14 @@ func TestCheckerDebounce(t *testing.T) {
 	if err := c.Check("AAPL", "buy", 100); err != nil {
 		t.Fatal(err)
 	}
+	// Check alone does not record — declined confirm must not burn the window.
+	if err := c.Check("AAPL", "buy", 100); err != nil {
+		t.Fatalf("without Record, second Check should still pass: %v", err)
+	}
+	// Record at submit commit (before broker ACK) blocks in-flight duplicates.
+	c.Record("AAPL", "buy", 100)
 	if err := c.Check("AAPL", "buy", 100); err == nil {
-		t.Fatal("expected debounce rejection")
+		t.Fatal("expected debounce rejection after Record")
 	}
 	// Different order is not debounced.
 	if err := c.Check("AAPL", "buy", 200); err != nil {
@@ -54,7 +60,7 @@ func TestCheckerDebounce(t *testing.T) {
 
 func TestCheckerLock(t *testing.T) {
 	c := NewChecker(Limits{}, fakeLookup{}, nil)
-	c.Lock("daily loss")
+	c.Lock("manual lock")
 	if err := c.Check("AAPL", "buy", 1); err == nil {
 		t.Fatal("locked checker must reject")
 	}
@@ -64,35 +70,5 @@ func TestCheckerLock(t *testing.T) {
 	c.Unlock()
 	if err := c.Check("AAPL", "buy", 1); err != nil {
 		t.Fatalf("unlocked: %v", err)
-	}
-}
-
-func TestLossMonitor(t *testing.T) {
-	loc, err := time.LoadLocation("America/New_York")
-	if err != nil {
-		t.Skip("tzdata:", err)
-	}
-	now := time.Date(2026, 7, 15, 12, 0, 0, 0, loc)
-	var breached float64
-	m := NewLossMonitor(1000, func(loss float64) { breached = loss }, func() time.Time { return now })
-
-	m.Update(100000, loc) // day start
-	m.Update(99500, loc)  // -500: fine
-	if m.Tripped() {
-		t.Fatal("tripped too early")
-	}
-	m.Update(98900, loc) // -1100: breach
-	if !m.Tripped() {
-		t.Fatal("should have tripped")
-	}
-	if breached < 1000 {
-		t.Fatalf("breach loss = %v", breached)
-	}
-
-	// New day resets.
-	now = now.AddDate(0, 0, 1)
-	m.Update(98900, loc)
-	if m.Tripped() {
-		t.Fatal("should reset on new day")
 	}
 }

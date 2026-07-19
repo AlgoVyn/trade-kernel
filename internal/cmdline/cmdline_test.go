@@ -73,6 +73,18 @@ func TestParseOther(t *testing.T) {
 	if c, err := Parse("unlock"); err != nil || c.Kind != KindUnlock {
 		t.Fatalf("%+v err=%v", c, err)
 	}
+	if c, err := Parse("lock"); err != nil || c.Kind != KindLock || c.Reason != "manual" {
+		t.Fatalf("lock: %+v err=%v", c, err)
+	}
+	if c, err := Parse("lock too hot"); err != nil || c.Kind != KindLock || c.Reason != "too hot" {
+		t.Fatalf("lock reason: %+v err=%v", c, err)
+	}
+	if c, err := Parse("panic"); err != nil || c.Kind != KindPanic || c.All {
+		t.Fatalf("panic: %+v err=%v", c, err)
+	}
+	if c, err := Parse("panic all"); err != nil || c.Kind != KindPanic || !c.All {
+		t.Fatalf("panic all: %+v err=%v", c, err)
+	}
 	if c, err := Parse("quit"); err != nil || c.Kind != KindQuit {
 		t.Fatalf("%+v err=%v", c, err)
 	}

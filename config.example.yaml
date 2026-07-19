@@ -31,7 +31,6 @@ confirm_orders: true
 limits:
   max_order_qty: 1000       # reject orders larger than this
   max_position_qty: 5000    # reject orders that would grow |position| past this
-  daily_loss_limit: 2000    # kill-switch: cancel all + flatten + lock (0 disables)
   debounce_ms: 300          # duplicate-order debounce window
 
 extended_hours:
@@ -39,8 +38,8 @@ extended_hours:
   quote_stale_ms: 3000      # NBBO older than this -> price off last trade + warn
 
 indicators:
-  sma_period: 20
-  ema_period: 9
+  ema_period: 9             # fast EMA period
+  ema2_period: 20           # slow EMA period
   vwap_anchor: session      # "session" resets each session; "day" resets at 20:00 ET
 
 chart:

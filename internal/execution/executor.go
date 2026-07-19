@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -28,6 +29,8 @@ type Executor interface {
 	Flatten(ctx context.Context, symbol string, positionQty float64) (alpaca.Order, error)
 	// CancelAll cancels every open order.
 	CancelAll(ctx context.Context) error
+	// CancelSymbol cancels open orders for one symbol only.
+	CancelSymbol(ctx context.Context, symbol string) error
 }
 
 // RESTExecutor implements Executor against the Alpaca REST API.
@@ -100,35 +103,84 @@ func (e *RESTExecutor) LimitSell(ctx context.Context, symbol string, qty int, pr
 }
 
 // Flatten submits the opposite-side order for the full position size. If
-// the market is locally Closed (weekend halt, holiday override), it falls
-// back to DELETE /v2/positions/{symbol}, which liquidates regardless of
-// order-form rules — the emergency exit must always work.
+// the market is locally Closed (weekend halt, holiday override), or the
+// session-aware builder cannot price an extended-hours exit (no NBBO /
+// last trade), it falls back to DELETE /v2/positions/{symbol} — the
+// emergency exit must always work.
+//
+// Non-integral quantities (fractional shares or sub-share residuals) use
+// ClosePosition directly so a single flatten fully exits; whole-share
+// positions use the session-aware order path.
 func (e *RESTExecutor) Flatten(ctx context.Context, symbol string, positionQty float64) (alpaca.Order, error) {
 	if positionQty == 0 {
 		return alpaca.Order{}, fmt.Errorf("no position in %s", symbol)
 	}
-	qty := int(math.Abs(positionQty))
-	if qty == 0 {
-		return alpaca.Order{}, fmt.Errorf("no position in %s", symbol)
+	abs := math.Abs(positionQty)
+	qty := int(abs)
+	// Fractional / sub-share: liquidate fully via the positions endpoint.
+	// Truncating to whole shares would leave a residual open.
+	if qty == 0 || abs != float64(qty) {
+		return e.closePosition(ctx, symbol)
 	}
+	// Capture session once so a boundary between checks cannot pick
+	// ClosePosition for one branch and the order path for the other.
+	sess := e.sessionNow()
 	// Closed locally ⇒ the builder would reject ("market is closed"). Use
 	// the position-close endpoint, which works outside any session.
-	if e.sessionNow() == session.Closed {
-		if err := e.rest.ClosePosition(ctx, symbol); err != nil {
-			return alpaca.Order{}, err
-		}
-		return alpaca.Order{Symbol: symbol, Status: "close_requested"}, nil
+	if sess == session.Closed {
+		return e.closePosition(ctx, symbol)
 	}
 	side := "sell"
 	if positionQty < 0 {
 		side = "buy"
 	}
-	return e.submit(ctx, BuildInput{
+	o, err := e.submit(ctx, BuildInput{
 		Symbol: symbol, Side: side, Qty: qty,
-		Session: e.sessionNow(), RegularTIF: e.regularTIF,
+		Session: sess, RegularTIF: e.regularTIF,
 	})
+	if err != nil {
+		// Only fall back for known builder/pricing failures. Do not call
+		// ClosePosition after a PlaceOrder transport/reject error — the
+		// order may already be live, and operators need the original error.
+		if isFlattenPricingFallback(err) {
+			o2, err2 := e.closePosition(ctx, symbol)
+			if err2 == nil {
+				// Keep original failure visible on the synthetic order so
+				// the UI/status line is not a silent close_requested alone.
+				o2.Status = "close_requested (" + err.Error() + ")"
+				return o2, nil
+			}
+			return alpaca.Order{}, fmt.Errorf("%w (close position: %v)", err, err2)
+		}
+		return alpaca.Order{}, err
+	}
+	return o, nil
+}
+
+// isFlattenPricingFallback reports whether err is a session/pricing failure
+// from the order builder (safe to liquidate via DELETE positions) rather
+// than a broker submit failure after the order may have been accepted.
+func isFlattenPricingFallback(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrMarketClosed) ||
+		errors.Is(err, ErrNoExtendedPrice) ||
+		errors.Is(err, ErrNotOvernightTradable) ||
+		errors.Is(err, ErrOvernightEligibility)
+}
+
+func (e *RESTExecutor) closePosition(ctx context.Context, symbol string) (alpaca.Order, error) {
+	if err := e.rest.ClosePosition(ctx, symbol); err != nil {
+		return alpaca.Order{}, err
+	}
+	return alpaca.Order{Symbol: symbol, Status: "close_requested"}, nil
 }
 
 func (e *RESTExecutor) CancelAll(ctx context.Context) error {
 	return e.rest.CancelAll(ctx)
+}
+
+func (e *RESTExecutor) CancelSymbol(ctx context.Context, symbol string) error {
+	return e.rest.CancelSymbol(ctx, symbol)
 }

@@ -14,7 +14,6 @@ func TestValidateRejectsNegativeLimits(t *testing.T) {
 	}{
 		{"negative max_order_qty", func(c *Config) { c.Limits.MaxOrderQty = -1 }, "max_order_qty"},
 		{"negative max_position_qty", func(c *Config) { c.Limits.MaxPositionQty = -1 }, "max_position_qty"},
-		{"negative daily_loss_limit", func(c *Config) { c.Limits.DailyLossLimit = -1}, "daily_loss_limit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -32,10 +31,33 @@ func TestValidateZeroLimitsAllowed(t *testing.T) {
 	// Zero means "disabled" and must be accepted (not treated as negative).
 	c := Config{
 		APIKeyID: "k", APISecretKey: "s", Paper: true,
-		Limits: Limits{MaxOrderQty: 0, MaxPositionQty: 0, DailyLossLimit: 0},
+		Limits: Limits{MaxOrderQty: 0, MaxPositionQty: 0},
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("zero limits should validate: %v", err)
+	}
+}
+
+func TestSMAPeriodAliasForEMA2(t *testing.T) {
+	tmp := t.TempDir() + "/tk.yaml"
+	if err := os.WriteFile(tmp, []byte(`
+api_key_id: k
+api_secret_key: s
+paper: true
+indicators:
+  ema_period: 9
+  sma_period: 21
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("APCA_API_KEY_ID", "")
+	t.Setenv("APCA_API_SECRET_KEY", "")
+	c, err := Load(tmp)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Indicators.EMA2Period != 21 {
+		t.Fatalf("EMA2Period = %d, want 21 from deprecated sma_period", c.Indicators.EMA2Period)
 	}
 }
 

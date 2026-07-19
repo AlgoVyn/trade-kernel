@@ -81,26 +81,32 @@ func (m *MarketWS) subscribeLocked(ctx context.Context) error {
 }
 
 // Run connects and maintains the connection until ctx is cancelled,
-// reconnecting with exponential backoff (250ms → 10s cap).
+// reconnecting with exponential backoff (250ms → 10s cap). Backoff resets
+// after any session that successfully authenticated, so post-outage flaps
+// reconnect quickly.
 func (m *MarketWS) Run(ctx context.Context) {
 	backoff := 250 * time.Millisecond
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		err := m.runOnce(ctx)
+		authed, err := m.runOnce(ctx)
 		if err != nil && m.OnError != nil && ctx.Err() == nil {
 			m.OnError(err)
 		}
 		m.setConn(nil)
+		if authed {
+			backoff = 250 * time.Millisecond
+		} else {
+			backoff *= 2
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
-		}
-		backoff *= 2
-		if backoff > 10*time.Second {
-			backoff = 10 * time.Second
 		}
 	}
 }
@@ -111,13 +117,15 @@ func (m *MarketWS) setConn(c *websocket.Conn) {
 	m.mu.Unlock()
 }
 
-func (m *MarketWS) runOnce(ctx context.Context) error {
+// runOnce returns authed=true if authentication completed (so the Run
+// loop can reset backoff after a healthy session ends).
+func (m *MarketWS) runOnce(ctx context.Context) (authed bool, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	conn, _, err := websocket.Dial(ctx, m.url, nil)
 	if err != nil {
-		return fmt.Errorf("dial market ws: %w", err)
+		return false, fmt.Errorf("dial market ws: %w", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "bye")
 	conn.SetReadLimit(1 << 20)
@@ -127,7 +135,7 @@ func (m *MarketWS) runOnce(ctx context.Context) error {
 	auth := map[string]any{"action": "auth", "key": m.keyID, "secret": m.secretKey}
 	b, _ := json.Marshal(auth)
 	if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
-		return fmt.Errorf("auth write: %w", err)
+		return false, fmt.Errorf("auth write: %w", err)
 	}
 
 	// Read auth responses, then subscribe.
@@ -136,7 +144,7 @@ func (m *MarketWS) runOnce(ctx context.Context) error {
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
-			return fmt.Errorf("market ws read: %w", err)
+			return authenticated, fmt.Errorf("market ws read: %w", err)
 		}
 		var msgs []json.RawMessage
 		if err := json.Unmarshal(data, &msgs); err != nil {
@@ -159,7 +167,7 @@ func (m *MarketWS) runOnce(ctx context.Context) error {
 					err := m.subscribeLocked(ctx)
 					m.mu.Unlock()
 					if err != nil {
-						return fmt.Errorf("subscribe: %w", err)
+						return true, fmt.Errorf("subscribe: %w", err)
 					}
 				}
 			case "subscription":
@@ -177,7 +185,7 @@ func (m *MarketWS) runOnce(ctx context.Context) error {
 					}
 				}
 			case "error":
-				return fmt.Errorf("market ws error %d: %s", head.Code, head.Msg)
+				return authenticated, fmt.Errorf("market ws error %d: %s", head.Code, head.Msg)
 			case "t":
 				var tr Trade
 				if json.Unmarshal(raw, &tr) == nil && m.OnTrade != nil {

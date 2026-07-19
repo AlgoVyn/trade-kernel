@@ -3,7 +3,7 @@
 A low-latency terminal trading app for US equities on
 [Alpaca](https://alpaca.markets), built for speed: keyboard-first order
 entry, full 24/5 session support (overnight, pre-market, regular,
-after-hours), braille candlestick charts with SMA/EMA/VWAP overlays,
+after-hours), braille candlestick charts with dual-EMA/VWAP overlays,
 and hard safety rails. Runs on a server near Alpaca; you attach over
 SSH + tmux.
 
@@ -25,11 +25,10 @@ SSH + tmux.
   confirmations are on, the converted limit price before submission.
 - **Fast order entry.** One keystroke to buy/sell/add/reduce/flatten
   with preset sizes; `:` command line for custom orders.
-- **Safety rails.** Max order size, max position size, duplicate-order
-  debounce, and a daily-loss kill-switch that cancels everything,
-  flattens, and locks until manually unlocked. `X` is the panic key.
+- **Safety rails.** Max order size, max position size, and duplicate-order
+  debounce. `X` is the panic key (cancel + flatten the active symbol).
 - **Charts.** Candlesticks in braille (2×4 dots/cell), volume pane,
-  SMA/EMA/session-VWAP overlays, per-session background shading,
+  dual EMA/session-VWAP overlays, per-session background shading,
   resolutions from 1s to 1d, weekend/holiday gaps collapsed.
 - **Resilient.** WebSocket auto-reconnect with REST backfill, state
   reconciliation on startup and reconnect, client order IDs for
@@ -68,7 +67,8 @@ export APCA_API_SECRET_KEY=...
 | `A` / `D` | Add to / reduce position |
 | `F` | Flatten entire position |
 | `C` | Cancel all open orders |
-| `X` | Panic: cancel all + flatten **all positions** (no confirmation) |
+| `X` | Panic: cancel **active symbol** orders + flatten it (no confirmation) |
+| `Ctrl+X` | Panic **all**: cancel every open order + flatten all positions |
 | `1`–`9` | Select size preset |
 | `Tab` / `Shift+Tab` | Cycle chart resolution forward / backward |
 | `←` / `→` | Pan chart back into history / forward toward live |
@@ -82,7 +82,8 @@ export APCA_API_SECRET_KEY=...
 :buy 250 lmt 152.30      limit buy        :sell 100 mkt     market sell
 :sym NVDA                switch symbol    :tf 5m            chart timeframe
 :preset 2                size preset      :flatten          close position
-:cancel                  cancel all       :unlock           release kill-switch
+:cancel                  cancel all       :lock [reason]    engage risk lock
+:unlock                  release lock     :panic / :panic all  symbol / account panic
 :confirm on|off          toggle confirms  :shading on|off   toggle shading
 :quit                    quit             :help             key summary
 ```
@@ -103,9 +104,13 @@ warning. Flatten/reduce are direction-aware from the position sign.
 
 - **Paper first.** Live trading needs both `paper: false` and
   `live_trading_acknowledged: true`, and prints a warning banner.
-- **Kill-switch.** If equity drops `daily_loss_limit` from the day's
-  first reading: cancel all, flatten everything, lock. `:unlock` to
-  re-enable (fires at most once per day).
+- **Size rails.** Max order qty and projected max position qty (reducing
+  exposure is always allowed); short duplicate-order debounce.
+- **Panic (X).** Cancels open orders for the active symbol and flattens
+  that symbol only (other names left alone). **Ctrl+X** / `:panic all`
+  cancels all orders and flattens every cached position.
+- **Manual lock.** `:lock [reason]` engages the kill-switch until
+  `:unlock` (orders rejected; flatten/panic still work).
 - **Confirmations.** `confirm_orders: true` shows every order (with the
   converted limit price in extended sessions) before submission.
 

@@ -19,7 +19,9 @@ const (
 	KindCancel
 	KindConfirm // confirm on|off
 	KindShading // shading on|off
+	KindLock    // lock [reason]
 	KindUnlock
+	KindPanic // panic | panic all
 	KindQuit
 	KindHelp
 )
@@ -34,6 +36,8 @@ type Command struct {
 	TF     string  // KindTF
 	Preset int     // KindPreset: 1-based
 	On     bool    // KindConfirm / KindShading
+	Reason string  // KindLock
+	All    bool    // KindPanic: true = account-wide
 }
 
 var verbs = map[string]Kind{
@@ -84,6 +88,20 @@ func Parse(input string) (Command, error) {
 			k = KindShading
 		}
 		return Command{Kind: k, On: args[0] == "on"}, nil
+	case "lock":
+		reason := "manual"
+		if len(args) > 0 {
+			reason = strings.Join(args, " ")
+		}
+		return Command{Kind: KindLock, Reason: reason}, nil
+	case "panic":
+		if len(args) == 0 {
+			return Command{Kind: KindPanic, All: false}, nil
+		}
+		if len(args) == 1 && strings.EqualFold(args[0], "all") {
+			return Command{Kind: KindPanic, All: true}, nil
+		}
+		return Command{}, fmt.Errorf("usage: panic | panic all")
 	default:
 		if k, ok := verbs[head]; ok {
 			return Command{Kind: k}, nil

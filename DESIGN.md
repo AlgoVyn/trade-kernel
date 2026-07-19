@@ -31,25 +31,23 @@ Keyboard ──> ui.Model ──> risk.Checker ──> execution.Executor ──
                   │              ▲                  ▲
                   └── confirm / pending state       └── execution.Builder
                                                        (session-aware rules)
-risk.LossMonitor <── account equity (5 s refresh) ──> kill-switch:
-                                                      cancel all + flatten + lock
 ```
 
 ### Packages
 
 | Package | Responsibility |
 |---|---|
-| `cmd/trade-kernel` | Config load, startup banner, wire-up, signal handling, symbol switching, bar backfill, kill-switch action. |
+| `cmd/trade-kernel` | Config load, startup banner, wire-up, signal handling, symbol switching, bar backfill. |
 | `internal/config` | YAML config (incl. `api_key_id`/`api_secret_key`) + env overrides (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`; env wins). Validation: live mode requires explicit acknowledgement; fills defaults. |
 | `internal/session` | Authoritative session classification in `America/New_York` (tz database, DST-safe). `Engine` emits transition events, accepts `/v2/clock` overrides for holidays/early closes (only ever *narrows* to Closed, never widens). |
 | `internal/alpaca` | REST client (account, positions, orders, clock, assets, bars w/ pagination); SIP market-data WS client (auth, subscribe, hot-switch, exponential-backoff reconnect, resync callback); trading WS client (`trade_updates`). |
-| `internal/bars` | Aggregates trades into 1s/5s/15s/1m/5m/15m/1h/1d bars in preallocated ring buffers (2048/TF). Daily bars anchor at 20:00 ET (the overnight open) so a "day" is one 24/5 trading day. Handles late/out-of-order trades (H/L/V correction in-place). Maintains per-TF SMA/EMA and session VWAP; caches latest NBBO + last trade for the order builder. |
-| `internal/indicators` | Pure incremental O(1) SMA, EMA, resettable VWAP, each with non-mutating `Peek` for live forming-bar values. |
+| `internal/bars` | Aggregates trades into 1s/5s/15s/1m/5m/15m/1h/1d bars in preallocated ring buffers (2048/TF). Daily bars anchor at 20:00 ET (the overnight open) so a "day" is one 24/5 trading day. Handles late/out-of-order trades (H/L/V correction in-place). Maintains per-TF dual EMA and session VWAP; caches latest NBBO + last trade for the order builder. |
+| `internal/indicators` | Pure incremental O(1) EMA, resettable VWAP (SMA retained as a utility), each with non-mutating `Peek` for live forming-bar values. |
 | `internal/state` | Mutex-guarded cache of account/positions/open orders. REST snapshot at startup + every 5 s; trading-WS events applied incrementally; full refresh on WS reconnect. |
-| `internal/execution` | `Executor` interface (`Buy/Sell/LimitBuy/LimitSell/Flatten/CancelAll`). `Builder` applies session rules. `RESTExecutor` submits with generated client order IDs. `EligibilityCache` caches overnight-tradability per symbol (1 h TTL). |
-| `internal/risk` | `Checker`: kill-switch lock, max order qty, projected max position qty (reducing exposure always allowed), duplicate-order debounce. `LossMonitor`: equity vs. first reading of each ET day; fires once per day. |
+| `internal/execution` | `Executor` interface (`Buy/Sell/LimitBuy/LimitSell/Flatten/CancelAll/CancelSymbol`). `Builder` applies session rules. `RESTExecutor` submits with generated client order IDs. `EligibilityCache` caches overnight-tradability per symbol (1 h TTL). |
+| `internal/risk` | `Checker`: optional lock, max order qty, projected max position qty (reducing exposure always allowed), duplicate-order debounce (Check/Record split). |
 | `internal/cmdline` | `:` command parser → typed `Command` structs. |
-| `internal/ui` | bubbletea model, braille candlestick renderer, volume pane, side panel, status bar, latency tracker, confirmation state machine. |
+| `internal/ui` | bubbletea model, solid-block candlestick renderer with braille indicator overlays, volume pane, bottom info bar, status bar, latency tracker, confirmation state machine. Panic (X) is symbol-scoped via `CancelSymbol` + flatten. |
 
 ## Key design decisions
 
@@ -88,15 +86,17 @@ price in extended sessions.
 ### 4. Safety rails (defense in depth)
 
 1. **Pre-trade** (`risk.Checker`): max order size, projected position
-   cap, 300 ms duplicate-order debounce, kill-switch lock.
-2. **Daily-loss kill-switch** (`risk.LossMonitor`): equity polled every
-   5 s against the first reading of the ET day; on breach → lock the
-   checker, cancel all, flatten every position using the
-   session-appropriate order form. Fires at most once per ET day;
-   `:unlock` re-enables manually.
-3. **Panic key (X)**: cancel all + flatten, bypassing the checker and
-   confirmation — the emergency exit must always work.
-4. **Idempotency**: every order carries a generated client order ID;
+   cap, 300 ms duplicate-order debounce, manual kill-switch
+   (`:lock [reason]` / `:unlock`). There is no automatic daily-loss
+   lock; operators engage the switch deliberately.
+2. **Panic key (X)**: cancel open orders for the *active* symbol +
+   flatten that symbol only, bypassing the checker and confirmation.
+   Other symbols' orders and positions are left alone (switch with
+   `:sym` and flatten/panic each). Status reports other symbols that
+   still have positions or resting orders. **Ctrl+X** / `:panic all`
+   is the account-wide emergency: CancelAll + flatten every cached
+   position.
+3. **Idempotency**: every order carries a generated client order ID;
    state reconciliation after reconnect prevents duplicates.
 
 ### 5. Bar aggregation with backfill
@@ -105,27 +105,31 @@ Live trades aggregate into all 8 timeframes simultaneously (fixed-cost
 per trade). On symbol switch and on every WS reconnect, history is
 backfilled from the REST bars endpoint (SIP feed includes
 extended-hours trades, so overnight bars exist; weekend/holiday gaps
-simply don't appear — collapsed chart). Sub-minute timeframes (1s/5s/15s)
-are backfilled by replaying recent trades from the REST trades endpoint
-through the aggregator (the bars endpoint doesn't serve sub-minute
-resolutions); the replay touches only the sub-minute series, never the
-1m+ bars or the live session VWAP. A reconnect triggers a backfill so
-sequence gaps are healed from REST rather than interpolated.
+simply don't appear — collapsed chart). The incomplete current bucket
+from REST is kept as the forming bar so live trades extend it — closing
+it into the ring would duplicate the minute and mis-state volume vs
+SIP/TradingView. Session VWAP seeds the forming bar's volume on Load so
+a mid-bar reconnect does not permanently under-count that minute. Sub-minute timeframes (1s/5s/15s) are backfilled by
+replaying recent trades from the REST trades endpoint through the
+aggregator (the bars endpoint doesn't serve sub-minute resolutions);
+the replay touches only the sub-minute series, never the 1m+ bars or
+the live session VWAP. A reconnect triggers a backfill so sequence gaps
+are healed from REST rather than interpolated.
 
 ### 6. Indicators
 
-SMA/EMA update per bar close per timeframe from ring-buffered values
-(O(1), no history scan). Session VWAP accumulates per trade and resets
-on session transitions; anchor is configurable — `session` (every
-transition, default) or `day` (only at the 20:00 ET overnight open).
-Forming-bar values use non-mutating `Peek` so the live edge renders
-without corrupting state.
+Two EMAs (fast/slow, configurable periods) update per bar close per
+timeframe from ring-buffered values (O(1), no history scan). Session
+VWAP accumulates per trade and resets on session transitions; anchor is
+configurable — `session` (every transition, default) or `day` (only at
+the 20:00 ET overnight open). Forming-bar values use non-mutating `Peek`
+so the live edge renders without corrupting state.
 
 ### 7. Rendering
 
 Candlesticks in braille (2×4 dots per cell → 2× horizontal, 4× vertical
 resolution): wick in the left dot-column, body across both; green/red
-per cell. SMA/EMA/VWAP as colored dot overlays drawn under candles.
+per cell. EMA/EMA2/VWAP as colored dot overlays drawn under candles.
 Volume pane with eighth-block characters. Session background shading
 per column (overnight = dark blue, pre/after = dark gray, toggleable
 via config/`:shading`). Price range auto-scales across bars + enabled
@@ -150,9 +154,10 @@ overlays with 2% padding.
 | `A` / `D` | Add to / reduce position (direction-aware from position sign) |
 | `F` | Flatten (session-appropriate form) |
 | `C` | Cancel all open orders |
-| `X` | Panic: cancel all + flatten (bypasses checks/confirmation) |
+| `X` | Panic: cancel active-symbol orders + flatten active symbol (bypasses checks/confirmation) |
+| `Ctrl+X` | Panic all: CancelAll + flatten every cached position |
 | `1`–`9` | Select size preset |
-| `:` | Command line: `buy 250 lmt 152.30`, `sell 100 mkt`, `sym NVDA`, `tf 5m`, `preset 2`, `flatten`, `cancel`, `unlock`, `confirm on|off`, `shading on|off`, `quit`, `help` |
+| `:` | Command line: `buy 250 lmt 152.30`, `sell 100 mkt`, `sym NVDA`, `tf 5m`, `preset 2`, `flatten`, `cancel`, `lock [reason]`, `unlock`, `panic` / `panic all`, `confirm on|off`, `shading on|off`, `quit`, `help` |
 | `Tab` | Cycle resolution (1m/5m/15m/1h/1d/1s/5s/15s) |
 | `Shift+Tab` | Cycle resolution backward |
 | `←` / `→` | Pan chart back into history / forward toward live |
@@ -165,9 +170,10 @@ overlays with 2% padding.
 settings including `api_key_id`/`api_secret_key`. Env vars
 (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`) override the file when set.
 Notables: `size_presets`, `limits.{max_order_qty,
-max_position_qty, daily_loss_limit, debounce_ms}`,
+max_position_qty, debounce_ms}`,
 `extended_hours.{slippage_bps, quote_stale_ms}`,
-`indicators.{sma_period, ema_period, vwap_anchor}`, `confirm_orders`,
+`indicators.{ema_period, ema2_period, vwap_anchor}` (`sma_period` is a
+deprecated alias for `ema2_period`), `confirm_orders`,
 `chart.session_shading`, `keys` overrides. `TRADE_KERNEL_LIVE=1` also
 forces live mode (still requires acknowledgement).
 
@@ -189,12 +195,12 @@ forces live mode (still requires acknowledgement).
 - `internal/bars`: canned tick sequences → OHLCV correctness, bar roll,
   late-trade correction, 20:00 daily anchor, backfill + live extension,
   snapshot limits.
-- `internal/indicators`: SMA/EMA/VWAP vs. reference math; `Peek` purity.
+- `internal/indicators`: EMA/VWAP vs. reference math; `Peek` purity.
 - `internal/execution`: order-builder matrix (regular market/limit/IOC,
   extended conversion price math both sides, stale-quote fallback,
   overnight eligibility accept/reject, closed rejection).
 - `internal/risk`: size caps, reduce-always-allowed, debounce window,
-  lock/unlock, loss-monitor trip + daily reset.
+  lock/unlock.
 - `internal/cmdline`: parser table tests incl. error forms.
 - `internal/ui`: hotkey→executor flows with a fake executor
   (buy/sell/add/reduce/flatten/panic), confirmation state machine,

@@ -1,6 +1,6 @@
 // Package bars aggregates a trade stream into OHLCV bars at multiple
-// resolutions, maintaining incremental SMA/EMA/session-VWAP alongside.
-// All state lives behind one mutex; buffers are preallocated rings.
+// resolutions, maintaining incremental dual-EMA and session-VWAP
+// alongside. All state lives behind one mutex; buffers are preallocated rings.
 package bars
 
 import (
@@ -66,6 +66,11 @@ type Bar struct {
 	Low    float64
 	Close  float64
 	Volume float64
+	// VWAP is the bar's own volume-weighted average price when known
+	// (e.g. from the REST bars endpoint "vw" field). Zero means unknown;
+	// session-VWAP reconstruction then falls back to typical price
+	// (H+L+C)/3.
+	VWAP float64
 }
 
 func newBar(start time.Time, price, vol float64) Bar {
@@ -87,7 +92,7 @@ func (b *Bar) add(price, vol float64) {
 // per-bar indicator values (NaN until ready).
 type ring struct {
 	bars        []Bar
-	sma, ema    []float64
+	ema, ema2   []float64
 	vwapAtClose []float64
 	start       int
 	count       int
@@ -96,27 +101,27 @@ type ring struct {
 func newRing(cap int) *ring {
 	return &ring{
 		bars:        make([]Bar, cap),
-		sma:         make([]float64, cap),
 		ema:         make([]float64, cap),
+		ema2:        make([]float64, cap),
 		vwapAtClose: make([]float64, cap),
 	}
 }
 
-func (r *ring) push(b Bar, smaV, emaV, vwapV float64) {
+func (r *ring) push(b Bar, emaV, ema2V, vwapV float64) {
 	if r.count < len(r.bars) {
 		i := (r.start + r.count) % len(r.bars)
-		r.set(i, b, smaV, emaV, vwapV)
+		r.set(i, b, emaV, ema2V, vwapV)
 		r.count++
 		return
 	}
-	r.set(r.start, b, smaV, emaV, vwapV)
+	r.set(r.start, b, emaV, ema2V, vwapV)
 	r.start = (r.start + 1) % len(r.bars)
 }
 
-func (r *ring) set(i int, b Bar, smaV, emaV, vwapV float64) {
+func (r *ring) set(i int, b Bar, emaV, ema2V, vwapV float64) {
 	r.bars[i] = b
-	r.sma[i] = smaV
 	r.ema[i] = emaV
+	r.ema2[i] = ema2V
 	r.vwapAtClose[i] = vwapV
 }
 
@@ -124,13 +129,24 @@ func (r *ring) at(i int) int { return (r.start + i) % len(r.bars) }
 
 func (r *ring) last() int { return r.at(r.count - 1) }
 
+// popLast removes and returns the newest closed bar. ok is false when empty.
+func (r *ring) popLast() (b Bar, ok bool) {
+	if r.count == 0 {
+		return Bar{}, false
+	}
+	i := r.last()
+	b = r.bars[i]
+	r.count--
+	return b, true
+}
+
 // series holds the ring plus forming-bar and indicator state for one TF.
 type series struct {
 	ring    *ring
 	forming Bar
 	open    bool // forming is valid
-	sma     *indicators.SMA
 	ema     *indicators.EMA
+	ema2    *indicators.EMA
 }
 
 // BarEvent is emitted when a bar closes.
@@ -145,8 +161,8 @@ const ringCap = 2048
 // The final element is the live forming bar with Peek'd indicators.
 type Snapshot struct {
 	Bars []Bar
-	SMA  []float64
-	EMA  []float64
+	EMA  []float64 // fast EMA (ema_period)
+	EMA2 []float64 // slow EMA (ema2_period)
 	VWAP []float64 // session VWAP value at each bar's close
 }
 
@@ -156,10 +172,11 @@ type Aggregator struct {
 	mu sync.Mutex
 
 	series [numTF]*series
-	smaN   int
 	emaN   int
+	ema2N  int
 
-	vwap indicators.VWAP // session-anchored, fed per trade
+	vwap       indicators.VWAP // session/day-anchored, fed per trade
+	vwapAnchor string          // "session" (default) or "day"
 
 	lastTradePrice float64
 	lastTradeAt    time.Time
@@ -169,17 +186,34 @@ type Aggregator struct {
 	events chan BarEvent
 }
 
-// NewAggregator creates an Aggregator with the given indicator periods.
-func NewAggregator(smaPeriod, emaPeriod int) *Aggregator {
-	a := &Aggregator{events: make(chan BarEvent, 64), smaN: smaPeriod, emaN: emaPeriod}
+// NewAggregator creates an Aggregator with two EMA periods (fast, slow).
+func NewAggregator(emaPeriod, ema2Period int) *Aggregator {
+	a := &Aggregator{
+		events:     make(chan BarEvent, 64),
+		emaN:       emaPeriod,
+		ema2N:      ema2Period,
+		vwapAnchor: "session",
+	}
 	for tf := TF(0); tf < numTF; tf++ {
 		a.series[tf] = &series{
 			ring: newRing(ringCap),
-			sma:  indicators.NewSMA(smaPeriod),
 			ema:  indicators.NewEMA(emaPeriod),
+			ema2: indicators.NewEMA(ema2Period),
 		}
 	}
 	return a
+}
+
+// SetVWAPAnchor sets reconstruction/live seeding mode: "session" (reset on
+// each session-instance change) or "day" (reset only at the 20:00 ET
+// trading-day boundary). Invalid values are ignored.
+func (a *Aggregator) SetVWAPAnchor(anchor string) {
+	if anchor != "session" && anchor != "day" {
+		return
+	}
+	a.mu.Lock()
+	a.vwapAnchor = anchor
+	a.mu.Unlock()
 }
 
 // Events returns the bar-close event channel (lossy if unconsumed).
@@ -247,6 +281,25 @@ func (a *Aggregator) aggregateInto(tf TF, price, size float64, ts time.Time) {
 	b := bucket(tf, ts)
 	switch {
 	case !s.open:
+		// If the newest closed bar is this same bucket (e.g. REST partial was
+		// closed into the ring), reopen it as forming so we never render two
+		// candles for one minute and so EMA/EMA2/VWAP stay Peek'd on the live
+		// close. Prefer Load leaving the current bucket as forming; this is a
+		// safety net for races / older loads.
+		if s.ring.count > 0 {
+			li := s.ring.last()
+			if s.ring.bars[li].Start.Equal(b) {
+				bb, _ := s.ring.popLast()
+				// Reverse the EMA updates applied at closeBar so the forming
+				// bar is not double-counted when it closes again.
+				s.ema.Undo(bb.Close)
+				s.ema2.Undo(bb.Close)
+				bb.add(price, size)
+				s.forming = bb
+				s.open = true
+				return
+			}
+		}
 		s.forming = newBar(b, price, size)
 		s.open = true
 	case b.Equal(s.forming.Start):
@@ -272,6 +325,9 @@ func (a *Aggregator) aggregateInto(tf TF, price, size float64, ts time.Time) {
 					r.bars[i].Low = price
 				}
 				r.bars[i].Volume += size
+				// Close is left alone for historical closed bars (tape repairs
+				// rarely rewrite official close). Current incomplete bucket is
+				// handled as forming or the !s.open same-bucket path above.
 				break
 			}
 		}
@@ -280,9 +336,9 @@ func (a *Aggregator) aggregateInto(tf TF, price, size float64, ts time.Time) {
 
 func (a *Aggregator) closeBar(tf TF, s *series) {
 	b := s.forming
-	smaV := s.sma.Update(b.Close)
 	emaV := s.ema.Update(b.Close)
-	s.ring.push(b, smaV, emaV, a.vwap.Value())
+	ema2V := s.ema2.Update(b.Close)
+	s.ring.push(b, emaV, ema2V, a.vwap.Value())
 	select {
 	case a.events <- BarEvent{TF: tf, Bar: b}:
 	default:
@@ -340,19 +396,130 @@ func (a *Aggregator) ResetMarket() {
 
 // Load replaces one timeframe's history with backfilled bars (e.g. from
 // the REST bars endpoint) and resets its indicator state accordingly.
+//
+// Session VWAP is reconstructed across hist so the chart overlay is a
+// continuous line. Per-bar contribution uses Bar.VWAP when set, otherwise
+// typical price (H+L+C)/3. Reset policy matches the configured anchor:
+//
+//   - "session": reset on every session-instance change (session enum or
+//     trading-day change), so multi-day RTH-only history restarts each day.
+//   - "day": reset only when the 20:00 ET trading day changes.
+//
+// The incomplete current bucket (when present as the last hist bar) is left
+// as the forming bar rather than a closed ring entry. Closing it would
+// duplicate the minute once live trades open a new forming bar for the same
+// start, which under/over-states volume vs REST/TradingView.
+//
+// For TF1m the live session VWAP is seeded from the reconstruction (including
+// the forming bar's contribution) so SessionVWAP is continuous after
+// reconnect. Live SIP prints that overlap the REST partial may briefly
+// double-count that minute; that overshoot is preferable to a permanent
+// under-count for the rest of the session.
 func (a *Aggregator) Load(tf TF, hist []Bar) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s := a.series[tf]
 	s.ring = newRing(ringCap)
-	s.sma = indicators.NewSMA(a.smaN)
 	s.ema = indicators.NewEMA(a.emaN)
+	s.ema2 = indicators.NewEMA(a.ema2N)
 	s.open = false
-	for _, b := range hist {
-		smaV := s.sma.Update(b.Close)
-		emaV := s.ema.Update(b.Close)
-		s.ring.push(b, smaV, emaV, math.NaN())
+	s.forming = Bar{}
+
+	// Incomplete current-bucket bar from REST must stay forming so live
+	// trades extend it instead of creating a second candle for the same start.
+	// Accept lastStart >= current bucket (clock skew / server slightly ahead)
+	// so Snapshot does not briefly show a "closed" live candle.
+	curBucket := bucket(tf, time.Now())
+	var forming *Bar
+	if n := len(hist); n > 0 && !hist[n-1].Start.Before(curBucket) {
+		b := hist[n-1]
+		forming = &b
+		hist = hist[:n-1]
 	}
+
+	var sessVWAP indicators.VWAP
+	var prevKey string
+	haveKey := false
+	for _, b := range hist {
+		cur := session.At(b.Start)
+		// Closed bars do not contribute to session VWAP (no session noise)
+		// and do not force a reset; carry the prior value forward.
+		if cur != session.Closed {
+			key := vwapInstanceKey(a.vwapAnchor, b.Start, cur)
+			if haveKey && key != prevKey {
+				sessVWAP.Reset()
+			}
+			prevKey = key
+			haveKey = true
+		}
+
+		emaV := s.ema.Update(b.Close)
+		ema2V := s.ema2.Update(b.Close)
+		var vwapV float64
+		if cur != session.Closed {
+			vwapV = sessVWAP.Update(barVWAPPrice(b), b.Volume)
+		} else {
+			vwapV = sessVWAP.Value()
+		}
+		s.ring.push(b, emaV, ema2V, vwapV)
+	}
+
+	if forming != nil {
+		// Leave the incomplete bar as forming for OHLCV continuity, and seed
+		// its volume into session VWAP so reconnect does not permanently
+		// under-count the partial minute for the rest of the session.
+		// Apply any session-key reset the forming bar would have triggered
+		// so the live accumulator does not span an anchor change.
+		cur := session.At(forming.Start)
+		if cur != session.Closed {
+			key := vwapInstanceKey(a.vwapAnchor, forming.Start, cur)
+			if haveKey && key != prevKey {
+				sessVWAP.Reset()
+			}
+			_ = sessVWAP.Update(barVWAPPrice(*forming), forming.Volume)
+		}
+		s.forming = *forming
+		s.open = true
+	}
+
+	// Seed the live trade VWAP from the finest REST-backed series so the
+	// right edge of the chart doesn't jump when live ticks start flowing.
+	// Coarser TFs load after 1m in backfill; only TF1m seeds to avoid the
+	// coarser reconstruction overwriting a better one.
+	if tf == TF1m {
+		a.vwap = sessVWAP
+	}
+}
+
+// vwapInstanceKey identifies a VWAP accumulation window for reconstruction.
+// Day mode keys only on the 20:00 ET trading day; session mode also includes
+// the session enum so overnight/pre/regular/AH each restart.
+func vwapInstanceKey(anchor string, t time.Time, sess session.Session) string {
+	day := tradingDayID(t)
+	if anchor == "day" {
+		return day
+	}
+	return day + "|" + sess.String()
+}
+
+// tradingDayID returns a stable id for the 20:00 ET–anchored trading day
+// that contains t (same boundary as daily bars).
+func tradingDayID(t time.Time) string {
+	return bucket(TF1d, t).Format(time.RFC3339)
+}
+
+// barVWAPPrice picks the best single price to contribute to session VWAP
+// reconstruction for one bar.
+func barVWAPPrice(b Bar) float64 {
+	if b.VWAP != 0 && !math.IsNaN(b.VWAP) {
+		return b.VWAP
+	}
+	// Typical price is the usual OHLC stand-in for bar-level VWAP.
+	tp := (b.High + b.Low + b.Close) / 3
+	if tp != 0 && !math.IsNaN(tp) {
+		return tp
+	}
+	return b.Close
 }
 
 // Snapshot returns up to n bars for rendering.
@@ -365,7 +532,7 @@ func (a *Aggregator) Load(tf TF, hist []Bar) {
 //	  the live edge the right edge of the view sits: offset=1 shows the
 //	  newest closed bar at the right edge, offset=2 the next one back, etc.
 //	  The forming bar is never included when panned back. Closed bars carry
-//	  their own frozen sma/ema/vwapAtClose captured at bar close, so panned
+//	  their own frozen ema/ema2/vwapAtClose captured at bar close, so panned
 //	  views are self-contained.
 //
 // offset is clamped to the available closed history; an offset past the
@@ -395,8 +562,8 @@ func (a *Aggregator) Snapshot(tf TF, n, offset int) Snapshot {
 		}
 		out := Snapshot{
 			Bars: make([]Bar, count),
-			SMA:  make([]float64, count),
 			EMA:  make([]float64, count),
+			EMA2: make([]float64, count),
 			VWAP: make([]float64, count),
 		}
 		closed := count - 1 // reserve last slot for the forming bar
@@ -410,15 +577,15 @@ func (a *Aggregator) Snapshot(tf TF, n, offset int) Snapshot {
 		for i := 0; i < closed; i++ {
 			j := r.at(startIdx + i)
 			out.Bars[i] = r.bars[j]
-			out.SMA[i] = r.sma[j]
 			out.EMA[i] = r.ema[j]
+			out.EMA2[i] = r.ema2[j]
 			out.VWAP[i] = r.vwapAtClose[j]
 		}
 		f := s.forming
 		i := count - 1
 		out.Bars[i] = f
-		out.SMA[i] = s.sma.Peek(f.Close)
 		out.EMA[i] = s.ema.Peek(f.Close)
+		out.EMA2[i] = s.ema2.Peek(f.Close)
 		out.VWAP[i] = a.vwap.Value()
 		return out
 	}
@@ -455,16 +622,16 @@ func (a *Aggregator) Snapshot(tf TF, n, offset int) Snapshot {
 	}
 	out := Snapshot{
 		Bars: make([]Bar, count),
-		SMA:  make([]float64, count),
 		EMA:  make([]float64, count),
+		EMA2: make([]float64, count),
 		VWAP: make([]float64, count),
 	}
 	startIdx := newest - count + 1
 	for i := 0; i < count; i++ {
 		j := r.at(startIdx + i)
 		out.Bars[i] = r.bars[j]
-		out.SMA[i] = r.sma[j]
 		out.EMA[i] = r.ema[j]
+		out.EMA2[i] = r.ema2[j]
 		out.VWAP[i] = r.vwapAtClose[j]
 	}
 	return out

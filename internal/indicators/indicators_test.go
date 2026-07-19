@@ -49,6 +49,50 @@ func TestEMA(t *testing.T) {
 	}
 }
 
+func TestEMAUndo(t *testing.T) {
+	e := NewEMA(3)
+	e.Update(1)
+	e.Update(2)
+	e.Update(3) // value 2.25
+	e.Undo(3)
+	if !almost(e.Value(), 1.5) {
+		t.Fatalf("after Undo(3) = %v, want 1.5", e.Value())
+	}
+	// Re-apply same sample.
+	if got := e.Update(3); !almost(got, 2.25) {
+		t.Fatalf("re-Update(3) = %v, want 2.25", got)
+	}
+	// Undo down to empty.
+	e.Undo(3)
+	e.Undo(2)
+	e.Undo(1)
+	if !math.IsNaN(e.Value()) {
+		t.Fatalf("fully undone EMA should be NaN, got %v", e.Value())
+	}
+	if got := e.Update(10); !almost(got, 10) {
+		t.Fatalf("seed after full undo = %v, want 10", got)
+	}
+}
+
+func TestEMAPeriod1Undo(t *testing.T) {
+	// Period 1 (k=1): EMA is always the last sample. Undo must restore the
+	// prior sample, not zero.
+	e := NewEMA(1)
+	e.Update(10)
+	e.Update(20)
+	if !almost(e.Value(), 20) {
+		t.Fatalf("period-1 after second Update = %v, want 20", e.Value())
+	}
+	e.Undo(20)
+	if !almost(e.Value(), 10) {
+		t.Fatalf("period-1 after Undo = %v, want 10", e.Value())
+	}
+	e.Undo(10)
+	if !math.IsNaN(e.Value()) {
+		t.Fatalf("period-1 fully undone should be NaN, got %v", e.Value())
+	}
+}
+
 func TestVWAP(t *testing.T) {
 	var v VWAP
 	if !math.IsNaN(v.Value()) {

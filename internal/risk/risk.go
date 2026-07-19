@@ -1,5 +1,5 @@
-// Package risk enforces pre-trade safety rails and the daily-loss
-// kill-switch.
+// Package risk enforces pre-trade safety rails (size caps, debounce,
+// manual kill-switch lock via Lock/Unlock — no automatic daily-loss trip).
 package risk
 
 import (
@@ -67,6 +67,11 @@ func (c *Checker) Locked() (bool, string) {
 }
 
 // Check validates an order intent. side is "buy" or "sell".
+//
+// Debounce is evaluated but not recorded here — call Record when the
+// order is committed to submission (start of the async submit path) so a
+// declined confirmation does not burn the debounce window, while
+// in-flight duplicates during broker RTT are still blocked.
 func (c *Checker) Check(symbol, side string, qty int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -90,66 +95,27 @@ func (c *Checker) Check(symbol, side string, qty int) error {
 			return fmt.Errorf("projected position %.0f exceeds max position size %d", proj, c.limits.MaxPositionQty)
 		}
 	}
-	key := fmt.Sprintf("%s|%s|%d", symbol, side, qty)
+	key := debounceKey(symbol, side, qty)
 	if c.limits.Debounce > 0 && key == c.lastKey && c.now().Sub(c.lastAt) < c.limits.Debounce {
 		return fmt.Errorf("duplicate order debounced (same order within %s)", c.limits.Debounce)
 	}
-	c.lastKey = key
-	c.lastAt = c.now()
 	return nil
 }
 
-// LossMonitor tracks account equity against a daily-loss limit. The
-// reference equity is the first reading of each ET calendar day.
-type LossMonitor struct {
-	limit float64
-
-	mu       sync.Mutex
-	day      string // ET date "2006-01-02"
-	startEq  float64
-	tripped  bool
-	onBreach func(loss float64)
-	now      func() time.Time
-}
-
-// NewLossMonitor creates a monitor; limit<=0 disables it. onBreach is
-// called (synchronously, once per trip) when the limit is breached.
-func NewLossMonitor(limit float64, onBreach func(loss float64), now func() time.Time) *LossMonitor {
-	if now == nil {
-		now = time.Now
-	}
-	return &LossMonitor{limit: limit, onBreach: onBreach, now: now}
-}
-
-// Update feeds the latest equity reading. dayLoc must be
-// America/New_York so "daily" means the trading day in ET.
-func (m *LossMonitor) Update(equity float64, dayLoc *time.Location) {
-	if m.limit <= 0 {
+// Record marks an order intent as committed for debounce purposes. Call
+// when submission starts (not only after broker ACK) so a second identical
+// hotkey during network RTT is blocked. Do not call on a declined
+// confirmation. Broker rejects still burn the short debounce window.
+func (c *Checker) Record(symbol, side string, qty int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.limits.Debounce <= 0 {
 		return
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	day := m.now().In(dayLoc).Format("2006-01-02")
-	if day != m.day {
-		m.day = day
-		m.startEq = equity
-		m.tripped = false
-		return
-	}
-	if m.tripped {
-		return
-	}
-	if loss := m.startEq - equity; loss >= m.limit {
-		m.tripped = true
-		if m.onBreach != nil {
-			m.onBreach(loss)
-		}
-	}
+	c.lastKey = debounceKey(symbol, side, qty)
+	c.lastAt = c.now()
 }
 
-// Tripped reports whether the monitor has fired today.
-func (m *LossMonitor) Tripped() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.tripped
+func debounceKey(symbol, side string, qty int) string {
+	return fmt.Sprintf("%s|%s|%d", symbol, side, qty)
 }

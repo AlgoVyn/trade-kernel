@@ -59,9 +59,10 @@ func (s *SMA) Ready() bool { return s.count >= s.n }
 
 // EMA is an exponential moving average.
 type EMA struct {
-	k       float64
-	value   float64
-	started bool
+	k     float64
+	value float64
+	prev  float64 // value before the last Update (period-1 Undo stack of 1)
+	n     int     // number of samples fed via Update
 }
 
 // NewEMA creates an EMA with the given period (k = 2/(n+1)).
@@ -74,18 +75,54 @@ func NewEMA(n int) *EMA {
 
 // Update feeds v and returns the current EMA value.
 func (e *EMA) Update(v float64) float64 {
-	if !e.started {
+	if e.n == 0 {
 		e.value = v
-		e.started = true
+		e.n = 1
+		return e.value
+	}
+	if e.k >= 1 {
+		// Period 1: EMA is always the last sample.
+		e.prev = e.value
+		e.value = v
+		e.n++
 		return e.value
 	}
 	e.value = v*e.k + e.value*(1-e.k)
+	e.n++
 	return e.value
+}
+
+// Undo reverses the most recent Update(v). v must be the value last
+// passed to Update. Used when reopening a bar that was closed into the
+// ring so the forming bar is not double-counted into the EMA.
+//
+// Period-1 Undo restores only one prior sample (prev). Deeper multi-Undo
+// stacks are not supported for k>=1; the forming-bar reopen path undoes
+// once.
+func (e *EMA) Undo(v float64) {
+	if e.n == 0 {
+		return
+	}
+	if e.n == 1 {
+		e.n = 0
+		e.value = 0
+		e.prev = 0
+		return
+	}
+	// value = v*k + prev*(1-k)  ⇒  prev = (value - v*k) / (1-k)
+	if e.k >= 1 {
+		e.n--
+		e.value = e.prev
+		e.prev = 0
+		return
+	}
+	e.value = (e.value - e.k*v) / (1 - e.k)
+	e.n--
 }
 
 // Value returns the current EMA value, or NaN before the first update.
 func (e *EMA) Value() float64 {
-	if !e.started {
+	if e.n == 0 {
 		return math.NaN()
 	}
 	return e.value
@@ -93,7 +130,7 @@ func (e *EMA) Value() float64 {
 
 // Peek returns what Value would be after Update(v), without mutating.
 func (e *EMA) Peek(v float64) float64 {
-	if !e.started {
+	if e.n == 0 {
 		return v
 	}
 	return v*e.k + e.value*(1-e.k)

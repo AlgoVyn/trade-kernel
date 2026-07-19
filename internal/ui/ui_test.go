@@ -45,6 +45,10 @@ func (f *fakeExec) CancelAll(_ context.Context) error {
 	f.calls = append(f.calls, "cancelall")
 	return nil
 }
+func (f *fakeExec) CancelSymbol(_ context.Context, sym string) error {
+	f.calls = append(f.calls, "cancelsym "+sym)
+	return nil
+}
 
 func testDeps(t *testing.T) (Deps, *fakeExec, *state.Store, *bars.Aggregator) {
 	t.Helper()
@@ -158,17 +162,15 @@ func TestPanicFlow(t *testing.T) {
 	m := NewModel(d)
 	_, cmd := m.handleKey(key('X'))
 	drain(m, cmd)
-	if len(fx.calls) != 2 || fx.calls[0] != "cancelall" || fx.calls[1] != "flatten AAPL" {
+	if len(fx.calls) != 2 || fx.calls[0] != "cancelsym AAPL" || fx.calls[1] != "flatten AAPL" {
 		t.Fatalf("panic: calls = %v", fx.calls)
 	}
 }
 
-// TestPanicFlattensAllPositions verifies that X flattens every position
-// in the account, not just the active symbol (the emergency exit must
-// flatten the whole account).
-func TestPanicFlattensAllPositions(t *testing.T) {
+// TestPanicFlattensActiveSymbolOnly verifies that X cancels and flattens
+// only the currently selected symbol — other positions/orders remain.
+func TestPanicFlattensActiveSymbolOnly(t *testing.T) {
 	d, fx, st, _ := testDeps(t)
-	// Add a second position in a non-active symbol.
 	st.Reconcile(
 		alpaca.Account{Equity: 100000, Cash: 50000, BuyingPower: 200000},
 		[]alpaca.Position{
@@ -181,19 +183,66 @@ func TestPanicFlattensAllPositions(t *testing.T) {
 	_, cmd := m.handleKey(key('X'))
 	drain(m, cmd)
 
-	if len(fx.calls) != 3 {
-		t.Fatalf("want cancelall + 2 flattens, got %v", fx.calls)
+	if len(fx.calls) != 2 {
+		t.Fatalf("want cancelsym AAPL + flatten AAPL, got %v", fx.calls)
+	}
+	if fx.calls[0] != "cancelsym AAPL" {
+		t.Fatalf("first call = %q, want cancelsym AAPL", fx.calls[0])
+	}
+	if fx.calls[1] != "flatten AAPL" {
+		t.Fatalf("second call = %q, want flatten AAPL (not other symbols)", fx.calls[1])
+	}
+	if !strings.Contains(m.status, "+1 other symbols still open") {
+		t.Fatalf("panic status should warn about other open symbols, got %q", m.status)
+	}
+}
+
+// TestPanicAllCancelsAndFlattensEverySymbol covers Ctrl+X / :panic all.
+func TestPanicAllCancelsAndFlattensEverySymbol(t *testing.T) {
+	d, fx, st, _ := testDeps(t)
+	st.Reconcile(
+		alpaca.Account{Equity: 100000, Cash: 50000, BuyingPower: 200000},
+		[]alpaca.Position{
+			{Symbol: "AAPL", Qty: 300, Side: "long", AvgEntryPrice: 150},
+			{Symbol: "NVDA", Qty: 100, Side: "long", AvgEntryPrice: 900},
+		},
+		nil,
+	)
+	m := NewModel(d)
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlX})
+	drain(m, cmd)
+
+	if len(fx.calls) < 3 {
+		t.Fatalf("want cancelall + flatten AAPL + flatten NVDA, got %v", fx.calls)
 	}
 	if fx.calls[0] != "cancelall" {
 		t.Fatalf("first call = %q, want cancelall", fx.calls[0])
 	}
-	// Both symbols must be flattened (order is map-iteration dependent).
-	got := map[string]bool{}
+	seen := map[string]bool{}
 	for _, c := range fx.calls[1:] {
-		got[c] = true
+		seen[c] = true
 	}
-	if !got["flatten AAPL"] || !got["flatten NVDA"] {
-		t.Fatalf("missing flatten: %v", fx.calls)
+	if !seen["flatten AAPL"] || !seen["flatten NVDA"] {
+		t.Fatalf("flatten calls incomplete: %v", fx.calls)
+	}
+}
+
+func TestLockAndUnlockCommands(t *testing.T) {
+	d, _, _, _ := testDeps(t)
+	m := NewModel(d)
+	m.cmdActive = true
+	m.cmdBuf = "lock too hot"
+	_, c := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	drain(m, c)
+	if locked, reason := m.d.Risk.Locked(); !locked || reason != "too hot" {
+		t.Fatalf("Locked() = %v %q, want locked too hot", locked, reason)
+	}
+	m.cmdActive = true
+	m.cmdBuf = "unlock"
+	_, c = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	drain(m, c)
+	if locked, _ := m.d.Risk.Locked(); locked {
+		t.Fatal("still locked after :unlock")
 	}
 }
 
@@ -431,12 +480,18 @@ func TestViewRenders(t *testing.T) {
 	if out == "" {
 		t.Fatal("empty view")
 	}
-	for _, want := range []string{"AAPL", "PAPER", "POSITION", "equity", "150"} {
+	// Info strip is above the chart (POS / eq / price present).
+	for _, want := range []string{"AAPL", "PAPER", "POS", "eq", "150"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("view missing %q", want)
 		}
 	}
-	// Narrow terminal hides the side panel without panicking.
+	// Richer POS should surface uPL% when positioned.
+	if !strings.Contains(out, "%") && !strings.Contains(out, "flat") {
+		// With a long position and avg entry, expect a percent token.
+		t.Fatalf("view missing uPL%% for open position:\n%s", out)
+	}
+	// Narrow terminal still renders without panicking.
 	m.Update(tea.WindowSizeMsg{Width: 60, Height: 20})
 	if m.View() == "" {
 		t.Fatal("empty narrow view")
@@ -450,7 +505,7 @@ func TestRenderCandlesShape(t *testing.T) {
 		agg.OnTrade("AAPL", 100+float64(i%5), 5, base.Add(time.Duration(i)*time.Minute))
 	}
 	snap := agg.Snapshot(bars.TF1m, 40, 0)
-	lines := renderCandles(snap, 40, 12, ChartOpts{ShowSMA: true, ShowEMA: true, ShowVWAP: true})
+	lines := renderCandles(snap, 40, 12, ChartOpts{ShowEMA: true, ShowEMA2: true, ShowVWAP: true})
 	if len(lines) != 12 {
 		t.Fatalf("want 12 lines, got %d", len(lines))
 	}

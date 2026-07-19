@@ -37,35 +37,40 @@ func NewTradingWS(keyID, secretKey string, paper bool) *TradingWS {
 }
 
 // Run connects and maintains the connection until ctx is cancelled.
+// Backoff resets after any session that successfully authorized.
 func (t *TradingWS) Run(ctx context.Context) {
 	backoff := 250 * time.Millisecond
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		err := t.runOnce(ctx)
+		authed, err := t.runOnce(ctx)
 		if err != nil && t.OnError != nil && ctx.Err() == nil {
 			t.OnError(err)
+		}
+		if authed {
+			backoff = 250 * time.Millisecond
+		} else {
+			backoff *= 2
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
 		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
 		}
-		backoff *= 2
-		if backoff > 10*time.Second {
-			backoff = 10 * time.Second
-		}
 	}
 }
 
-func (t *TradingWS) runOnce(ctx context.Context) error {
+func (t *TradingWS) runOnce(ctx context.Context) (authed bool, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	conn, _, err := websocket.Dial(ctx, t.url, nil)
 	if err != nil {
-		return fmt.Errorf("dial trading ws: %w", err)
+		return false, fmt.Errorf("dial trading ws: %w", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "bye")
 	conn.SetReadLimit(1 << 20)
@@ -82,19 +87,19 @@ func (t *TradingWS) runOnce(ctx context.Context) error {
 		"action": "authenticate",
 		"data":   map[string]string{"key_id": t.keyID, "secret_key": t.secretKey},
 	}); err != nil {
-		return fmt.Errorf("auth write: %w", err)
+		return false, fmt.Errorf("auth write: %w", err)
 	}
 	if err := write(map[string]any{
 		"action": "listen",
 		"data":   map[string]any{"streams": []string{"trade_updates"}},
 	}); err != nil {
-		return fmt.Errorf("listen write: %w", err)
+		return false, fmt.Errorf("listen write: %w", err)
 	}
 
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
-			return fmt.Errorf("trading ws read: %w", err)
+			return authed, fmt.Errorf("trading ws read: %w", err)
 		}
 		var env struct {
 			Stream string          `json:"stream"`
@@ -109,6 +114,7 @@ func (t *TradingWS) runOnce(ctx context.Context) error {
 				Status string `json:"status"`
 			}
 			if json.Unmarshal(env.Data, &st) == nil && st.Status == "authorized" {
+				authed = true
 				// First auth → OnInitial; every later auth → OnReconnect.
 				if !t.firstAuth {
 					t.firstAuth = true

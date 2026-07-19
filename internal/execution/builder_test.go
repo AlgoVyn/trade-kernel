@@ -2,7 +2,7 @@ package execution
 
 import (
 	"context"
-	"strings"
+	"errors"
 	"testing"
 	"time"
 
@@ -127,7 +127,7 @@ func TestBuildOvernightEligibility(t *testing.T) {
 	_, _, err := b.Build(context.Background(), BuildInput{
 		Symbol: "XYZ", Side: "buy", Qty: 10, Session: session.Overnight,
 	})
-	if err == nil || !strings.Contains(err.Error(), "not overnight-tradable") {
+	if err == nil || !errors.Is(err, ErrNotOvernightTradable) {
 		t.Fatalf("ineligible symbol: err = %v", err)
 	}
 }

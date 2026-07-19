@@ -5,6 +5,7 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -12,6 +13,21 @@ import (
 
 	"trade-kernel/internal/alpaca"
 	"trade-kernel/internal/session"
+)
+
+// Sentinel errors from Build. Flatten matches these with errors.Is rather
+// than substring matching so reworded messages still fall back safely.
+var (
+	// ErrMarketClosed is returned when the session is Closed.
+	ErrMarketClosed = errors.New("market is closed")
+	// ErrNoExtendedPrice is returned when extended-hours pricing has no
+	// usable NBBO or last trade.
+	ErrNoExtendedPrice = errors.New("no quote or last trade available to price extended-hours order")
+	// ErrNotOvernightTradable is returned when the symbol fails the
+	// overnight-tradability check (wrapped with the symbol name).
+	ErrNotOvernightTradable = errors.New("not overnight-tradable on Alpaca")
+	// ErrOvernightEligibility is returned when the eligibility lookup itself fails.
+	ErrOvernightEligibility = errors.New("overnight eligibility check failed")
 )
 
 // QuoteSource provides the latest NBBO and last trade for the active
@@ -100,10 +116,10 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (alpaca.OrderRequest
 		if in.Session == session.Overnight && b.elig != nil {
 			ok, err := b.elig.OvernightTradable(ctx, in.Symbol)
 			if err != nil {
-				return alpaca.OrderRequest{}, "", fmt.Errorf("overnight eligibility check: %w", err)
+				return alpaca.OrderRequest{}, "", fmt.Errorf("%w: %v", ErrOvernightEligibility, err)
 			}
 			if !ok {
-				return alpaca.OrderRequest{}, "", fmt.Errorf("%s is not overnight-tradable on Alpaca", in.Symbol)
+				return alpaca.OrderRequest{}, "", fmt.Errorf("%s is %w", in.Symbol, ErrNotOvernightTradable)
 			}
 		}
 		req.Type = "limit"
@@ -115,13 +131,13 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (alpaca.OrderRequest
 		}
 		price, warn := b.aggressivePrice(in.Side)
 		if price <= 0 {
-			return alpaca.OrderRequest{}, "", fmt.Errorf("no quote or last trade available to price extended-hours order")
+			return alpaca.OrderRequest{}, "", ErrNoExtendedPrice
 		}
 		req.LimitPrice = fmt.Sprintf("%.2f", price)
 		return req, warn, nil
 
 	default:
-		return alpaca.OrderRequest{}, "", fmt.Errorf("market is closed")
+		return alpaca.OrderRequest{}, "", ErrMarketClosed
 	}
 }
 

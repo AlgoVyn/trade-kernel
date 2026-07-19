@@ -151,10 +151,21 @@ func (e *Engine) classify(t time.Time) Session {
 func (e *Engine) Events() <-chan Event { return e.ch }
 
 // SyncClock applies an Alpaca /v2/clock reading. When Alpaca reports the
-// market closed during a window we'd classify as Regular (holiday or
-// early close), the engine forces Closed until nextOpen. Sync is advisory
-// only; it never overrides a locally-derived Closed into a trading
-// session.
+// market closed during a window we'd classify as tradable, the engine may
+// force Closed until nextOpen. Alpaca's is_open is the *regular* session
+// flag — false every pre-market, after-hours, and overnight on a normal day —
+// so it must not force Closed for PreMarket/AfterHours/Overnight unless
+// nextOpen skips past the next expected RTH open (multi-day gap ⇒ holiday).
+// During local Regular, is_open=false means a holiday or early close, so we
+// force Closed until nextOpen (covers process start mid-afternoon on an
+// early-close day while wall clock is still in the 09:30–16:00 window).
+//
+// Gap: if the process starts only after local Regular has ended (AH/overnight)
+// on an early-close day, next_open looks like a normal next-session open and
+// we intentionally stay in AfterHours/Overnight — extended-hours books are
+// often still open after an early RTH close; the broker rejects if not.
+// Sync is advisory only; it never overrides a locally-derived Closed into a
+// trading session.
 func (e *Engine) SyncClock(isOpen bool, nextOpen time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -164,11 +175,40 @@ func (e *Engine) SyncClock(isOpen bool, nextOpen time.Time) {
 	}
 	now := e.now()
 	local := At(now)
-	if local == Regular || local == PreMarket || local == AfterHours {
-		if nextOpen.After(now) {
+	if !Tradable(local) || !nextOpen.After(now) {
+		return
+	}
+	switch local {
+	case Regular:
+		// RTH window but Alpaca says closed → holiday / early close.
+		// Sticky until nextOpen so a later tick still after early close
+		// but still in the local Regular wall-clock window stays Closed.
+		e.forcedClosedUntil = nextOpen
+	default:
+		// PreMarket / AfterHours / Overnight: is_open is false every normal
+		// day. Only force when next_open skips the next expected RTH open
+		// (full-session holiday gap).
+		expected := nextExpectedRTHOpen(now)
+		const slack = 2 * time.Hour
+		if nextOpen.After(expected.Add(slack)) {
 			e.forcedClosedUntil = nextOpen
 		}
 	}
+}
+
+// nextExpectedRTHOpen returns the next 09:30 ET Monday–Friday open strictly
+// after t (or at t if t is exactly 09:30 on a weekday — callers use After).
+// Weekend candidates roll forward to Monday.
+func nextExpectedRTHOpen(t time.Time) time.Time {
+	t = t.In(et)
+	candidate := time.Date(t.Year(), t.Month(), t.Day(), 9, 30, 0, 0, et)
+	if !t.Before(candidate) {
+		candidate = candidate.AddDate(0, 0, 1)
+	}
+	for candidate.Weekday() == time.Saturday || candidate.Weekday() == time.Sunday {
+		candidate = candidate.AddDate(0, 0, 1)
+	}
+	return candidate
 }
 
 // Run polls once per second and emits an Event whenever the session

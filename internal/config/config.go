@@ -39,10 +39,9 @@ type Config struct {
 
 // Limits are the pre-trade safety rails.
 type Limits struct {
-	MaxOrderQty    int     `yaml:"max_order_qty"`
-	MaxPositionQty int     `yaml:"max_position_qty"`
-	DailyLossLimit float64 `yaml:"daily_loss_limit"` // account currency; 0 disables
-	DebounceMS     int     `yaml:"debounce_ms"`      // duplicate-order debounce window
+	MaxOrderQty    int `yaml:"max_order_qty"`
+	MaxPositionQty int `yaml:"max_position_qty"`
+	DebounceMS     int `yaml:"debounce_ms"` // duplicate-order debounce window
 }
 
 // ExtendedHours configures order conversion outside regular hours.
@@ -56,9 +55,13 @@ type ExtendedHours struct {
 }
 
 // Indicators configures overlay periods and VWAP anchoring.
+// Two independent EMAs are drawn (e.g. fast 9 + slow 20).
 type Indicators struct {
+	EMAPeriod  int `yaml:"ema_period"`  // fast EMA (default 9)
+	EMA2Period int `yaml:"ema2_period"` // slow EMA (default 20)
+	// SMAPeriod is a deprecated alias for ema2_period (accepted when
+	// ema2_period is unset so older YAML keeps controlling the slow MA).
 	SMAPeriod int `yaml:"sma_period"`
-	EMAPeriod int `yaml:"ema_period"`
 	// VWAPAnchor: "session" (default) or "day".
 	VWAPAnchor string `yaml:"vwap_anchor"`
 }
@@ -112,11 +115,16 @@ func (c *Config) Validate() error {
 	if c.DefaultSymbol == "" {
 		c.DefaultSymbol = "AAPL"
 	}
-	if c.Indicators.SMAPeriod <= 0 {
-		c.Indicators.SMAPeriod = 20
-	}
 	if c.Indicators.EMAPeriod <= 0 {
 		c.Indicators.EMAPeriod = 9
+	}
+	if c.Indicators.EMA2Period <= 0 {
+		// Deprecated sma_period alias → slow EMA when ema2_period omitted.
+		if c.Indicators.SMAPeriod > 0 {
+			c.Indicators.EMA2Period = c.Indicators.SMAPeriod
+		} else {
+			c.Indicators.EMA2Period = 20
+		}
 	}
 	if c.Indicators.VWAPAnchor == "" {
 		c.Indicators.VWAPAnchor = "session"
@@ -138,9 +146,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Limits.MaxPositionQty < 0 {
 		return fmt.Errorf("limits.max_position_qty must be >= 0 (0 disables)")
-	}
-	if c.Limits.DailyLossLimit < 0 {
-		return fmt.Errorf("limits.daily_loss_limit must be >= 0 (0 disables)")
 	}
 	return nil
 }

@@ -74,3 +74,31 @@ func TestAccountDecodes(t *testing.T) {
 		t.Fatalf("Cash = %v", a.Cash)
 	}
 }
+
+func TestTradeUpdateOptionalPositionQty(t *testing.T) {
+	var tu TradeUpdate
+	if err := json.Unmarshal([]byte(`{"event":"fill","order":{"id":"1"}}`), &tu); err != nil {
+		t.Fatal(err)
+	}
+	if tu.PositionQty.Valid {
+		t.Fatal("omitted position_qty should be invalid")
+	}
+	if err := json.Unmarshal([]byte(`{"event":"fill","order":{"id":"1"},"position_qty":"100.5"}`), &tu); err != nil {
+		t.Fatal(err)
+	}
+	if !tu.PositionQty.Valid || tu.PositionQty.V != 100.5 {
+		t.Fatalf("got %+v", tu.PositionQty)
+	}
+	if err := json.Unmarshal([]byte(`{"event":"fill","order":{"id":"1"},"position_qty":null}`), &tu); err != nil {
+		t.Fatal(err)
+	}
+	if tu.PositionQty.Valid {
+		t.Fatal("null position_qty should be invalid")
+	}
+	if err := json.Unmarshal([]byte(`{"event":"fill","order":{"id":"1"},"position_qty":""}`), &tu); err != nil {
+		t.Fatal(err)
+	}
+	if tu.PositionQty.Valid {
+		t.Fatal("empty-string position_qty should be invalid")
+	}
+}
