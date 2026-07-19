@@ -24,6 +24,7 @@ const (
 	KindPanic // panic (active symbol)
 	KindQuit
 	KindHelp
+	KindFocus // focus N|off — crop chart to the last N bars
 )
 
 // Command is a parsed ':' command.
@@ -37,6 +38,7 @@ type Command struct {
 	Preset int     // KindPreset: 1-based
 	On     bool    // KindConfirm / KindShading
 	Reason string  // KindLock
+	Focus  int     // KindFocus: bars to crop from the left (0 = off)
 }
 
 var verbs = map[string]Kind{
@@ -78,6 +80,18 @@ func Parse(input string) (Command, error) {
 			return Command{}, fmt.Errorf("preset must be a positive number")
 		}
 		return Command{Kind: KindPreset, Preset: n}, nil
+	case "focus":
+		if len(args) != 1 {
+			return Command{}, fmt.Errorf("usage: focus N|off")
+		}
+		if strings.EqualFold(args[0], "off") {
+			return Command{Kind: KindFocus, Focus: 0}, nil
+		}
+		n, err := strconv.Atoi(args[0])
+		if err != nil || n < 1 {
+			return Command{}, fmt.Errorf("focus must be a positive number or off")
+		}
+		return Command{Kind: KindFocus, Focus: n}, nil
 	case "confirm", "shading":
 		if len(args) != 1 || (args[0] != "on" && args[0] != "off") {
 			return Command{}, fmt.Errorf("usage: %s on|off", head)

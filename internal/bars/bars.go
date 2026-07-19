@@ -258,12 +258,6 @@ type series struct {
 	ema2    *indicators.EMA
 }
 
-// BarEvent is emitted when a bar closes.
-type BarEvent struct {
-	TF  TF
-	Bar Bar
-}
-
 const ringCap = 2048
 
 // Snapshot is a render-ready copy of recent bars and indicator overlays.
@@ -297,14 +291,11 @@ type Aggregator struct {
 	lastTradeAt    time.Time
 	bid, ask       float64
 	quoteAt        time.Time
-
-	events chan BarEvent
 }
 
 // NewAggregator creates an Aggregator with two EMA periods (fast, slow).
 func NewAggregator(emaPeriod, ema2Period int) *Aggregator {
 	a := &Aggregator{
-		events:     make(chan BarEvent, 64),
 		emaN:       emaPeriod,
 		ema2N:      ema2Period,
 		vwapAnchor: "session",
@@ -330,9 +321,6 @@ func (a *Aggregator) SetVWAPAnchor(anchor string) {
 	a.vwapAnchor = anchor
 	a.mu.Unlock()
 }
-
-// Events returns the bar-close event channel (lossy if unconsumed).
-func (a *Aggregator) Events() <-chan BarEvent { return a.events }
 
 // bucket returns the bar start time for ts at tf. Intraday buckets align
 // on UTC boundaries, which coincide with ET boundaries (whole-hour
@@ -413,21 +401,17 @@ type TradeReplay struct {
 // aggregateInto folds one trade into a single timeframe. Caller holds the
 // mutex. Handles bucket rollover and late/out-of-order trades.
 func (a *Aggregator) aggregateInto(tf TF, price, size float64, ts time.Time) {
-	a.foldTrade(a.series[tf], bucket(tf, ts), price, size, func(s *series) {
-		a.closeBar(tf, s)
-	})
+	a.foldTrade(a.series[tf], bucket(tf, ts), price, size, a.closeFormingBar)
 }
 
 // aggregateIntoCustom folds one trade into the active custom series.
 // Caller holds the mutex; a.custom must be non-nil.
 func (a *Aggregator) aggregateIntoCustom(price, size float64, ts time.Time) {
-	a.foldTrade(a.custom, bucketDur(a.customDur, ts), price, size, func(s *series) {
-		a.closeCustomBar(s)
-	})
+	a.foldTrade(a.custom, bucketDur(a.customDur, ts), price, size, a.closeFormingBar)
 }
 
 // foldTrade is the shared bucket-rollover logic for built-in and custom series.
-// closeFn closes the current forming bar (built-in emits BarEvent; custom does not).
+// closeFn closes the current forming bar (EMA/EMA2 update + ring push).
 func (a *Aggregator) foldTrade(s *series, b time.Time, price, size float64, closeFn func(*series)) {
 	switch {
 	case !s.open:
@@ -484,19 +468,7 @@ func (a *Aggregator) foldTrade(s *series, b time.Time, price, size float64, clos
 	}
 }
 
-func (a *Aggregator) closeBar(tf TF, s *series) {
-	b := s.forming
-	emaV := s.ema.Update(b.Close)
-	ema2V := s.ema2.Update(b.Close)
-	s.ring.push(b, emaV, ema2V, a.vwap.Value())
-	select {
-	case a.events <- BarEvent{TF: tf, Bar: b}:
-	default:
-	}
-	s.open = false
-}
-
-func (a *Aggregator) closeCustomBar(s *series) {
+func (a *Aggregator) closeFormingBar(s *series) {
 	b := s.forming
 	emaV := s.ema.Update(b.Close)
 	ema2V := s.ema2.Update(b.Close)
@@ -531,6 +503,33 @@ func (a *Aggregator) LatestTrade() (price float64, at time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.lastTradePrice, a.lastTradeAt
+}
+
+// MarketSnapshot bundles the live market cache the UI reads each frame so the
+// render loop takes the aggregator mutex once instead of four times
+// (LatestTrade / LatestQuote / SessionVWAP). Returned values are copies.
+type MarketSnapshot struct {
+	LastPrice float64
+	LastAt    time.Time
+	Bid       float64
+	Ask       float64
+	QuoteAt   time.Time
+	VWAP      float64
+}
+
+// MarketSnapshot returns the cached last trade, NBBO, and session VWAP in a
+// single locked read.
+func (a *Aggregator) MarketSnapshot() MarketSnapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return MarketSnapshot{
+		LastPrice: a.lastTradePrice,
+		LastAt:    a.lastTradeAt,
+		Bid:       a.bid,
+		Ask:       a.ask,
+		QuoteAt:   a.quoteAt,
+		VWAP:      a.vwap.Value(),
+	}
 }
 
 // SessionVWAP returns the live session-anchored VWAP.

@@ -75,7 +75,24 @@ func Location() *time.Location { return et }
 
 // At classifies t into a session using wall-clock time in ET.
 func At(t time.Time) Session {
+	// Fast path: session boundaries align on whole minutes in ET, so every
+	// timestamp within the same (ET weekday, minute) shares a result. Memoize
+	// per-minute to avoid re-running weekday arithmetic for each visible bar
+	// on every render frame (the chart renderer calls At once per bar).
 	t = t.In(et)
+	key := uint64(t.Unix())/60 + uint64(t.Weekday())*1e6
+	if v, ok := atCache.Load(key); ok {
+		return v.(Session)
+	}
+	s := classifyAt(t)
+	atCache.Store(key, s)
+	return s
+}
+
+var atCache sync.Map
+
+// classifyAt is the pure wall-clock classification (no cache).
+func classifyAt(t time.Time) Session {
 	wd := t.Weekday()
 	mins := t.Hour()*60 + t.Minute()
 

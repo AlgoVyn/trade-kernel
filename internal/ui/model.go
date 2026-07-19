@@ -85,6 +85,14 @@ type Model struct {
 	// history. Reset to 0 on symbol/resolution switch.
 	panOffset int
 
+	// leftCrop trims bars from the left edge of the chart window while
+	// keeping the right edge at live (or at panOffset). It rebases the
+	// volume/price scale onto the recent window — useful when a new
+	// low-volume session starts and the prior session's peaks would
+	// otherwise squash it flat. 0 = no crop (full width). Reset to 0
+	// wherever panOffset is reset (symbol/resolution switch).
+	leftCrop int
+
 	cmdActive bool
 	cmdBuf    string
 
@@ -163,6 +171,8 @@ func defaultKeys() map[string]string {
 		"shift+tab": "cycle_tf_back",
 		"left":      "pan_left",
 		"right":     "pan_right",
+		"[":         "crop_in",
+		"]":         "crop_out",
 		"i":         "cycle_indicators",
 		"q":         "quit",
 		"ctrl+c":    "quit_force",
@@ -319,6 +329,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.symbol = msg.symbol
 			m.panOffset = 0
+			m.leftCrop = 0
 			m.setStatus("symbol → "+msg.symbol, false)
 		}
 		return m, nil
@@ -425,25 +436,35 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.usingCustomTF() {
 			m.clearCustomTF()
 			m.panOffset = 0
+			m.leftCrop = 0
 			return m, nil
 		}
 		m.tfIdx = (m.tfIdx + 1) % len(m.tfs)
 		m.panOffset = 0
+		m.leftCrop = 0
 		return m, nil
 	case "cycle_tf_back":
 		if m.usingCustomTF() {
 			m.clearCustomTF()
 			m.panOffset = 0
+			m.leftCrop = 0
 			return m, nil
 		}
 		m.tfIdx = (m.tfIdx - 1 + len(m.tfs)) % len(m.tfs)
 		m.panOffset = 0
+		m.leftCrop = 0
 		return m, nil
 	case "pan_left":
 		m.pan(-1)
 		return m, nil
 	case "pan_right":
 		m.pan(1)
+		return m, nil
+	case "crop_in": // [ — narrow window toward the live edge
+		m.crop(1)
+		return m, nil
+	case "crop_out": // ] — widen back to full width
+		m.crop(-1)
 		return m, nil
 	case "cycle_indicators":
 		m.cycleIndicators()
@@ -529,6 +550,44 @@ func (m *Model) pan(dir int) {
 			m.setStatus("back to live", false)
 		} else {
 			m.setStatus(fmt.Sprintf("▶ forward, now −%d", m.panOffset), false)
+		}
+	}
+}
+
+// crop narrows (dir > 0) or widens (dir < 0) the left edge of the chart
+// window, keeping the right edge pinned at the live edge (or at panOffset).
+// Each press jumps a quarter of the chart width. Dropping older bars lets
+// volume/price scale rebase onto the recent window — useful when a new
+// low-volume session starts and the prior session's peaks squash it flat.
+// Capped so at least one bar stays visible.
+func (m *Model) crop(dir int) {
+	cap := m.chartWidth() - 1
+	if cap < 0 {
+		cap = 0
+	}
+	step := m.chartWidth() / 4
+	if step < 1 {
+		step = 1
+	}
+	switch {
+	case dir > 0: // narrow: drop older bars from the left
+		m.leftCrop += step
+		if m.leftCrop > cap {
+			m.leftCrop = cap
+		}
+		m.setStatus(fmt.Sprintf("▶ focus −%d", m.leftCrop), false)
+	default: // dir < 0: widen toward full width
+		if m.leftCrop == 0 {
+			return
+		}
+		m.leftCrop -= step
+		if m.leftCrop < 0 {
+			m.leftCrop = 0
+		}
+		if m.leftCrop == 0 {
+			m.setStatus("focus off", false)
+		} else {
+			m.setStatus(fmt.Sprintf("▶ focus −%d", m.leftCrop), false)
 		}
 	}
 }
@@ -850,6 +909,7 @@ func (m *Model) runCommand(input string) tea.Cmd {
 			}
 		}
 		m.panOffset = 0
+		m.leftCrop = 0
 		m.setStatus("timeframe "+spec.Name, false)
 		return nil
 	case cmdline.KindPreset:
@@ -885,11 +945,28 @@ func (m *Model) runCommand(input string) tea.Cmd {
 	case cmdline.KindShading:
 		m.shading = c.On
 		return nil
+	case cmdline.KindFocus:
+		// Clamp to the chart width (same ceiling crop() uses) so an absolute
+		// ":focus 9999" can't zero out the view. At least one bar stays.
+		cap := m.chartWidth() - 1
+		if cap < 0 {
+			cap = 0
+		}
+		if c.Focus > cap {
+			c.Focus = cap
+		}
+		m.leftCrop = c.Focus
+		if m.leftCrop > 0 {
+			m.setStatus(fmt.Sprintf("focus −%d", m.leftCrop), false)
+		} else {
+			m.setStatus("focus off", false)
+		}
+		return nil
 	case cmdline.KindQuit:
 		m.done = true
 		return nil
 	case cmdline.KindHelp:
-		m.setStatus("B/S buy/sell A/D add/reduce F flatten C cancel(active) X panic(active only) 1-9 preset :tf 1m|2m|30s… tab cycle ←/→ pan i ind :lock/:unlock q", false)
+		m.setStatus("B/S buy/sell A/D add/reduce F flatten C cancel(active) X panic(active only) 1-9 preset :tf 1m|2m|30s… tab cycle ←/→ pan [/] focus :focus N|off i ind :lock/:unlock q", false)
 		return nil
 	}
 	return nil
@@ -920,6 +997,18 @@ func (m *Model) View() string {
 	if m.width <= 0 || m.height <= 0 {
 		return ""
 	}
+	// One locked snapshot of the store and one of the market cache per frame.
+	// This replaces ~5 separate mutex acquisitions + slice allocations that
+	// the status bar, info bar, and chart used to each perform.
+	var book state.BookSnapshot
+	if m.d.Store != nil {
+		book = m.d.Store.Snapshot()
+	}
+	var market bars.MarketSnapshot
+	if m.d.Agg != nil {
+		market = m.d.Agg.MarketSnapshot()
+	}
+
 	// TradingView-style price scale sits on the right of the candle plot.
 	// Reserve it unless the window is too narrow (plot would be unusable).
 	axisW := priceAxisWidth
@@ -931,7 +1020,7 @@ func (m *Model) View() string {
 		plotW = 1
 	}
 	statusH, bottomH := 1, 1
-	panelH := m.infoBarRows()
+	panelH := infoBarRowsFor(book, m.symbol)
 	// Keep the info strip when there's room; collapse it on tiny terminals
 	// so the chart still fits.
 	if m.height < statusH+bottomH+panelH+8 {
@@ -954,18 +1043,21 @@ func (m *Model) View() string {
 		candleH = 1
 	}
 
-	var openOrders []alpaca.Order
-	if m.d.Store != nil {
-		openOrders = m.d.Store.OpenOrders()
-	}
 	opts := ChartOpts{
 		ShowEMA: m.showEMA, ShowEMA2: m.showEMA2, ShowVWAP: m.showVWAP,
 		SessionShading: m.shading,
-		Orders:         chartOrdersFor(m.symbol, openOrders),
+		Orders:         chartOrdersFor(m.symbol, book.Orders),
 	}
 	// Request only as many bars as fit at barStride spacing; the renderers
 	// still paint into the full plotW-cell canvas with empty spacer columns.
-	snap := m.chartSnapshot(maxBars(plotW), m.panOffset)
+	// leftCrop narrows the window from the left (focus mode): bars cluster at
+	// the live edge and the blank left region lets volume/price scale rebase
+	// onto the recent window. barCol right-aligns so fewer bars = blank left.
+	nBars := maxBars(plotW) - m.leftCrop
+	if nBars < 1 {
+		nBars = 1
+	}
+	snap := m.chartSnapshot(nBars, m.panOffset)
 	chartLines := renderCandles(snap, plotW, candleH, opts)
 
 	// Join each candle row with its matching price-axis label.
@@ -998,9 +1090,9 @@ func (m *Model) View() string {
 
 	// Pass chart snap into the status bar so quiet-tape OHLCV fallback does
 	// not take a second Aggregator.Snapshot (same mutex as ingest).
-	parts := []string{m.renderStatusBar(snap)}
+	parts := []string{m.renderStatusBar(snap, market)}
 	if panelH > 0 {
-		parts = append(parts, m.renderInfoBar(m.width, panelH))
+		parts = append(parts, m.renderInfoBar(m.width, panelH, book, market))
 	}
 	parts = append(parts, chart, m.renderBottom())
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
@@ -1041,7 +1133,7 @@ var (
 	stSideDn  = lipgloss.NewStyle().Foreground(infoDownFg)
 )
 
-func (m *Model) renderStatusBar(chartSnap bars.Snapshot) string {
+func (m *Model) renderStatusBar(chartSnap bars.Snapshot, market bars.MarketSnapshot) string {
 	sep := stSep.Render(" │ ")
 	sepW := lipgloss.Width(sep)
 
@@ -1068,12 +1160,8 @@ func (m *Model) renderStatusBar(chartSnap bars.Snapshot) string {
 	// closed session still shows a print comparable to TradingView's header.
 	// Reuse the frame chart snap only when live (panOffset==0); when panned
 	// the chart window is historical and must not overwrite the status price.
-	// Agg is always set in production; nil-guard for partial test Deps.
-	var last float64
-	var lastAt time.Time
-	if m.d.Agg != nil {
-		last, lastAt = m.d.Agg.LatestTrade()
-	}
+	last := market.LastPrice
+	lastAt := market.LastAt
 	price := "—"
 	var lastBarOHLCV string
 	if last > 0 {
@@ -1095,10 +1183,8 @@ func (m *Model) renderStatusBar(chartSnap bars.Snapshot) string {
 	if lastBarOHLCV != "" {
 		quote += stMuted.Render(lastBarOHLCV)
 	}
-	if m.d.Agg != nil {
-		if bid, ask, _ := m.d.Agg.LatestQuote(); bid > 0 && ask > 0 {
-			quote += stMuted.Render(fmt.Sprintf("  %.2f×%.2f", bid, ask))
-		}
+	if market.Bid > 0 && market.Ask > 0 {
+		quote += stMuted.Render(fmt.Sprintf("  %.2f×%.2f", market.Bid, market.Ask))
 	}
 
 	// Clock.
@@ -1151,6 +1237,9 @@ func (m *Model) renderStatusBar(chartSnap bars.Snapshot) string {
 	if m.panOffset > 0 {
 		alerts += stHistory.Render(fmt.Sprintf(" ◀ HISTORY −%d ", m.panOffset))
 	}
+	if m.leftCrop > 0 {
+		alerts += stHistory.Render(fmt.Sprintf(" ▶ FOCUS −%d ", m.leftCrop))
+	}
 	if !lastAt.IsZero() && time.Since(lastAt) > 10*time.Second && m.sess != session.Closed {
 		alerts += stMuted.Render(" feed quiet")
 	}
@@ -1189,26 +1278,39 @@ func (m *Model) renderStatusBar(chartSnap bars.Snapshot) string {
 	return stStatusBar.Width(m.width).MaxWidth(m.width).Render(line)
 }
 
+// Bottom-bar styles. Hoisted to package vars so renderBottom (called every
+// frame) doesn't call lipgloss.NewStyle(); only the dynamic width is applied
+// at render time via Width(), which is a struct copy, not a re-init.
+var (
+	bottomConfirmBG = lipgloss.Color("94")
+	bottomConfirmFG = lipgloss.Color("0")
+	bottomErrFG     = lipgloss.Color("9")
+	bottomOkFG      = lipgloss.Color("10")
+
+	stBottomConfirm = lipgloss.NewStyle().Background(bottomConfirmBG).Foreground(bottomConfirmFG).Bold(true)
+	stBottomErr     = lipgloss.NewStyle().Foreground(bottomErrFG)
+	stBottomOk      = lipgloss.NewStyle().Foreground(bottomOkFG)
+	stBottomFaint   = lipgloss.NewStyle().Faint(true)
+)
+
 func (m *Model) renderBottom() string {
-	st := lipgloss.NewStyle().Width(m.width)
+	// Width is dynamic; apply on top of the prebuilt styles.
 	if m.pending != nil {
-		return st.Background(lipgloss.Color("94")).Foreground(lipgloss.Color("0")).Bold(true).
-			Render("CONFIRM: " + m.pending.label + "  (y/n)")
+		return stBottomConfirm.Width(m.width).Render("CONFIRM: " + m.pending.label + "  (y/n)")
 	}
 	if m.confirmQ {
-		return st.Background(lipgloss.Color("94")).Foreground(lipgloss.Color("0")).Bold(true).
-			Render("Position open in " + m.symbol + " — quit anyway? (y/n)")
+		return stBottomConfirm.Width(m.width).Render("Position open in " + m.symbol + " — quit anyway? (y/n)")
 	}
 	if m.cmdActive {
-		return st.Render(":" + m.cmdBuf + "█")
+		return stBottomFaint.Width(m.width).Render(":" + m.cmdBuf + "█")
 	}
 	if m.status != "" && time.Since(m.statusAt) < 8*time.Second {
 		if m.statusErr {
-			return st.Foreground(lipgloss.Color("9")).Render(m.status)
+			return stBottomErr.Width(m.width).Render(m.status)
 		}
-		return st.Foreground(lipgloss.Color("10")).Render(m.status)
+		return stBottomOk.Width(m.width).Render(m.status)
 	}
-	return st.Faint(true).Render(": for commands · :help for keys")
+	return stBottomFaint.Width(m.width).Render(": for commands · :help for keys")
 }
 
 // infoBar palette — foreground accents only (no full-row backgrounds).
@@ -1222,6 +1324,16 @@ var (
 	infoSizeOnBg = lipgloss.Color("#3d59a1")
 	infoSizeOnFg = lipgloss.Color("#c0caf5")
 	infoIndOnFg  = lipgloss.Color("#7dcfff")
+
+	// Hoisted info-bar styles (rebuilt per frame was pure CPU on the render path).
+	stInfoMuted = lipgloss.NewStyle().Foreground(infoMutedFg)
+	stInfoValue = lipgloss.NewStyle().Foreground(infoValueFg)
+	stInfoLabel = lipgloss.NewStyle().Foreground(infoLabelFg).Bold(true)
+	stInfoVwap  = lipgloss.NewStyle().Foreground(infoVwapFg)
+	stInfoEq    = lipgloss.NewStyle().Foreground(infoValueFg).Bold(true)
+	// Order side glyphs (B/S) — bold tinted.
+	stInfoSideBuy  = lipgloss.NewStyle().Foreground(infoUpFg).Bold(true)
+	stInfoSideSell = lipgloss.NewStyle().Foreground(infoDownFg).Bold(true)
 )
 
 // infoSeg is one pipe-separated info-bar unit with a fit priority
@@ -1229,6 +1341,18 @@ var (
 type infoSeg struct {
 	text string
 	prio int
+}
+
+// infoBarRowsFor returns how many rows the info strip should use (0–2),
+// based on a store snapshot taken once per frame. A second row is only used
+// when the active symbol has open orders.
+func infoBarRowsFor(book state.BookSnapshot, symbol string) int {
+	for _, o := range book.Orders {
+		if o.Symbol == symbol {
+			return 2
+		}
+	}
+	return 1
 }
 
 // infoBarRows returns how many rows the info strip should use (0–2).
@@ -1308,11 +1432,14 @@ func chartOrderPrices(o alpaca.Order) []float64 {
 // Quote/symbol/size/indicators live on the status line. This strip is book
 // + risk + working orders: richer POS metrics, priority-trimmed account
 // segments, and open orders for the active symbol only.
-func (m *Model) renderInfoBar(w, h int) string {
+//
+// book and market are the per-frame snapshots taken once in View() — this
+// function never touches the store/agg mutexes directly.
+func (m *Model) renderInfoBar(w, h int, book state.BookSnapshot, market bars.MarketSnapshot) string {
 	if h <= 0 || w <= 0 {
 		return ""
 	}
-	row1, row2 := m.buildInfoBarRows(w)
+	row1, row2 := m.buildInfoBarRows(w, book, market)
 	// Soft band under the status bar so the strip reads as a unit without
 	// competing with the chart below.
 	rowStyle := lipgloss.NewStyle().Width(w).MaxWidth(w).
@@ -1324,28 +1451,24 @@ func (m *Model) renderInfoBar(w, h int) string {
 	return rowStyle.Render(row1) + "\n" + rowStyle.Render(row2)
 }
 
-func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
+func (m *Model) buildInfoBarRows(w int, book state.BookSnapshot, market bars.MarketSnapshot) (row1, row2 string) {
 	// Leave room for PaddingLeft(1) applied in renderInfoBar.
 	if w > 1 {
 		w--
 	}
-	muted := lipgloss.NewStyle().Foreground(infoMutedFg)
-	value := lipgloss.NewStyle().Foreground(infoValueFg)
-	lbl := lipgloss.NewStyle().Foreground(infoLabelFg).Bold(true)
+	muted := stInfoMuted
+	value := stInfoValue
+	lbl := stInfoLabel
 	sep := muted.Render("  ·  ")
 	sepW := lipgloss.Width(sep)
 
-	var last, vwapVal float64
-	hasVWAP := false
-	if m.d.Agg != nil {
-		last, _ = m.d.Agg.LatestTrade()
-		vwapVal = m.d.Agg.SessionVWAP()
-		hasVWAP = vwapVal == vwapVal // NaN check
-	}
+	last := market.LastPrice
+	vwapVal := market.VWAP
+	hasVWAP := vwapVal == vwapVal // NaN check
 
 	// --- POS (priority 1) ---
 	posText := lbl.Render("POS") + " " + muted.Render("flat")
-	if p := m.d.Store.Position(m.symbol); p != nil {
+	if p := book.ActivePosition(m.symbol); p != nil {
 		side := "L"
 		sideSt := stSideUp
 		if p.Side == "short" {
@@ -1388,7 +1511,7 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 	}
 
 	// Other symbols with positions or resting orders (C/X only touch active).
-	otherN := countOtherOpenSymbols(m.d.Store, m.symbol)
+	otherN := book.OtherOpenCount(m.symbol)
 	otherPos := ""
 	if otherN > 0 {
 		// Reminder that C/X are symbol-scoped when multi-name risk is open.
@@ -1397,14 +1520,15 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 
 	// --- Account: eq + day/week PnL (open marks stripped at REST) + bp; cash lower ---
 	eqText, cashText, bpText, dayText, weekText := "", "", "", "", ""
-	if a, ok := m.d.Store.Account(); ok {
-		eqText = lbl.Render("eq") + " " + value.Bold(true).Render(compactMoney(float64(a.Equity)))
+	if book.HasAccount {
+		a := book.Account
+		eqText = lbl.Render("eq") + " " + stInfoEq.Render(compactMoney(float64(a.Equity)))
 		bpText = lbl.Render("bp") + " " + value.Render(compactMoney(float64(a.BuyingPower)))
 		cashText = lbl.Render("cash") + " " + value.Render(compactMoney(float64(a.Cash)))
 	} else {
 		eqText = lbl.Render("eq") + " " + muted.Render("—")
 	}
-	pnl := m.d.Store.PnL()
+	pnl := book.PnL
 	if pnl.HasDay {
 		dayText = lbl.Render("day") + " " + signedPLStyle(pnl.Day).Render(signedCompactMoney(pnl.Day))
 	}
@@ -1416,26 +1540,19 @@ func (m *Model) buildInfoBarRows(w int) (row1, row2 string) {
 	vwapText := ""
 	if hasVWAP {
 		vwapText = lbl.Render("vwap") + " " +
-			lipgloss.NewStyle().Foreground(infoVwapFg).Render(fmt.Sprintf("%.2f", vwapVal))
+			stInfoVwap.Render(fmt.Sprintf("%.2f", vwapVal))
 	}
 
 	// --- Orders: active symbol only (trading focus) ---
-	var activeOrds []alpaca.Order
-	if m.d.Store != nil {
-		for _, o := range m.d.Store.OpenOrders() {
-			if o.Symbol == m.symbol {
-				activeOrds = append(activeOrds, o)
-			}
-		}
-	}
+	activeOrds := book.ActiveOrders(m.symbol)
 	formatOrd := func(o alpaca.Order) string {
-		sideCol := infoUpFg
+		sideSt := stInfoSideBuy
 		sideMark := "B"
 		if strings.EqualFold(o.Side, "sell") {
-			sideCol = infoDownFg
+			sideSt = stInfoSideSell
 			sideMark = "S"
 		}
-		s := lipgloss.NewStyle().Foreground(sideCol).Bold(true).Render(sideMark)
+		s := sideSt.Render(sideMark)
 		s += value.Render(fmt.Sprintf(" %.0f", o.Qty-o.FilledQty))
 		if o.FilledQty > 0 {
 			s += muted.Render(fmt.Sprintf("(%.0f/%.0f)", o.FilledQty, o.Qty))

@@ -21,17 +21,13 @@ import (
 // payload whose tail would otherwise be silently dropped and mis-decoded.
 var ErrResponseTruncated = errors.New("response body exceeded size limit")
 
-// readBounded reads up to maxBytes from r. If the body contains more than
-// maxBytes, it returns the bytes read so far and ErrResponseTruncated.
-func readBounded(r io.Reader, maxBytes int) ([]byte, error) {
-	b, err := io.ReadAll(io.LimitReader(r, int64(maxBytes)+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(b) > maxBytes {
-		return b[:maxBytes], ErrResponseTruncated
-	}
-	return b, nil
+// respBufPool reuses read buffers across REST calls so the 5 s reconcile
+// path (account/positions/orders) and paginated backfills don't each grow a
+// fresh buffer. Buffers are borrowed for the duration of one do() call —
+// read, status-checked, and decoded before being returned — so the decoded
+// value never aliases pooled memory.
+var respBufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
 }
 
 // REST is a client for the Alpaca trading and market-data REST APIs.
@@ -134,9 +130,22 @@ func (c *REST) do(ctx context.Context, hc *http.Client, method, base, path strin
 	// individual calls bounded). Reading up to N+1 bytes lets us detect a
 	// truncation rather than silently chopping the tail, which would yield a
 	// misleading decode error or, worse, a partial parse.
-	data, err := readBounded(resp.Body, 1<<20)
-	if err != nil {
+	//
+	// A pooled buffer backs the read, status check, and decode — which all
+	// happen synchronously here — so callers never hold a reference into it
+	// and no per-response []byte escapes into the heap.
+	buf := respBufPool.Get().(*bytes.Buffer)
+	defer func() {
+		buf.Reset()
+		respBufPool.Put(buf)
+	}()
+	buf.Grow(1<<20 + 1)
+	if _, err := io.Copy(buf, io.LimitReader(resp.Body, 1<<20+1)); err != nil {
 		return fmt.Errorf("read %s %s: %w", method, path, err)
+	}
+	data := buf.Bytes()
+	if len(data) > 1<<20 {
+		return fmt.Errorf("read %s %s: %w", method, path, ErrResponseTruncated)
 	}
 	if resp.StatusCode >= 400 {
 		var ae apiError

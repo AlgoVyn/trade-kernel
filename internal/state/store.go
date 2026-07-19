@@ -17,8 +17,79 @@ import (
 // refreshed successfully for this long (avoids multi-hour frozen "wk").
 const weekPnLStaleAfter = 30 * time.Minute
 
-// AccountPnL is cached day/week account profit-and-loss with open marks
-// stripped at the last REST snapshot (not recomputed from live WS positions).
+// BookSnapshot is a single-lock-acquired copy of the store's render-relevant
+// fields. The UI render loop takes one BookSnapshot per frame instead of
+// calling Positions()/OpenOrders()/Account()/PnL() separately (each of which
+// takes the RWMutex and allocates a slice). Positions, Orders, and Account are
+// deep copies — the snapshot is safe to read off the lock for the whole frame.
+type BookSnapshot struct {
+	Account     alpaca.Account
+	HasAccount  bool
+	Reconciled  bool
+	Positions   []alpaca.Position
+	Orders      []alpaca.Order
+	PnL         AccountPnL
+	PositionQty map[string]float64 // signed qty per symbol; nil-safe lookups
+}
+
+// ActivePosition returns the snapshot entry for symbol (copy by value), or
+// nil if no position is open. Safe to mutate the returned pointer.
+func (b BookSnapshot) ActivePosition(symbol string) *alpaca.Position {
+	for i := range b.Positions {
+		if b.Positions[i].Symbol == symbol {
+			p := b.Positions[i]
+			return &p
+		}
+	}
+	return nil
+}
+
+// SignedQty returns the signed position qty for symbol (negative = short).
+func (b BookSnapshot) SignedQty(symbol string) float64 {
+	for i := range b.Positions {
+		if b.Positions[i].Symbol != symbol {
+			continue
+		}
+		q := float64(b.Positions[i].Qty)
+		if b.Positions[i].Side == "short" {
+			return -q
+		}
+		return q
+	}
+	return 0
+}
+
+// OtherOpenCount returns how many symbols other than active have a non-zero
+// position and/or resting open order. Used for multi-name risk reminders.
+func (b BookSnapshot) OtherOpenCount(active string) int {
+	seen := make(map[string]struct{})
+	for _, p := range b.Positions {
+		if p.Symbol != "" && p.Symbol != active {
+			seen[p.Symbol] = struct{}{}
+		}
+	}
+	for _, o := range b.Orders {
+		if o.Symbol != "" && o.Symbol != active {
+			seen[o.Symbol] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
+// ActiveOrders returns the open orders for symbol (active symbol only, per
+// the trading-focus rule). Allocates a fresh slice only when there is at
+// least one matching order.
+func (b BookSnapshot) ActiveOrders(symbol string) []alpaca.Order {
+	var out []alpaca.Order
+	for _, o := range b.Orders {
+		if o.Symbol == symbol {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// AccountPnL is cached day/week account profit-and-loss with open marks// stripped at the last REST snapshot (not recomputed from live WS positions).
 //
 //	Day  = (equity − last_equity) − Σ unrealized_intraday_pl
 //	Week = portfolio-history PnL − Σ unrealized_pl (total vs cost)
@@ -297,6 +368,45 @@ func (s *Store) Reconciled() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.reconciled
+}
+
+// Snapshot returns a single-copy view of the store for rendering. The UI
+// calls this once per frame instead of Positions()/OpenOrders()/Account()/
+// PnL() separately (each takes the mutex and allocates). One copy here =
+// one mutex acquisition and one set of allocations per frame.
+func (s *Store) Snapshot() BookSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := BookSnapshot{
+		Account:    s.account,
+		HasAccount: s.hasAcct,
+		Reconciled: s.reconciled,
+		Positions:  make([]alpaca.Position, 0, len(s.positions)),
+		Orders:     make([]alpaca.Order, 0, len(s.orders)),
+		PnL: AccountPnL{
+			HasDay:  s.hasDayPnL,
+			HasWeek: s.hasWeekPnL,
+		},
+	}
+	for _, p := range s.positions {
+		out.Positions = append(out.Positions, p)
+	}
+	for _, o := range s.orders {
+		out.Orders = append(out.Orders, o)
+	}
+	// Re-derive PnL numbers under the same lock the existing PnL() uses,
+	// including the week-staleness check.
+	if s.hasDayPnL {
+		out.PnL.Day = s.dayChange - s.openIntradaySnap
+	}
+	if s.hasWeekPnL {
+		if !s.weekUpdatedAt.IsZero() && time.Since(s.weekUpdatedAt) > weekPnLStaleAfter {
+			out.PnL.HasWeek = false
+		} else {
+			out.PnL.Week = s.weekChange - s.openTotalUnrealSnap
+		}
+	}
+	return out
 }
 
 // PositionQty returns the signed quantity for symbol (negative = short).

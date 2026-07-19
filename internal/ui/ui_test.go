@@ -304,7 +304,7 @@ func TestInfoBarShowsDayWeekPnL(t *testing.T) {
 	st.SetWeekPnL(3200)
 	m := NewModel(d)
 	m.width = 160
-	row1, _ := m.buildInfoBarRows(160)
+	row1, _ := m.buildInfoBarRows(160, st.Snapshot(), bars.MarketSnapshot{})
 	if !strings.Contains(row1, "day") || !strings.Contains(row1, "+1.3k") {
 		t.Fatalf("row1 missing day PnL: %q", row1)
 	}
@@ -394,7 +394,7 @@ func TestInfoBarOrdersActiveSymbolOnly(t *testing.T) {
 	if m.openOrderCount("AAPL") != 1 {
 		t.Fatalf("openOrderCount AAPL = %d", m.openOrderCount("AAPL"))
 	}
-	row1, row2 := m.buildInfoBarRows(120)
+	row1, row2 := m.buildInfoBarRows(120, st.Snapshot(), bars.MarketSnapshot{})
 	if !strings.Contains(row2, "ORD 1") {
 		t.Fatalf("row2 should show ORD 1 for AAPL only, got %q", row2)
 	}
@@ -410,7 +410,7 @@ func TestInfoBarOrdersActiveSymbolOnly(t *testing.T) {
 	if m.infoBarRows() != 1 {
 		t.Fatalf("infoBarRows for TSLA = %d, want 1 (no active open orders)", m.infoBarRows())
 	}
-	row1, row2 = m.buildInfoBarRows(120)
+	row1, row2 = m.buildInfoBarRows(120, st.Snapshot(), bars.MarketSnapshot{})
 	if row2 != "" {
 		t.Fatalf("expected empty order row for TSLA, got %q", row2)
 	}

@@ -48,6 +48,48 @@ var fgColors = map[uint8]lipgloss.Color{
 	colVWAP: lipgloss.Color("#ffa726"), // soft amber
 }
 
+// chartStyle is a precomputed lipgloss.Style for every (fg, bg) combination
+// the chart can emit. Built once at package init so grid.render() and
+// renderVolume never call lipgloss.NewStyle() on the 10–30 Hz render path.
+// Index as chartStyles[bg*8+fg].
+var chartStyles [numBg * 8]lipgloss.Style
+
+const numBg = 4 // bgNone + 3 session tints (matches bg* iota count)
+
+func init() {
+	var bgs = [numBg]uint8{bgNone, bgOvernight, bgPreMarket, bgAfterHours}
+	for bi, bg := range bgs {
+		for fi := uint8(0); fi < 8; fi++ {
+			st := lipgloss.NewStyle()
+			if fc, ok := fgColors[fi]; ok {
+				st = st.Foreground(fc)
+			}
+			if bi > 0 {
+				if bc, ok := bgColors[bg]; ok {
+					st = st.Background(bc)
+				}
+			}
+			chartStyles[int(bg)*8+int(fi)] = st
+		}
+	}
+}
+
+// chartStyleAt returns the precomputed style for (fg, bg) without allocating.
+func chartStyleAt(fg, bg uint8) lipgloss.Style {
+	i := int(bg)*8 + int(fg)
+	if i < 0 || i >= len(chartStyles) {
+		return lipgloss.NewStyle()
+	}
+	return chartStyles[i]
+}
+
+// stDim is the shared faint style for axis labels / separators / the time
+// ruler. Hoisted so the once-per-frame axis/ruler renderers don't allocate.
+var stDim = lipgloss.NewStyle().Faint(true)
+
+// stAxisSep is the "│" separator rendered at the left of each price-axis row.
+var stAxisSep = stDim.Render("│")
+
 // Session background colors — light, desaturated tints so they mark the
 // session without competing with candle teal/red. Hex keeps them soft on
 // truecolor terms; they fall back cleanly on 256-color terminals via lipgloss.
@@ -190,14 +232,7 @@ func (g *grid) render() []string {
 			if run.Len() == 0 {
 				return
 			}
-			st := lipgloss.NewStyle()
-			if f, ok := fgColors[runFG]; ok {
-				st = st.Foreground(f)
-			}
-			if b, ok := bgColors[runBG]; ok {
-				st = st.Background(b)
-			}
-			sb.WriteString(st.Render(run.String()))
+			sb.WriteString(chartStyleAt(runFG, runBG).Render(run.String()))
 			run.Reset()
 		}
 		started := false
@@ -633,6 +668,10 @@ func volumeScale(vols []float64) float64 {
 
 // renderVolume draws volume bars for the newest bars into h lines, using
 // the same barStride spacing as the candle pane so columns line up.
+//
+// Styling is performed via the precomputed chartStyles table (no NewStyle per
+// cell), and the per-column (fg, bg) pair is computed once per bar. Cells are
+// run-coalesced per row so a volume bar's same-color cells flush in one Render.
 func renderVolume(snap bars.Snapshot, w, h int, shading bool) []string {
 	if w <= 0 || h <= 0 || len(snap.Bars) == 0 {
 		return blankLines(h)
@@ -646,59 +685,109 @@ func renderVolume(snap bars.Snapshot, w, h int, shading bool) []string {
 		vols[i] = b.Volume
 	}
 	scale := volumeScale(vols)
-	rows := make([][]rune, h)
-	styles := make([][]lipgloss.Style, h)
-	for i := range rows {
-		rows[i] = make([]rune, w)
-		styles[i] = make([]lipgloss.Style, w)
-		for x := range rows[i] {
-			rows[i][x] = ' '
+
+	// perCol[i] = (fg, bg) for column of bar i, precomputed once.
+	type colStyle struct{ fg, bg uint8 }
+	perCol := make([]colStyle, n)
+	if shading {
+		for i, b := range snap.Bars {
+			perCol[i] = colStyle{candleColor(b), sessionBG(session.At(b.Start))}
+		}
+	} else {
+		for i, b := range snap.Bars {
+			perCol[i] = colStyle{candleColor(b), bgNone}
 		}
 	}
+
+	// heights[i] = how many eighth-block units bar i should occupy (0 = empty).
+	heights := make([]int, n)
 	if scale > 0 {
 		for i, b := range snap.Bars {
-			cx := barCol(w, n, i)
-			// Clip to scale so outliers paint full-height, not overshoot.
 			v := b.Volume
 			if v > scale {
 				v = scale
 			}
-			units := v / scale * float64(h*8) // eighth-block units
-			// Any real print gets at least one eighth-block so quiet minutes
-			// still read as a stub (TradingView does the same).
+			units := v / scale * float64(h*8)
 			if b.Volume > 0 && units < 1 {
 				units = 1
 			}
-			fg := fgColors[candleColor(b)]
-			st := lipgloss.NewStyle().Foreground(fg)
-			if shading {
-				if bg := sessionBG(session.At(b.Start)); bg != bgNone {
-					st = st.Background(bgColors[bg])
-				}
-			}
-			full := int(units) / 8
-			rem := int(units) % 8
-			for y := 0; y < full && y < h; y++ {
-				rows[h-1-y][cx] = '█'
-				styles[h-1-y][cx] = st
-			}
-			if full < h && rem > 0 {
-				rows[h-1-full][cx] = volBlocks[rem-1]
-				styles[h-1-full][cx] = st
-			}
+			heights[i] = int(units)
 		}
 	}
+
+	// Build one []uint8 grid per row holding the rune index (0=space, 1=full,
+	// 2..9=eighth-block) so we can coalesce runs of the same (rune, fg, bg).
+	const (
+		cellSpace = 0
+		cellFull  = 1
+	)
+	cellRune := func(rowIdx, colIdx int) uint8 {
+		units := heights[colIdx]
+		if units <= 0 {
+			return cellSpace
+		}
+		full := units / 8
+		// rowIdx 0 is the top; volume grows from the bottom (row h-1).
+		fromBottom := h - 1 - rowIdx
+		if fromBottom < full {
+			return cellFull
+		}
+		rem := units % 8
+		if fromBottom == full && rem > 0 {
+			return uint8(2 + rem - 1) // 2..9 → volBlocks index 0..7
+		}
+		return cellSpace
+	}
+
 	lines := make([]string, h)
 	for y := 0; y < h; y++ {
 		var sb strings.Builder
-		for x := 0; x < w; x++ {
-			st := styles[y][x]
-			if rows[y][x] == ' ' {
-				sb.WriteRune(' ')
-			} else {
-				sb.WriteString(st.Render(string(rows[y][x])))
+		var runSB strings.Builder
+		var runFG, runBG uint8
+		runActive := false
+		flush := func() {
+			if runSB.Len() == 0 {
+				return
 			}
+			sb.WriteString(chartStyleAt(runFG, runBG).Render(runSB.String()))
+			runSB.Reset()
+			runActive = false
 		}
+		for x := 0; x < w; x++ {
+			// Determine column. Linear scan is fine (terminal widths are small)
+			// and avoids precomputing a column map each frame.
+			colIdx := -1
+			for i := 0; i < n; i++ {
+				if barCol(w, n, i) == x {
+					colIdx = i
+					break
+				}
+			}
+			var fg, bg uint8 = colNone, bgNone
+			runeIdx := uint8(cellSpace)
+			rn := ' '
+			if colIdx >= 0 {
+				fg, bg = perCol[colIdx].fg, perCol[colIdx].bg
+				runeIdx = cellRune(y, colIdx)
+				switch runeIdx {
+				case cellSpace:
+					rn = ' '
+				case cellFull:
+					rn = '█'
+				default:
+					rn = volBlocks[int(runeIdx)-2]
+				}
+			}
+			if runActive && (fg != runFG || bg != runBG) {
+				flush()
+			}
+			if !runActive {
+				runFG, runBG = fg, bg
+				runActive = true
+			}
+			runSB.WriteRune(rn)
+		}
+		flush()
 		lines[y] = sb.String()
 	}
 	return lines
@@ -849,7 +938,7 @@ func renderTimeRuler(snap bars.Snapshot, w int, tf bars.TF) string {
 		}
 	}
 
-	dim := lipgloss.NewStyle().Faint(true)
+	dim := stDim
 	return dim.Render(strings.TrimRight(string(runes), " "))
 }
 
@@ -883,7 +972,7 @@ func renderPriceAxis(min, max float64, w, h int) []string {
 		return max - (float64(row)/float64(h-1))*(max-min)
 	}
 
-	dim := lipgloss.NewStyle().Faint(true)
+	dim := stDim
 	step := 3
 	if h/step < 4 {
 		step = 2
@@ -911,7 +1000,7 @@ func priceAxisLine(w int, label string) string {
 	if w <= 0 {
 		return ""
 	}
-	sep := lipgloss.NewStyle().Faint(true).Render("│")
+	sep := stAxisSep
 	if w == 1 {
 		return sep
 	}

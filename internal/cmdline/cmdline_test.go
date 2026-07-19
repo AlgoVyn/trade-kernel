@@ -70,6 +70,27 @@ func TestParseOther(t *testing.T) {
 	if err != nil || c.Kind != KindShading || !c.On {
 		t.Fatalf("%+v err=%v", c, err)
 	}
+	c, err = Parse("focus 30")
+	if err != nil || c.Kind != KindFocus || c.Focus != 30 {
+		t.Fatalf("focus 30: %+v err=%v", c, err)
+	}
+	c, err = Parse("focus off")
+	if err != nil || c.Kind != KindFocus || c.Focus != 0 {
+		t.Fatalf("focus off: %+v err=%v", c, err)
+	}
+	c, err = Parse("focus OFF")
+	if err != nil || c.Kind != KindFocus || c.Focus != 0 {
+		t.Fatalf("focus OFF (case-insensitive): %+v err=%v", c, err)
+	}
+	if _, err := Parse("focus"); err == nil {
+		t.Fatal("expected error: focus without arg")
+	}
+	if _, err := Parse("focus -5"); err == nil {
+		t.Fatal("expected error: focus negative")
+	}
+	if _, err := Parse("focus abc"); err == nil {
+		t.Fatal("expected error: focus non-numeric")
+	}
 	for _, v := range []string{"flatten", "flat", "f"} {
 		if c, err := Parse(v); err != nil || c.Kind != KindFlatten {
 			t.Fatalf("%s: %+v err=%v", v, c, err)
