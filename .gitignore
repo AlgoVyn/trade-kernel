@@ -26,6 +26,7 @@ go.work.sum
 *~
 .DS_Store
 .kilo
+.zcode
 
 # Env / secrets (never commit)
 .env
