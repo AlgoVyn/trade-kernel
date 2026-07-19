@@ -22,7 +22,9 @@ SSH + tmux.
   debounce. `X` is the panic key (cancel + flatten the active symbol).
 - **Charts.** Candlesticks in braille (2×4 dots/cell), volume pane,
   dual EMA/session-VWAP overlays, per-session background shading,
-  resolutions from 1s to 1d, weekend/holiday gaps collapsed.
+  resolutions from 1s to 1d, weekend/holiday gaps collapsed. Focus mode
+  (`[` / `]` or `:focus N`) crops the chart toward the live edge so a new
+  low-volume session isn't squashed by the prior session's peaks.
 - **Resilient.** WebSocket auto-reconnect with REST backfill, state
   reconciliation on startup and reconnect, client order IDs for
   idempotency, keypress→ack latency (p50/p99) in the status bar.
@@ -64,6 +66,7 @@ export APCA_API_SECRET_KEY=...
 | `1`–`9` | Select size preset |
 | `Tab` / `Shift+Tab` | Cycle chart resolution forward / backward |
 | `←` / `→` | Pan chart back into history / forward toward live |
+| `[` / `]` | Focus: narrow chart toward the live edge / widen back (rebases volume scale when a new low-volume session starts) |
 | `i` | Cycle indicator overlays |
 | `:` | Command line |
 | `q` / `Ctrl+C` | Quit / force quit |
@@ -77,7 +80,8 @@ export APCA_API_SECRET_KEY=...
 :cancel                  cancel active    :lock [reason]    engage risk lock
 :unlock                  release lock     :panic             panic active symbol
 :confirm on|off          toggle confirms  :shading on|off   toggle shading
-:quit                    quit             :help             key summary
+:focus N|off             crop to last N bars :quit             quit
+:help                    key summary
 ```
 
 ### How orders are built

@@ -132,7 +132,13 @@ per cell. EMA/EMA2/VWAP as colored dot overlays drawn under candles.
 Volume pane with eighth-block characters. Session background shading
 per column (overnight = dark blue, pre/after = dark gray, toggleable
 via config/`:shading`). Price range auto-scales across bars + enabled
-overlays with 2% padding.
+overlays with 2% padding. **Focus mode** (`[` / `]` or `:focus N|off`)
+crops the chart window from the left edge while keeping the right edge
+pinned at live; `barCol` right-aligns so fewer bars leaves blank space
+on the left and `volumeScale`/`priceRange` rebase onto the remaining
+(cropped) window. Use it when a new low-volume session starts and the
+prior session's peaks would otherwise squash the new session's volume
+bars flat. Reset to 0 wherever `panOffset` is reset (symbol/TF switch).
 
 ### 8. Latency discipline
 
@@ -165,10 +171,11 @@ overlays with 2% padding.
 | `C` | Cancel open orders for the active symbol |
 | `X` | Panic: cancel active-symbol orders + flatten active symbol (bypasses checks/confirmation) |
 | `1`–`9` | Select size preset |
-| `:` | Command line: `buy 250 lmt 152.30`, `sell 100 mkt`, `sym NVDA`, `tf 5m`, `preset 2`, `flatten`, `cancel`, `lock [reason]`, `unlock`, `panic`, `confirm on|off`, `shading on|off`, `quit`, `help` |
+| `:` | Command line: `buy 250 lmt 152.30`, `sell 100 mkt`, `sym NVDA`, `tf 5m`, `preset 2`, `flatten`, `cancel`, `lock [reason]`, `unlock`, `panic`, `confirm on|off`, `shading on|off`, `focus N\|off`, `quit`, `help` |
 | `Tab` | Cycle resolution (1m/5m/15m/1h/1d/1s/5s/15s) |
 | `Shift+Tab` | Cycle resolution backward |
 | `←` / `→` | Pan chart back into history / forward toward live |
+| `[` / `]` | Focus: crop chart toward the live edge / widen back (rebases volume/price scale onto the recent window when a new low-volume session starts) |
 | `i` | Cycle indicator overlay combos |
 | `q` / `Ctrl+C` | Quit (confirms with open position when confirmations on) / force quit |
 
