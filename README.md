@@ -7,14 +7,7 @@ after-hours), braille candlestick charts with dual-EMA/VWAP overlays,
 and hard safety rails. Runs on a server near Alpaca; you attach over
 SSH + tmux.
 
-```
- PAPER  REGULAR  AAPL  152.31 152.30×152.32  10:42:17 ET  size 250  tf 1m  p50 12ms p99 31ms
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀   AAPL
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⡄⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⢠⠀⠀⠀⠀⢠⡇⠀⠀⠀   last   152.31
-⠀⣄⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⠀⠀⠀⠀⢸⡇⠀⠀⠀⣿⡇⠀⠀⡆⠀⠀⣾⠀⠀⠀⠀⢸⡇⠀⠀⠀   bid    152.30
-⣠⣿⡄⠀⠀⠀⠀⠀⠀⢀⣾⡇⠀⠀⠀⠀⠀⢸⡇⠀⠀⠀⣿⡇⠀⢀⡇⠀⠀⣿⠀⠀⠀⢀⣾⠀⠀⠀⠀   ask    152.32
-...
-```
+![trade-kernel terminal UI](img/screenshot_spy.png)
 
 ## Features
 
