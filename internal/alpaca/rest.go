@@ -467,6 +467,21 @@ func (c *REST) Trades(ctx context.Context, symbol string, start, end time.Time, 
 	}
 }
 
+// LatestQuote fetches the most recent quote for symbol from the given feed
+// ("sip" default; "boats" for the overnight session). Used by the overnight
+// poller because the SIP websocket does not stream overnight quotes.
+func (c *REST) LatestQuote(ctx context.Context, symbol, feed string) (Quote, error) {
+	if feed == "" {
+		feed = "sip"
+	}
+	q := url.Values{"feed": {feed}}
+	var out struct {
+		Quote Quote `json:"quote"`
+	}
+	err := c.data(ctx, http.MethodGet, "/v2/stocks/"+url.PathEscape(symbol)+"/quotes/latest", q, &out)
+	return out.Quote, err
+}
+
 // MergeTrades merges two ascending trade series (SIP + BOATS) by timestamp.
 // On an exact timestamp collision both prints are kept unless they share a
 // non-zero trade id (true duplicate); then SIP wins. Equal price+size alone

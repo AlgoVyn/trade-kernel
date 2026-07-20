@@ -207,7 +207,7 @@ func (c *EligibilityCache) OvernightTradable(ctx context.Context, symbol string)
 	if err != nil {
 		return false, err
 	}
-	ok := a.Tradable && a.OvernightTradable
+	ok := a.Tradable && a.IsOvernightTradable()
 	c.mu.Lock()
 	c.ent[symbol] = eligEntry{ok: ok, at: time.Now()}
 	c.mu.Unlock()

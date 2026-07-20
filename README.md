@@ -24,7 +24,10 @@ SSH + tmux.
   dual EMA/session-VWAP overlays, per-session background shading,
   resolutions from 1s to 1d, weekend/holiday gaps collapsed. Focus mode
   (`[` / `]` or `:focus N`) crops the chart toward the live edge so a new
-  low-volume session isn't squashed by the prior session's peaks.
+  low-volume session isn't squashed by the prior session's peaks. Live
+  overnight: Alpaca's websocket doesn't stream the overnight session, so
+  20:00–04:00 ET the chart, volume, and last price are kept live by
+  polling the BOATS REST feed every 2 s.
 - **Resilient.** WebSocket auto-reconnect with REST backfill, state
   reconciliation on startup and reconnect, client order IDs for
   idempotency, keypress→ack latency (p50/p99) in the status bar.

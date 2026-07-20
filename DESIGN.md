@@ -115,6 +115,22 @@ the replay touches only the sub-minute series, never the 1m+ bars or
 the live session VWAP. A reconnect triggers a backfill so sequence gaps
 are healed from REST rather than interpolated.
 
+Alpaca's market-data websocket (SIP) does not stream overnight
+(20:00–04:00 ET) prints; overnight data exists only on the REST BOATS
+feed. During the Overnight session a poller fetches BOATS trades every
+2 s and folds new prints through `Aggregator.OnTrade` exactly like live
+tape — the forming candle updates in place, new candles roll on bucket
+boundaries, and volume / last price / session VWAP advance. Each tick
+also refreshes the NBBO cache from the BOATS latest-quote endpoint so
+extended-hours order pricing has a live quote overnight (without it the
+quote cache is empty all session and pricing falls back to a often-stale
+last trade). A high-water timestamp cursor plus a bounded trade-ID
+dedupe set prevents double application across polls; the backfill
+publishes its fetch end time as a shared cursor so polled prints never
+overlap trades that Load / ReplayTrades already applied. Outside
+Overnight the poller idles (SIP streams the other sessions; BOATS covers
+only overnight).
+
 ### 6. Indicators
 
 Two EMAs (fast/slow, configurable periods) update per bar close per

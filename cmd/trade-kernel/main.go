@@ -195,6 +195,10 @@ func main() {
 		backfillMu  sync.Mutex
 		backfillGen atomic.Uint64
 	)
+	// liveCursor holds the end time (time.Time) of the most recent
+	// backfill. The overnight poller reads it so it never re-applies
+	// trades that Load / ReplayTrades already folded into the aggregator.
+	liveCursor := &atomic.Value{}
 	runBackfill := func(symbol string, gen uint64) {
 		backfillMu.Lock()
 		defer backfillMu.Unlock()
@@ -204,7 +208,7 @@ func main() {
 		if activeSymbol.Load().(string) != symbol {
 			return
 		}
-		if err := backfill(context.Background(), rest, agg, symbol); err != nil {
+		if err := backfill(context.Background(), rest, agg, symbol, liveCursor); err != nil {
 			log.Printf("backfill %s: %v", symbol, err)
 		}
 	}
@@ -237,6 +241,21 @@ func main() {
 	mws.OnError = func(err error) { log.Printf("market ws: %v", err) }
 	_ = mws.SetSymbol(cfg.DefaultSymbol)
 	go mws.Run(ctx)
+
+	// --- Overnight live data ---
+	// The SIP websocket does not stream overnight (20:00–04:00 ET) prints;
+	// poll the BOATS REST trades endpoint during Overnight instead so the
+	// forming candle, new candles, volume, and the last price keep updating.
+	onFeed := newOvernightFeed(agg, sessions,
+		func() string { return activeSymbol.Load().(string) },
+		func(ctx context.Context, symbol string, start, end time.Time, limit int) ([]alpaca.Trade, error) {
+			return rest.Trades(ctx, symbol, start, end, limit, "boats")
+		},
+		func(ctx context.Context, symbol string) (alpaca.Quote, error) {
+			return rest.LatestQuote(ctx, symbol, "boats")
+		},
+		liveCursor)
+	go onFeed.run(ctx)
 
 	// --- Trading stream ---
 	tws := alpaca.NewTradingWS(cfg.APIKeyID, cfg.APISecretKey, !cfg.Live())
@@ -273,7 +292,7 @@ func main() {
 		if backfillGen.Load() != gen {
 			return nil
 		}
-		if err := backfill(context.Background(), rest, agg, symbol); err != nil {
+		if err := backfill(context.Background(), rest, agg, symbol, liveCursor); err != nil {
 			return err
 		}
 		prefetchElig(symbol)
@@ -310,7 +329,11 @@ func main() {
 // 24/5 coverage: SIP feed supplies regular + pre/after-hours bars; BOATS
 // feed supplies the overnight session (20:00–04:00 ET). The two series are
 // merged by timestamp so the chart shows the full trading day.
-func backfill(ctx context.Context, rest *alpaca.REST, agg *bars.Aggregator, symbol string) error {
+//
+// liveCursor (when non-nil) receives the fetch end time once the trades
+// replay has landed; the overnight poller uses it as a high-water mark so
+// it never re-applies trades already folded into the aggregator here.
+func backfill(ctx context.Context, rest *alpaca.REST, agg *bars.Aggregator, symbol string, liveCursor *atomic.Value) error {
 	windows := []struct {
 		tf       bars.TF
 		api      string
@@ -369,11 +392,16 @@ func backfill(ctx context.Context, rest *alpaca.REST, agg *bars.Aggregator, symb
 	}
 
 	// Sub-minute TFs: replay recent trades through the aggregator so 1s/5s/15s
-	// charts aren't blank at startup / on symbol switch. Anchor the window to
-	// the newest backfilled 1m bar's time (a real trading time) rather than
-	// time.Now() — otherwise a launch outside market hours (weekend, holiday,
-	// pre-market) fetches an empty window and sub-minute charts stay blank.
+	// charts aren't blank at startup / on symbol switch. Anchor the window
+	// start to the newest backfilled 1m bar's time (a real trading time)
+	// rather than time.Now() — otherwise a launch outside market hours
+	// (weekend, holiday, pre-market) fetches an empty window and sub-minute
+	// charts stay blank. The window ends at now so the partial current
+	// minute's prints also land in the sub-minute rings; trades only exist
+	// up to the last print, so a far-future end costs nothing.
 	// SIP + BOATS (soft-fail boats) for overnight 24/5 coverage.
+	// Page limit 2000 keeps each response well under the 1 MB read cap —
+	// 30 min of an active symbol at 10000/page overflows it.
 	tradesCtx, tradesCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer tradesCancel()
 	trLookback := 30 * time.Minute
@@ -382,14 +410,14 @@ func backfill(ctx context.Context, rest *alpaca.REST, agg *bars.Aggregator, symb
 		anchor = last
 	}
 	startTr := anchor.Add(-trLookback)
-	sipTr, errSIP := rest.Trades(tradesCtx, symbol, startTr, anchor, 10000, "sip")
+	sipTr, errSIP := rest.Trades(tradesCtx, symbol, startTr, end, 2000, "sip")
 	if errSIP != nil {
 		log.Printf("backfill trades %s sip: %v", symbol, errSIP)
 		if firstErr == nil {
 			firstErr = errSIP
 		}
 	}
-	boatsTr, errBoats := rest.Trades(tradesCtx, symbol, startTr, anchor, 10000, "boats")
+	boatsTr, errBoats := rest.Trades(tradesCtx, symbol, startTr, end, 2000, "boats")
 	if errBoats != nil {
 		log.Printf("backfill trades %s boats (overnight): %v", symbol, errBoats)
 	}
@@ -403,5 +431,12 @@ func backfill(ctx context.Context, rest *alpaca.REST, agg *bars.Aggregator, symb
 		}
 	}
 	agg.ReplayTrades(replay)
+	// Publish the high-water mark for the overnight poller: trades at or
+	// before end are now reflected in the aggregator (bars Load covers the
+	// current partial minute; replay covers the sub-minute rings), so the
+	// poller must only apply strictly newer prints.
+	if liveCursor != nil {
+		liveCursor.Store(end)
+	}
 	return firstErr
 }

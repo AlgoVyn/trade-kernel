@@ -123,3 +123,27 @@ func TestTradeUpdateOptionalPositionQty(t *testing.T) {
 		t.Fatal("empty-string position_qty should be invalid")
 	}
 }
+
+func TestAssetIsOvernightTradable(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want bool
+	}{
+		// Current Alpaca shape: eligibility via the attributes array only.
+		{"attributes array", `{"symbol":"SOXL","tradable":true,"attributes":["fractional_eh_enabled","has_options","overnight_tradable"]}`, true},
+		{"attributes array without overnight", `{"symbol":"XYZ","tradable":true,"attributes":["has_options"]}`, false},
+		// Legacy top-level flag still honored if it ever appears alone.
+		{"legacy top-level flag", `{"symbol":"ABC","tradable":true,"overnight_tradable":true}`, true},
+		{"legacy flag false, no attributes", `{"symbol":"ABC","tradable":true,"overnight_tradable":false}`, false},
+	}
+	for _, c := range cases {
+		var a Asset
+		if err := json.Unmarshal([]byte(c.json), &a); err != nil {
+			t.Fatalf("%s: unmarshal: %v", c.name, err)
+		}
+		if got := a.IsOvernightTradable(); got != c.want {
+			t.Errorf("%s: IsOvernightTradable = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

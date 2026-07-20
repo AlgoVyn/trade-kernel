@@ -240,3 +240,33 @@ func TestEligibilityCacheExpiry(t *testing.T) {
 		t.Fatalf("asset hits = %d, want 2 after TTL expiry", hits.Load())
 	}
 }
+
+// TestEligibilityAttributesArray: eligibility from the attributes array
+// (the shape Alpaca actually returns today — no top-level boolean).
+func TestEligibilityAttributesArray(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v2/assets/SOXL":
+			_, _ = w.Write([]byte(`{"symbol":"SOXL","tradable":true,"attributes":["fractional_eh_enabled","has_options","overnight_tradable"]}`))
+		case "/v2/assets/XYZ":
+			_, _ = w.Write([]byte(`{"symbol":"XYZ","tradable":true,"attributes":["has_options"]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	rest := alpaca.NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	cache := NewEligibilityCache(rest)
+
+	ok, err := cache.OvernightTradable(context.Background(), "SOXL")
+	if err != nil || !ok {
+		t.Fatalf("SOXL: ok=%v err=%v, want true (overnight_tradable attribute)", ok, err)
+	}
+	ok, err = cache.OvernightTradable(context.Background(), "XYZ")
+	if err != nil || ok {
+		t.Fatalf("XYZ: ok=%v err=%v, want false (attribute absent)", ok, err)
+	}
+}

@@ -145,12 +145,32 @@ type Clock struct {
 
 // Asset is the /v2/assets/{symbol} response (subset).
 type Asset struct {
-	Symbol            string `json:"symbol"`
-	Status            string `json:"status"`
-	Tradable          bool   `json:"tradable"`
-	Shortable         bool   `json:"shortable"`
-	Fractionable      bool   `json:"fractionable"`
-	OvernightTradable bool   `json:"overnight_tradable"`
+	Symbol       string   `json:"symbol"`
+	Status       string   `json:"status"`
+	Tradable     bool     `json:"tradable"`
+	Shortable    bool     `json:"shortable"`
+	Fractionable bool     `json:"fractionable"`
+	Attributes   []string `json:"attributes"`
+	// OvernightTradable is the legacy top-level flag. Current Alpaca
+	// responses do not send it; overnight eligibility is conveyed via the
+	// attributes array (see IsOvernightTradable).
+	OvernightTradable bool `json:"overnight_tradable"`
+}
+
+// IsOvernightTradable reports whether the asset may trade in the overnight
+// session (20:00–04:00 ET). Alpaca signals this with "overnight_tradable"
+// in the attributes array; the legacy top-level boolean is honored as a
+// fallback in case either form appears alone.
+func (a Asset) IsOvernightTradable() bool {
+	if a.OvernightTradable {
+		return true
+	}
+	for _, attr := range a.Attributes {
+		if attr == "overnight_tradable" {
+			return true
+		}
+	}
+	return false
 }
 
 // Bar is a single OHLCV bar from the market-data API.
