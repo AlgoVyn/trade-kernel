@@ -292,7 +292,7 @@ func TestCancelActiveSymbolOnly(t *testing.T) {
 func TestInfoBarShowsDayWeekPnL(t *testing.T) {
 	d, _, st, _ := testDeps(t)
 	// +1500 equity day, +200 open intraday mark → day +1300.
-	// Week raw +3200 − total open unrealized 500 → +2700.
+	// Week base 100000, equity 101500, window strip 500 → +1000.
 	st.Reconcile(
 		alpaca.Account{Equity: 101500, LastEquity: 100000, Cash: 50000, BuyingPower: 200000},
 		[]alpaca.Position{{
@@ -301,14 +301,14 @@ func TestInfoBarShowsDayWeekPnL(t *testing.T) {
 		}},
 		nil,
 	)
-	st.SetWeekPnL(3200)
+	st.SetWeekPnL(100000, 500)
 	m := NewModel(d)
 	m.width = 160
 	row1, _ := m.buildInfoBarRows(160, st.Snapshot(), bars.MarketSnapshot{})
 	if !strings.Contains(row1, "day") || !strings.Contains(row1, "+1.3k") {
 		t.Fatalf("row1 missing day PnL: %q", row1)
 	}
-	if !strings.Contains(row1, "wk") || !strings.Contains(row1, "+2.7k") {
+	if !strings.Contains(row1, "wk") || !strings.Contains(row1, "+1.0k") {
 		t.Fatalf("row1 missing week PnL: %q", row1)
 	}
 }

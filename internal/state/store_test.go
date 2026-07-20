@@ -353,11 +353,12 @@ func TestReconcileDayPnLRealizedOnly(t *testing.T) {
 	if !p.HasDay || p.Day != 1300 {
 		t.Fatalf("day realized = %+v, want HasDay Day=1300", p)
 	}
-	s.SetWeekPnL(3200)
+	// Week base 100000, window-accrued unrealized strip 500, equity 101500
+	// at refresh → (101500 − 100000) − 500 = 1000.
+	s.SetWeekPnL(100000, 500)
 	p = s.PnL()
-	// Week raw 3200 − total open unrealized 500 → 2700 (multi-day marks stripped).
-	if !p.HasWeek || p.Week != 2700 {
-		t.Fatalf("week realized = %+v, want 2700", p)
+	if !p.HasWeek || p.Week != 1000 {
+		t.Fatalf("week realized = %+v, want 1000", p)
 	}
 }
 
@@ -368,7 +369,7 @@ func TestPnLIgnoresFillZeroedUnrealized(t *testing.T) {
 		[]alpaca.Position{{Symbol: "AAPL", Qty: 10, Side: "long", UnrealizedIntradayPL: 200, UnrealizedPL: 500, AvgEntryPrice: 100}},
 		nil,
 	)
-	s.SetWeekPnL(3200)
+	s.SetWeekPnL(100000, 500)
 	// Scale-in fill rebuilds position without mark fields (zeros).
 	s.ApplyUpdate(alpaca.TradeUpdate{
 		Event: "fill",
@@ -384,18 +385,19 @@ func TestPnLIgnoresFillZeroedUnrealized(t *testing.T) {
 	if !p.HasDay || p.Day != 1300 {
 		t.Fatalf("day must stay snapshotted after fill: %+v", p)
 	}
-	if !p.HasWeek || p.Week != 2700 {
+	if !p.HasWeek || p.Week != 1000 {
 		t.Fatalf("week must stay snapshotted after fill: %+v", p)
 	}
 }
 
-// TestSetWeekPnLUsesRESTMarkSnap: week history refresh after a WS fill that
-// zeroed mark fields must still strip the last REST open-unrealized snap.
-func TestSetWeekPnLUsesRESTMarkSnap(t *testing.T) {
+// TestRefreshWeekPnLUsesRESTPositions: week history refresh after a WS fill
+// that zeroed mark fields must still price the strip off the last REST
+// positions copy, not the WS-zeroed live map.
+func TestRefreshWeekPnLUsesRESTPositions(t *testing.T) {
 	s := NewStore()
 	s.Reconcile(
 		alpaca.Account{Equity: 101500, LastEquity: 100000},
-		[]alpaca.Position{{Symbol: "AAPL", Qty: 10, Side: "long", UnrealizedIntradayPL: 200, UnrealizedPL: 500, AvgEntryPrice: 100}},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 10, Side: "long", MarketValue: 1050, AvgEntryPrice: 100}},
 		nil,
 	)
 	// Fill zeros mark fields on the live positions map.
@@ -409,11 +411,23 @@ func TestSetWeekPnLUsesRESTMarkSnap(t *testing.T) {
 		Qty:         5,
 		PositionQty: qty(15),
 	})
-	// Week refresh lands in the WS-zeroed window (no Reconcile yet).
-	s.SetWeekPnL(3200)
+	// Week refresh lands in the WS-zeroed window (no Reconcile yet). The
+	// strip must use the REST copy: mark_now 105 (mv 1050 / qty 10), not 0.
+	windowStart := time.Now()
+	r := fakeRefresher{
+		hist: alpaca.PortfolioHistory{
+			Timestamp: []int64{windowStart.Unix()},
+			BaseValue: 100000,
+		},
+		bars: []alpaca.Bar{{Close: 100}},
+	}
+	if err := s.RefreshWeekPnL(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	// Week = (101500 − 100000) − 10×(105 − 100) = 1500 − 50 = 1450.
 	p := s.PnL()
-	if !p.HasWeek || p.Week != 2700 {
-		t.Fatalf("week must use REST mark snap not WS-zeroed map: %+v, want Week=2700", p)
+	if !p.HasWeek || p.Week != 1450 {
+		t.Fatalf("week must use REST positions copy not WS-zeroed map: %+v, want Week=1450", p)
 	}
 }
 
@@ -438,6 +452,8 @@ type fakeRefresher struct {
 	ord     []alpaca.Order
 	hist    alpaca.PortfolioHistory
 	histErr error
+	bars    []alpaca.Bar
+	barsErr error
 }
 
 func (f fakeRefresher) Account(context.Context) (alpaca.Account, error) { return f.acct, nil }
@@ -449,6 +465,9 @@ func (f fakeRefresher) OpenOrders(context.Context, string) ([]alpaca.Order, erro
 }
 func (f fakeRefresher) PortfolioHistory(context.Context, string, string) (alpaca.PortfolioHistory, error) {
 	return f.hist, f.histErr
+}
+func (f fakeRefresher) Bars(context.Context, string, string, time.Time, time.Time, int, string) ([]alpaca.Bar, error) {
+	return f.bars, f.barsErr
 }
 
 func TestRefreshDayPnLFromAccount(t *testing.T) {
@@ -472,13 +491,17 @@ func TestRefreshDayPnLFromAccount(t *testing.T) {
 func TestRefreshWeekPnLFromHistory(t *testing.T) {
 	s := NewStore()
 	var hist alpaca.PortfolioHistory
-	if err := json.Unmarshal([]byte(`{"profit_loss":["0","800","2500"],"base_value":"100000"}`), &hist); err != nil {
+	if err := json.Unmarshal([]byte(`{"timestamp":[1700000000],"base_value":"100000"}`), &hist); err != nil {
 		t.Fatal(err)
 	}
 	r := fakeRefresher{
 		acct: alpaca.Account{Equity: 102000, LastEquity: 100000},
-		pos:  []alpaca.Position{{Symbol: "AAPL", Qty: 10, Side: "long", UnrealizedPL: 400, UnrealizedIntradayPL: 100}},
+		pos: []alpaca.Position{{
+			Symbol: "AAPL", Qty: 10, Side: "long", MarketValue: 1040,
+			UnrealizedPL: 400, UnrealizedIntradayPL: 100,
+		}},
 		hist: hist,
+		bars: []alpaca.Bar{{Close: 100}}, // window-start daily close
 	}
 	if err := s.Refresh(context.Background(), r); err != nil {
 		t.Fatal(err)
@@ -490,16 +513,52 @@ func TestRefreshWeekPnLFromHistory(t *testing.T) {
 	if !p.HasDay || p.Day != 1900 { // 2000 − 100 open intraday
 		t.Fatalf("day = %+v, want Day=1900", p)
 	}
-	// Week 2500 − total open unrealized 400.
-	if !p.HasWeek || p.Week != 2100 {
-		t.Fatalf("week = %+v, want 2100", p)
+	// Week = (102000 − 100000) − 10×(104 − 100) = 2000 − 40 = 1960. Only the
+	// mark movement inside the window is stripped, not lifetime unrealized.
+	if !p.HasWeek || p.Week != 1960 {
+		t.Fatalf("week = %+v, want 1960", p)
+	}
+}
+
+// TestRefreshWeekPnLStripsOnlyWindowMarks: a large lifetime unrealized from
+// before the window must not leak into the week figure (the −415k bug).
+func TestRefreshWeekPnLStripsOnlyWindowMarks(t *testing.T) {
+	s := NewStore()
+	s.Reconcile(
+		alpaca.Account{Equity: 754648.45, LastEquity: 753252.22},
+		// Long held for months: avg 17.97, lifetime uPL +391k, but the mark
+		// only moved 67.87 − 66.00 inside the week window.
+		[]alpaca.Position{{
+			Symbol: "TQQQ", Qty: 7840, Side: "long",
+			MarketValue: 532100.8, AvgEntryPrice: 17.972232, UnrealizedPL: 391198.5,
+		}},
+		nil,
+	)
+	r := fakeRefresher{
+		hist: alpaca.PortfolioHistory{
+			Timestamp: []int64{time.Now().Unix()},
+			BaseValue: 822061.41,
+		},
+		bars: []alpaca.Bar{{Close: 66.00}},
+	}
+	if err := s.RefreshWeekPnL(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	p := s.PnL()
+	if !p.HasWeek {
+		t.Fatal("week must be set")
+	}
+	// (754648.45 − 822061.41) − 7840×(532100.8/7840 − 66) ≈ −67412.96 − 14660.8.
+	want := (754648.45 - 822061.41) - 7840*(532100.8/7840-66.00)
+	if math.Abs(p.Week-want) > 0.01 {
+		t.Fatalf("week = %v, want %v (lifetime unrealized must not be stripped)", p.Week, want)
 	}
 }
 
 func TestRefreshWeekPnLErrorKeepsPriorSample(t *testing.T) {
 	s := NewStore()
 	s.Reconcile(alpaca.Account{Equity: 102000, LastEquity: 100000}, nil, nil)
-	s.SetWeekPnL(2500)
+	s.SetWeekPnL(100000, 0)
 	if !s.PnL().HasWeek {
 		t.Fatal("setup: want week set")
 	}
@@ -509,7 +568,7 @@ func TestRefreshWeekPnLErrorKeepsPriorSample(t *testing.T) {
 	}
 	p := s.PnL()
 	// Transient error must not wipe a recent good sample (TTL handles freeze).
-	if !p.HasWeek || p.Week != 2500 {
+	if !p.HasWeek || p.Week != 2000 {
 		t.Fatalf("history error must keep prior week: %+v", p)
 	}
 	if !p.HasDay || p.Day != 2000 {
@@ -519,7 +578,7 @@ func TestRefreshWeekPnLErrorKeepsPriorSample(t *testing.T) {
 
 func TestRefreshWeekPnLEmptySeriesClearsWeek(t *testing.T) {
 	s := NewStore()
-	s.SetWeekPnL(2500)
+	s.SetWeekPnL(100000, 0)
 	r := fakeRefresher{hist: alpaca.PortfolioHistory{}} // no profit_loss / equity
 	if err := s.RefreshWeekPnL(context.Background(), r); err != nil {
 		t.Fatal(err)
@@ -531,7 +590,7 @@ func TestRefreshWeekPnLEmptySeriesClearsWeek(t *testing.T) {
 
 func TestWeekPnLStaleHidden(t *testing.T) {
 	s := NewStore()
-	s.SetWeekPnL(1000)
+	s.SetWeekPnL(100000, 0)
 	s.mu.Lock()
 	s.weekUpdatedAt = time.Now().Add(-weekPnLStaleAfter - time.Minute)
 	s.mu.Unlock()

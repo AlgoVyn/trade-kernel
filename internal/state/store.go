@@ -7,6 +7,8 @@ package state
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -92,14 +94,17 @@ func (b BookSnapshot) ActiveOrders(symbol string) []alpaca.Order {
 // AccountPnL is cached day/week account profit-and-loss with open marks// stripped at the last REST snapshot (not recomputed from live WS positions).
 //
 //	Day  = (equity − last_equity) − Σ unrealized_intraday_pl
-//	Week = portfolio-history PnL − Σ unrealized_pl (total vs cost)
+//	Week = (equity − week base_value) − Σ signedQty × (mark_now − mark_week_start)
 //
-// Day is realized since prior close (intraday open marks only). Week strips
-// all current open MTM so multi-day holds do not dominate the 1W curve; if a
-// position was already open at the period start with prior unrealized, that
-// start-of-period mark is also removed (conservative understate). Figures
-// move on REST reconcile / history refresh, not on quote drift or fill
-// rewrites of position mark fields.
+// Day is realized since prior close (intraday open marks only). Week is
+// realized over the trailing 1W portfolio-history window: the equity change
+// across the window minus the unrealized that accrued inside it (per-position
+// mark movement from the window-start daily close, at current size). It never
+// subtracts lifetime unrealized vs cost — gains earned before the window are
+// not this week's. Positions whose qty changed inside the window are
+// approximated at current size (bounded error, sane sign). Figures move on
+// REST reconcile / history refresh, not on quote drift or fill rewrites of
+// position mark fields.
 type AccountPnL struct {
 	Day     float64
 	Week    float64
@@ -126,11 +131,18 @@ type Store struct {
 	dayChange        float64
 	openIntradaySnap float64
 	hasDayPnL        bool
-	// Week: raw history PnL and total-open-unrealized snap from SetWeekPnL.
-	weekChange          float64
-	openTotalUnrealSnap float64
-	hasWeekPnL          bool
-	weekUpdatedAt       time.Time
+	// Week: portfolio-history window base equity, equity at refresh, and
+	// the window-accrued unrealized strip — all snapshotted at SetWeekPnL.
+	weekBase      float64
+	weekEquity    float64
+	weekStrip     float64
+	hasWeekPnL    bool
+	weekUpdatedAt time.Time
+	// restPositions is a copy of the positions map as of the last
+	// Reconcile. RefreshWeekPnL prices the week strip from it rather than
+	// the live map so a WS fill that zeroes mark fields between reconciles
+	// cannot corrupt the strip.
+	restPositions []alpaca.Position
 }
 
 // NewStore creates an empty Store.
@@ -143,9 +155,9 @@ func NewStore() *Store {
 
 // Reconcile replaces the store with a fresh REST snapshot.
 // Day equity change and open mark sums are snapshotted here so PnL() does
-// not re-read mark fields that WebSocket fills zero out. Week total-open
-// unrealized is also refreshed from REST so RefreshWeekPnL never pairs
-// history with a WS-zeroed positions map.
+// not re-read mark fields that WebSocket fills zero out. The REST positions
+// are also kept as a separate copy so RefreshWeekPnL never pairs history
+// with a WS-zeroed positions map.
 func (s *Store) Reconcile(acct alpaca.Account, positions []alpaca.Position, orders []alpaca.Order) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -156,12 +168,11 @@ func (s *Store) Reconcile(acct alpaca.Account, positions []alpaca.Position, orde
 	for _, p := range positions {
 		s.positions[p.Symbol] = p
 	}
+	s.restPositions = append([]alpaca.Position(nil), positions...)
 	s.orders = make(map[string]alpaca.Order, len(orders))
 	for _, o := range orders {
 		s.orders[o.ID] = o
 	}
-	// Total open unrealized from REST positions (week strip); never from WS fills.
-	s.openTotalUnrealSnap = openTotalUnrealized(s.positions)
 	// Raw day equity change (realized + open intraday marks) + snap for strip.
 	if float64(acct.LastEquity) > 0 {
 		s.dayChange = float64(acct.Equity) - float64(acct.LastEquity)
@@ -403,7 +414,7 @@ func (s *Store) Snapshot() BookSnapshot {
 		if !s.weekUpdatedAt.IsZero() && time.Since(s.weekUpdatedAt) > weekPnLStaleAfter {
 			out.PnL.HasWeek = false
 		} else {
-			out.PnL.Week = s.weekChange - s.openTotalUnrealSnap
+			out.PnL.Week = (s.weekEquity - s.weekBase) - s.weekStrip
 		}
 	}
 	return out
@@ -464,14 +475,6 @@ func openIntradayUnrealized(positions map[string]alpaca.Position) float64 {
 	return u
 }
 
-func openTotalUnrealized(positions map[string]alpaca.Position) float64 {
-	var u float64
-	for _, p := range positions {
-		u += float64(p.UnrealizedPL)
-	}
-	return u
-}
-
 // PnL returns day/week account PnL with open marks stripped using the
 // snapshots taken at the last REST reconcile / week history refresh.
 func (s *Store) PnL() AccountPnL {
@@ -485,29 +488,33 @@ func (s *Store) PnL() AccountPnL {
 		if !s.weekUpdatedAt.IsZero() && time.Since(s.weekUpdatedAt) > weekPnLStaleAfter {
 			out.HasWeek = false
 		} else {
-			out.Week = s.weekChange - s.openTotalUnrealSnap
+			out.Week = (s.weekEquity - s.weekBase) - s.weekStrip
 		}
 	}
 	return out
 }
 
-// SetWeekPnL stores the raw week equity change from portfolio history.
-// Open-mark stripping uses openTotalUnrealSnap from the last Reconcile
-// (REST positions), not the live map — WS fill rewrites can zero mark
-// fields between reconciles. Prefer calling after a successful Refresh.
-func (s *Store) SetWeekPnL(v float64) {
+// SetWeekPnL snapshots the week computation inputs: the portfolio-history
+// window base equity, the account equity at refresh time, and the
+// window-accrued unrealized strip. Snapshotting equity here (rather than
+// reading it in PnL) keeps the figure frozen between history refreshes and
+// immune to WS fill rewrites of account fields.
+func (s *Store) SetWeekPnL(base, strip float64) {
 	s.mu.Lock()
-	s.weekChange = v
+	s.weekBase = base
+	s.weekStrip = strip
+	s.weekEquity = float64(s.account.Equity)
 	s.hasWeekPnL = true
 	s.weekUpdatedAt = time.Now()
 	s.mu.Unlock()
 }
 
 // ClearWeekPnL hides week PnL (history failure or empty series).
-// Leaves openTotalUnrealSnap intact — it is owned by Reconcile.
 func (s *Store) ClearWeekPnL() {
 	s.mu.Lock()
-	s.weekChange = 0
+	s.weekBase = 0
+	s.weekEquity = 0
+	s.weekStrip = 0
 	s.hasWeekPnL = false
 	s.weekUpdatedAt = time.Time{}
 	s.mu.Unlock()
@@ -520,9 +527,11 @@ type Refresher interface {
 	OpenOrders(ctx context.Context, symbol string) ([]alpaca.Order, error)
 }
 
-// PnLRefresher supplies week PnL (portfolio history).
+// PnLRefresher supplies week PnL (portfolio history) plus the daily bars
+// used to price the window-start marks of open positions.
 type PnLRefresher interface {
 	PortfolioHistory(ctx context.Context, period, timeframe string) (alpaca.PortfolioHistory, error)
+	Bars(ctx context.Context, symbol, timeframe string, start, end time.Time, limit int, feed string) ([]alpaca.Bar, error)
 }
 
 // Refresh pulls account/positions/orders from REST into the store.
@@ -546,19 +555,80 @@ func (s *Store) Refresh(ctx context.Context, r Refresher) error {
 }
 
 // RefreshWeekPnL updates week PnL from portfolio history (1W / 1D).
-// Transient history errors leave the prior sample in place; PnL() hides
-// week when the last successful sample is older than weekPnLStaleAfter.
-// An empty series clears week (no data to show). Day reconcile is unaffected.
+//
+// Week is realized-only over the trailing history window:
+//
+//	Week = (equity_now − base_value) − Σ signedQty × (mark_now − mark_window_start)
+//
+// base_value is the window-start equity from Alpaca; mark_window_start is
+// each held symbol's last daily close before the window (fetched from the
+// 1Day bars endpoint). Only the unrealized that accrued *inside* the window
+// is stripped — subtracting lifetime unrealized vs cost (the old behavior)
+// double-counted prior weeks' gains and could dwarf the week's figure.
+// Positions whose qty changed inside the window are approximated at current
+// size. Positions are read from the last REST reconcile copy, never the
+// live map (WS fills zero mark fields).
+//
+// Transient errors (history, marks, unreconciled account) leave the prior
+// sample in place; PnL() hides week when the last successful sample is
+// older than weekPnLStaleAfter. An empty series clears week (no data to
+// show). Day reconcile is unaffected.
 func (s *Store) RefreshWeekPnL(ctx context.Context, r PnLRefresher) error {
 	h, err := r.PortfolioHistory(ctx, "1W", "1D")
 	if err != nil {
 		return err
 	}
-	v, ok := h.LatestPnL()
-	if !ok {
+	base := float64(h.BaseValue)
+	if len(h.Timestamp) == 0 || base == 0 {
 		s.ClearWeekPnL()
 		return nil
 	}
-	s.SetWeekPnL(v)
+	windowStart := time.Unix(h.Timestamp[0], 0)
+
+	s.mu.RLock()
+	positions := make([]alpaca.Position, len(s.restPositions))
+	copy(positions, s.restPositions)
+	reconciled := s.reconciled
+	equity := float64(s.account.Equity)
+	s.mu.RUnlock()
+	if !reconciled || equity <= 0 {
+		return fmt.Errorf("week pnl: no reconciled account snapshot yet")
+	}
+
+	// Window-start marks: base_value is the equity mark one trading day
+	// before the first daily sample, so the matching price mark is the
+	// last daily close before that day. Ending the bar fetch 24h before
+	// the first sample lands on (or before) that prior trading day across
+	// weekends and holidays.
+	barsEnd := windowStart.Add(-24 * time.Hour)
+	barsStart := windowStart.Add(-14 * 24 * time.Hour)
+	var strip float64
+	for _, p := range positions {
+		qty := float64(p.Qty)
+		if qty <= 0 {
+			continue
+		}
+		markNow := math.Abs(float64(p.MarketValue)) / qty
+		if markNow <= 0 {
+			return fmt.Errorf("week pnl: %s missing market value", p.Symbol)
+		}
+		bars, err := r.Bars(ctx, p.Symbol, "1Day", barsStart, barsEnd, 10, "sip")
+		if err != nil {
+			return fmt.Errorf("week pnl: %s window-start bars: %w", p.Symbol, err)
+		}
+		if len(bars) == 0 {
+			return fmt.Errorf("week pnl: %s: no daily bars before window start", p.Symbol)
+		}
+		markStart := float64(bars[len(bars)-1].Close)
+		if markStart <= 0 {
+			return fmt.Errorf("week pnl: %s: non-positive window-start close", p.Symbol)
+		}
+		signed := qty
+		if p.Side == "short" {
+			signed = -qty
+		}
+		strip += signed * (markNow - markStart)
+	}
+	s.SetWeekPnL(base, strip)
 	return nil
 }
