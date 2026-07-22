@@ -500,8 +500,9 @@ func (m *Model) cycleIndicators() {
 }
 
 // chartWidth returns how many bars fit in the candle plot (excluding the
-// right-side price axis gutter). Accounts for barStride spacing. Mirrors
-// the layout math in View() so pan/focus steps match what is painted.
+// right-side price axis gutter). Accounts for barStride spacing and the
+// optional chart.bars_visible cap. Mirrors the layout math in View() so
+// pan/focus steps match what is painted.
 func (m *Model) chartWidth() int {
 	axisW := priceAxisWidth
 	// Drop the price axis when the window is too narrow to host it.
@@ -512,7 +513,13 @@ func (m *Model) chartWidth() int {
 	if w < 1 {
 		w = 1
 	}
-	return maxBars(w)
+	n := maxBars(w)
+	if m.d.Cfg != nil {
+		if cap := m.d.Cfg.Chart.BarsVisible; cap > 0 && n > cap {
+			n = cap
+		}
+	}
+	return n
 }
 
 // pan shifts the chart view through history. dir < 0 pans back to older
@@ -1053,14 +1060,9 @@ func (m *Model) View() string {
 	// leftCrop narrows the window from the left (focus mode): bars cluster at
 	// the live edge and the blank left region lets volume/price scale rebase
 	// onto the recent window. barCol right-aligns so fewer bars = blank left.
-	// chart.bars_visible caps painted bars (Validate defaults omit/≤0 → 120).
-	// When the cap is below the width-fit count, the left gutter stays blank.
-	nBars := maxBars(plotW) - m.leftCrop
-	if m.d.Cfg != nil {
-		if cap := m.d.Cfg.Chart.BarsVisible; cap > 0 && nBars > cap {
-			nBars = cap
-		}
-	}
+	// chart.bars_visible (when >0) caps width-fit count before leftCrop; 0 = no cap.
+	// Cap applied first so focus still trims from that window (not ignored).
+	nBars := m.chartWidth() - m.leftCrop
 	if nBars < 1 {
 		nBars = 1
 	}

@@ -75,7 +75,9 @@ type Chart struct {
 	// Change at runtime with :tf <resolution>.
 	Timeframe string `yaml:"timeframe"`
 	// BarsVisible optionally caps how many bars the chart paints (CPU/history).
-	// When ≤0 after Validate, defaults to 120. The UI uses min(width-fit, BarsVisible).
+	// 0 or omit = fill the full chart width (no cap). Positive N = paint at most
+	// min(width-fit, N); when N is below the width-fit count the left gutter is blank.
+	// Use focus mode ([ / ] or :focus) for intentional left cropping without a hard cap.
 	BarsVisible    int  `yaml:"bars_visible"`
 	SessionShading bool `yaml:"session_shading"`
 	// TickMS is the base UI render interval in milliseconds (default 50).
@@ -166,8 +168,10 @@ func (c *Config) Validate() error {
 	} else if _, ok := bars.ParseChartTF(c.Chart.Timeframe); !ok {
 		return fmt.Errorf("chart.timeframe %q is invalid (use 1s|5s|15s|1m|5m|15m|1h|1d or a custom duration like 2m, 30s, 4h)", c.Chart.Timeframe)
 	}
-	if c.Chart.BarsVisible <= 0 {
-		c.Chart.BarsVisible = 120
+	// BarsVisible ≤0 stays 0: UI treats that as "no cap" (fill width).
+	// Reject absurd positives so a typo cannot request millions of bars.
+	if c.Chart.BarsVisible < 0 {
+		return fmt.Errorf("chart.bars_visible must be >= 0 (0 = fill width, got %d)", c.Chart.BarsVisible)
 	}
 	if c.Chart.TickMS == 0 {
 		c.Chart.TickMS = 50

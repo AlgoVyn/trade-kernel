@@ -46,9 +46,10 @@ chart:
   # Initial resolution: built-ins 1s|5s|15s|1m|5m|15m|1h|1d, or a custom
   # duration like 2m, 3m, 30s, 4h. Change at runtime with :tf 2m
   timeframe: 1m
-  # Optional max bars painted (CPU/history cap). Omit or ≤0 → default 120.
-  # Values below the width-fit count leave a blank left gutter.
-  bars_visible: 120
+  # Optional max bars painted (CPU/history cap). Omit or 0 → fill full width.
+  # Positive N caps at min(width-fit, N); below width-fit leaves a blank left
+  # gutter. Prefer [ / ] or :focus for intentional cropping without a hard cap.
+  # bars_visible: 0
   session_shading: true
   tick_ms: 50               # base UI refresh (16–500). Short TFs speed up to 33ms
                             # when base is higher; panned/closed slow to ≥100ms.

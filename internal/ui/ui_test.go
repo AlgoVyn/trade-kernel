@@ -54,7 +54,7 @@ func testDeps(t *testing.T) (Deps, *fakeExec, *state.Store, *bars.Aggregator) {
 	t.Helper()
 	cfg := &config.Config{
 		SizePresets: []int{100, 250},
-		Chart:       config.Chart{Timeframe: "1m", BarsVisible: 60},
+		Chart:       config.Chart{Timeframe: "1m"}, // BarsVisible 0 = fill width
 	}
 	fx := &fakeExec{}
 	agg := bars.NewAggregator(3, 3)
@@ -285,6 +285,32 @@ func TestCancelActiveSymbolOnly(t *testing.T) {
 	drain(m, cmd)
 	if len(fx.calls) != 1 || fx.calls[0] != "cancelsym AAPL" {
 		t.Fatalf("cancel: calls = %v, want [cancelsym AAPL]", fx.calls)
+	}
+}
+
+// TestChartWidthFillsScreenWhenBarsVisibleZero: omit/0 means paint full width
+// (no blank left gutter from an artificial cap). A positive bars_visible still
+// caps below the width-fit count.
+func TestChartWidthFillsScreenWhenBarsVisibleZero(t *testing.T) {
+	d, _, _, _ := testDeps(t)
+	// Wide terminal: plotW = 300-10 = 290 → maxBars = (289)/2+1 = 145.
+	m := NewModel(d)
+	m.Update(tea.WindowSizeMsg{Width: 300, Height: 40})
+	if d.Cfg.Chart.BarsVisible != 0 {
+		t.Fatalf("test deps BarsVisible = %d, want 0", d.Cfg.Chart.BarsVisible)
+	}
+	wantFill := maxBars(300 - priceAxisWidth)
+	if got := m.chartWidth(); got != wantFill {
+		t.Fatalf("chartWidth fill = %d, want %d (full width)", got, wantFill)
+	}
+	d.Cfg.Chart.BarsVisible = 80
+	if got := m.chartWidth(); got != 80 {
+		t.Fatalf("chartWidth capped = %d, want 80", got)
+	}
+	// Cap above width-fit does not shrink further.
+	d.Cfg.Chart.BarsVisible = 10_000
+	if got := m.chartWidth(); got != wantFill {
+		t.Fatalf("chartWidth high cap = %d, want width-fit %d", got, wantFill)
 	}
 }
 

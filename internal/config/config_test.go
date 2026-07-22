@@ -84,6 +84,33 @@ func TestValidateTimeframe(t *testing.T) {
 	}
 }
 
+func TestValidateBarsVisible(t *testing.T) {
+	base := Config{APIKeyID: "k", APISecretKey: "s", Paper: true}
+	// Omit / zero → stay 0 (UI fills full chart width).
+	c := base
+	if err := c.Validate(); err != nil {
+		t.Fatalf("default: %v", err)
+	}
+	if c.Chart.BarsVisible != 0 {
+		t.Fatalf("BarsVisible = %d, want 0 (fill width)", c.Chart.BarsVisible)
+	}
+	// Positive cap preserved.
+	c = base
+	c.Chart.BarsVisible = 80
+	if err := c.Validate(); err != nil {
+		t.Fatalf("positive: %v", err)
+	}
+	if c.Chart.BarsVisible != 80 {
+		t.Fatalf("BarsVisible = %d, want 80", c.Chart.BarsVisible)
+	}
+	// Negative rejected.
+	c = base
+	c.Chart.BarsVisible = -1
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "bars_visible") {
+		t.Fatalf("want bars_visible error, got %v", err)
+	}
+}
+
 func TestValidateTickMS(t *testing.T) {
 	base := Config{APIKeyID: "k", APISecretKey: "s", Paper: true}
 	// Zero → default 50.
