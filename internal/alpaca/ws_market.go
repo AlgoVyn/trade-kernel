@@ -11,6 +11,40 @@ import (
 	"github.com/coder/websocket"
 )
 
+// wsPingInterval / wsPingTimeout drive the connection watchdog. Alpaca's
+// market-data stream can go completely silent for hours (the overnight
+// session has no SIP traffic), and a half-open TCP connection would
+// otherwise leave the chart frozen with no read error. The ping forces
+// traffic; a missing pong kills the connection so Run reconnects.
+const (
+	wsPingInterval = 30 * time.Second
+	wsPingTimeout  = 15 * time.Second
+)
+
+// pingWatchdog pings the connection every wsPingInterval until ctx is
+// done. A failed ping (dead peer, no pong within wsPingTimeout) closes
+// the connection so the blocked Read errors out and the Run loop
+// reconnects. coder/websocket Ping waits for the pong, which the
+// concurrent Read delivers.
+func pingWatchdog(ctx context.Context, conn *websocket.Conn) {
+	t := time.NewTicker(wsPingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			pctx, cancel := context.WithTimeout(ctx, wsPingTimeout)
+			err := conn.Ping(pctx)
+			cancel()
+			if err != nil {
+				_ = conn.Close(websocket.StatusGoingAway, "ping watchdog")
+				return
+			}
+		}
+	}
+}
+
 // MarketWS is a SIP market-data WebSocket client with automatic
 // reconnect, resubscribe, and symbol hot-switching.
 type MarketWS struct {
@@ -82,21 +116,25 @@ func (m *MarketWS) subscribeLocked(ctx context.Context) error {
 }
 
 // Run connects and maintains the connection until ctx is cancelled,
-// reconnecting with exponential backoff (250ms → 10s cap). Backoff resets
-// after any session that successfully authenticated, so post-outage flaps
-// reconnect quickly.
+// reconnecting with exponential backoff (250ms → 10s cap).
+//
+// Backoff resets only when a session both authenticated and stayed up for
+// at least 5s. Auth-then-die flaps (common during brief network blips) keep
+// the exponential schedule so we do not hammer the broker; once a session
+// is healthy for 5s, the next reconnect starts again at 250ms.
 func (m *MarketWS) Run(ctx context.Context) {
 	backoff := 250 * time.Millisecond
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		start := time.Now()
 		authed, err := m.runOnce(ctx)
 		if err != nil && m.OnError != nil && ctx.Err() == nil {
 			m.OnError(err)
 		}
 		m.setConn(nil)
-		if authed {
+		if authed && time.Since(start) >= 5*time.Second {
 			backoff = 250 * time.Millisecond
 		} else {
 			backoff *= 2
@@ -130,6 +168,7 @@ func (m *MarketWS) runOnce(ctx context.Context) (authed bool, err error) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "bye")
 	conn.SetReadLimit(1 << 20)
+	go pingWatchdog(ctx, conn)
 
 	m.setConn(conn)
 

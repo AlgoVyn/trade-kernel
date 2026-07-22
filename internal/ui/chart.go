@@ -2,8 +2,10 @@ package ui
 
 import (
 	"math"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
@@ -48,13 +50,22 @@ var fgColors = map[uint8]lipgloss.Color{
 	colVWAP: lipgloss.Color("#ffa726"), // soft amber
 }
 
-// chartStyle is a precomputed lipgloss.Style for every (fg, bg) combination
-// the chart can emit. Built once at package init so grid.render() and
-// renderVolume never call lipgloss.NewStyle() on the 10–30 Hz render path.
-// Index as chartStyles[bg*8+fg].
-var chartStyles [numBg * 8]lipgloss.Style
+// chartOpen/chartClose are pre-baked ANSI open/close sequences for every
+// (fg, bg) the chart can emit. Built once at package init by calling
+// lipgloss.Render a single time per entry (hex→terminal-profile conversion
+// happens at startup). The 10–30 Hz path only concatenates these strings —
+// never Style.Render, which re-parses hex colors via Sscanf every call.
+// Index as chartOpen[bg*8+fg].
+var (
+	chartOpen  [numBg * 8]string
+	chartClose [numBg * 8]string
+)
 
 const numBg = 4 // bgNone + 3 session tints (matches bg* iota count)
+
+// bakeMarker is a private one-byte rune used only while splitting a styled
+// lipgloss.Render result into open-prefix + close-suffix at init.
+const bakeMarker = "\x01"
 
 func init() {
 	var bgs = [numBg]uint8{bgNone, bgOvernight, bgPreMarket, bgAfterHours}
@@ -69,18 +80,47 @@ func init() {
 					st = st.Background(bc)
 				}
 			}
-			chartStyles[int(bg)*8+int(fi)] = st
+			open, close := bakeANSI(st)
+			chartOpen[int(bg)*8+int(fi)] = open
+			chartClose[int(bg)*8+int(fi)] = close
 		}
 	}
 }
 
-// chartStyleAt returns the precomputed style for (fg, bg) without allocating.
-func chartStyleAt(fg, bg uint8) lipgloss.Style {
-	i := int(bg)*8 + int(fg)
-	if i < 0 || i >= len(chartStyles) {
-		return lipgloss.NewStyle()
+// bakeANSI splits st.Render(marker) into the ANSI prefix/suffix so the hot
+// path can wrap arbitrary run text without calling Render again.
+func bakeANSI(st lipgloss.Style) (open, close string) {
+	s := st.Render(bakeMarker)
+	i := strings.Index(s, bakeMarker)
+	if i < 0 {
+		return "", ""
 	}
-	return chartStyles[i]
+	return s[:i], s[i+len(bakeMarker):]
+}
+
+// styleIndex maps (fg, bg) palette indices into the pre-baked tables.
+func styleIndex(fg, bg uint8) int {
+	i := int(bg)*8 + int(fg)
+	if i < 0 || i >= len(chartOpen) {
+		return 0
+	}
+	return i
+}
+
+// writeStyled appends text wrapped in the pre-baked (fg, bg) ANSI sequences.
+// No lipgloss work; empty open means plain text (colNone + bgNone).
+func writeStyled(sb *strings.Builder, fg, bg uint8, text string) {
+	if text == "" {
+		return
+	}
+	i := styleIndex(fg, bg)
+	if chartOpen[i] == "" {
+		sb.WriteString(text)
+		return
+	}
+	sb.WriteString(chartOpen[i])
+	sb.WriteString(text)
+	sb.WriteString(chartClose[i])
 }
 
 // stDim is the shared faint style for axis labels / separators / the time
@@ -116,20 +156,59 @@ type grid struct {
 	indColor []uint8
 }
 
+// gridPool reuses grid canvases across frames to avoid allocating five
+// w×h slices on every render tick.
+var gridPool = sync.Pool{New: func() any { return &grid{} }}
+
+func acquireGrid(w, h int) *grid {
+	g := gridPool.Get().(*grid)
+	g.reset(w, h)
+	return g
+}
+
+func releaseGrid(g *grid) {
+	if g == nil {
+		return
+	}
+	gridPool.Put(g)
+}
+
 func newGrid(w, h int) *grid {
+	g := &grid{}
+	g.reset(w, h)
+	return g
+}
+
+// reset resizes (if needed) and clears the canvas for a fresh paint.
+func (g *grid) reset(w, h int) {
+	if w < 0 {
+		w = 0
+	}
+	if h < 0 {
+		h = 0
+	}
 	n := w * h
-	g := &grid{
-		w: w, h: h,
-		ch:       make([]rune, n),
-		fg:       make([]uint8, n),
-		bg:       make([]uint8, n),
-		indDots:  make([]uint8, n),
-		indColor: make([]uint8, n),
+	g.w, g.h = w, h
+	if cap(g.ch) < n {
+		g.ch = make([]rune, n)
+		g.fg = make([]uint8, n)
+		g.bg = make([]uint8, n)
+		g.indDots = make([]uint8, n)
+		g.indColor = make([]uint8, n)
+	} else {
+		g.ch = g.ch[:n]
+		g.fg = g.fg[:n]
+		g.bg = g.bg[:n]
+		g.indDots = g.indDots[:n]
+		g.indColor = g.indColor[:n]
+		clear(g.fg)
+		clear(g.bg)
+		clear(g.indDots)
+		clear(g.indColor)
 	}
 	for i := range g.ch {
 		g.ch[i] = ' '
 	}
-	return g
 }
 
 func (g *grid) idx(x, y int) int { return y*g.w + x }
@@ -221,21 +300,27 @@ func stepSign(a, b int) int {
 
 // render emits styled lines. Indicator braille takes priority over candle
 // blocks so overlay lines stay thin and smooth; solid █/│ candles show
-// everywhere else.
+// everywhere else. Styling uses pre-baked ANSI sequences (writeStyled) —
+// no lipgloss.Render on this path.
 func (g *grid) render() []string {
 	lines := make([]string, g.h)
+	var sb strings.Builder
+	var run strings.Builder
+	// Rough capacity: ~3 bytes/rune for braille + ANSI open/close per run.
+	sb.Grow(g.w * 24)
+	run.Grow(g.w * 3)
 	for y := 0; y < g.h; y++ {
-		var sb strings.Builder
+		sb.Reset()
+		run.Reset()
 		var runFG, runBG uint8
-		var run strings.Builder
+		started := false
 		flush := func() {
 			if run.Len() == 0 {
 				return
 			}
-			sb.WriteString(chartStyleAt(runFG, runBG).Render(run.String()))
+			writeStyled(&sb, runFG, runBG, run.String())
 			run.Reset()
 		}
-		started := false
 		for x := 0; x < g.w; x++ {
 			i := g.idx(x, y)
 			bg := g.bg[i]
@@ -328,26 +413,46 @@ func validOrderPrice(p float64) bool {
 	return p > 0 && !math.IsNaN(p) && !math.IsInf(p, 0)
 }
 
+// validScalePrice is the Y-axis counterpart: only positive finite prices may
+// expand the candle scale. Zero / NaN indicator seeds and bad OHLC must not
+// pin the axis to the origin (that is the usual "candles flattened to a line"
+// failure mode when a live print of 0 lands in the forming bar).
+func validScalePrice(p float64) bool {
+	return validOrderPrice(p)
+}
+
 // orderScaleExpand is how far beyond the bar/indicator span a resting limit
 // may pull the Y-axis, as a multiple of that span. Orders outside the window
 // still paint (clamped to the top/bottom edge) but do not squash candle detail.
 const orderScaleExpand = 1.0
+
+// wickOutlierMult: a high (or low) is treated as a single wild wick when it
+// sits more than this many typical bar-ranges beyond the next-most extreme
+// high (or low). Only that isolated extreme is soft-clipped; a real step
+// move that leaves several bars at the new level is kept.
+const wickOutlierMult = 3.0
 
 // priceRange returns the (min, max) price span across snap's bars and the
 // enabled overlays, with 2% padding on each side — exactly the range the
 // candle pane maps to its y-axis. Shared by renderCandles and the price
 // axis so labels line up with the bars. Returns (0,0,false) for empty.
 //
-// Nearby working-order prices expand the scale so markers sit on-screen;
-// far GTC/limits only expand within orderScaleExpand× the bar span so a
-// distant resting order cannot flatten the candle structure.
+// Order of operations matters for indicator overlays (VWAP/EMA):
+//  1. Span valid bar high/low only.
+//  2. Soft-clip a single isolated wild wick (not a midprice percentile core —
+//     that wrongly clipped legitimate recent tape and left VWAP above max,
+//     which clamps to a flat line on the top edge).
+//  3. Grow for enabled indicators so overlays always sit inside the scale.
+//  4. Nearby working orders expand within orderScaleExpand× the bar span.
+//
+// Non-positive / non-finite OHLC and indicator values never expand the axis.
 func priceRange(snap bars.Snapshot, opts ChartOpts) (min, max float64, ok bool) {
 	if len(snap.Bars) == 0 {
 		return 0, 0, false
 	}
 	min, max = math.Inf(1), math.Inf(-1)
 	grow := func(v float64) {
-		if math.IsNaN(v) {
+		if !validScalePrice(v) {
 			return
 		}
 		if v < min {
@@ -357,22 +462,76 @@ func priceRange(snap bars.Snapshot, opts ChartOpts) (min, max float64, ok bool) 
 			max = v
 		}
 	}
-	for i, b := range snap.Bars {
-		grow(b.Low)
-		grow(b.High)
-		if opts.ShowEMA {
+
+	lows := make([]float64, 0, len(snap.Bars))
+	highs := make([]float64, 0, len(snap.Bars))
+	ranges := make([]float64, 0, len(snap.Bars))
+	bodyTops := make([]float64, 0, len(snap.Bars))
+	bodyBots := make([]float64, 0, len(snap.Bars))
+	for _, b := range snap.Bars {
+		if validScalePrice(b.Low) {
+			lows = append(lows, b.Low)
+			grow(b.Low)
+		}
+		if validScalePrice(b.High) {
+			highs = append(highs, b.High)
+			grow(b.High)
+		}
+		if validScalePrice(b.Low) && validScalePrice(b.High) && b.High >= b.Low {
+			ranges = append(ranges, b.High-b.Low)
+		}
+		// Body top/bottom (max/min of open, close) distinguish a pure wick
+		// outlier from a real one-bar drive that closes near the extreme.
+		if validScalePrice(b.Open) || validScalePrice(b.Close) {
+			top, bot := b.Open, b.Close
+			if !validScalePrice(top) {
+				top = bot
+			}
+			if !validScalePrice(bot) {
+				bot = top
+			}
+			if top < bot {
+				top, bot = bot, top
+			}
+			if validScalePrice(top) {
+				bodyTops = append(bodyTops, top)
+			}
+			if validScalePrice(bot) {
+				bodyBots = append(bodyBots, bot)
+			}
+		}
+	}
+	if math.IsInf(min, 1) || math.IsInf(max, -1) {
+		return 0, 0, false
+	}
+	if min >= max {
+		max = min + 1
+	}
+
+	// Soft-clip only pure wick outliers — before indicators, so a clipped max
+	// cannot leave VWAP/EMA above the scale (flat line glued to the top edge).
+	// A one-bar news spike that closes near the extreme is kept.
+	if lo, hi, clipped := softClipWickExtremes(lows, highs, ranges, bodyTops, bodyBots); clipped {
+		min, max = lo, hi
+	}
+
+	// Indicators always expand the scale: session VWAP after a reset, and
+	// EMAs, are real prices the user expects to see on-pane — never clamp them.
+	for i := range snap.Bars {
+		if opts.ShowEMA && i < len(snap.EMA) {
 			grow(snap.EMA[i])
 		}
-		if opts.ShowEMA2 {
+		if opts.ShowEMA2 && i < len(snap.EMA2) {
 			grow(snap.EMA2[i])
 		}
-		if opts.ShowVWAP {
+		if opts.ShowVWAP && i < len(snap.VWAP) {
 			grow(snap.VWAP[i])
 		}
 	}
 	if min >= max {
 		max = min + 1
 	}
+
 	// Cap order-driven expansion to a band around the bar/indicator range.
 	barMin, barMax := min, max
 	span := barMax - barMin
@@ -392,6 +551,111 @@ func priceRange(snap bars.Snapshot, opts ChartOpts) (min, max float64, ok bool) 
 	}
 	pad := (max - min) * 0.02
 	return min - pad, max + pad, true
+}
+
+// softClipWickExtremes drops a single isolated high and/or low when it sits
+// more than wickOutlierMult× the typical bar range beyond the next extreme
+// *and* the extreme is a pure wick (body top/bottom also far from the
+// extreme). A genuine step (several bars at the new level) or a one-bar
+// body-driven spike (close near the high/low) keeps the new extreme.
+//
+// bodyTops / bodyBots are max(open,close) / min(open,close) per bar; they
+// may be unsorted and need not align 1:1 with lows/highs after filtering.
+func softClipWickExtremes(lows, highs, barRanges, bodyTops, bodyBots []float64) (lo, hi float64, clipped bool) {
+	if len(lows) == 0 || len(highs) == 0 {
+		return 0, 0, false
+	}
+	slices.Sort(lows)
+	slices.Sort(highs)
+	lo, hi = lows[0], highs[len(highs)-1]
+	if !(hi > lo) {
+		return lo, hi, false
+	}
+	if len(lows) < 8 || len(highs) < 8 {
+		return lo, hi, false
+	}
+
+	typical := medianFloats(barRanges)
+	// Isolated high: max is far above the second-highest high, and no body
+	// closes near that high (pure upper wick / bad print).
+	if n := len(highs); n >= 2 {
+		second := highs[n-2]
+		thresh := wickThresh(typical, second)
+		if hi-second > thresh && bodyFarFromExtreme(bodyTops, hi, thresh) {
+			hi = second
+			clipped = true
+		}
+	}
+	// Isolated low: min is far below the second-lowest low, and no body
+	// prints near that low (pure lower wick / bad print).
+	if n := len(lows); n >= 2 {
+		second := lows[1]
+		thresh := wickThresh(typical, second)
+		if second-lo > thresh && bodyFarFromExtremeLow(bodyBots, lo, thresh) {
+			lo = second
+			clipped = true
+		}
+	}
+	if !(hi > lo) {
+		return lows[0], highs[len(highs)-1], false
+	}
+	return lo, hi, clipped
+}
+
+// bodyFarFromExtreme reports whether every body top sits more than thresh
+// below extreme (hi). Empty bodyTops means we cannot prove a body move —
+// treat as wick-only (allow clip).
+func bodyFarFromExtreme(bodyTops []float64, extreme, thresh float64) bool {
+	if len(bodyTops) == 0 {
+		return true
+	}
+	for _, t := range bodyTops {
+		if extreme-t <= thresh {
+			return false
+		}
+	}
+	return true
+}
+
+// bodyFarFromExtremeLow reports whether every body bottom sits more than
+// thresh above extreme (lo).
+func bodyFarFromExtremeLow(bodyBots []float64, extreme, thresh float64) bool {
+	if len(bodyBots) == 0 {
+		return true
+	}
+	for _, b := range bodyBots {
+		if b-extreme <= thresh {
+			return false
+		}
+	}
+	return true
+}
+
+// wickThresh is how far beyond the next extreme a high/low may sit before
+// we call it a single wild wick. Prefer a multiple of typical bar range;
+// when bars are flat (H==L dojis) fall back to 5% of the reference price
+// so a real 1-point step on a $150 name is never clipped.
+func wickThresh(typicalBarRange, refPrice float64) float64 {
+	if typicalBarRange > 0 {
+		return typicalBarRange * wickOutlierMult
+	}
+	if refPrice > 0 {
+		return refPrice * 0.05
+	}
+	return 0
+}
+
+func medianFloats(a []float64) float64 {
+	if len(a) == 0 {
+		return 0
+	}
+	s := append([]float64(nil), a...)
+	slices.Sort(s)
+	mid := len(s) / 2
+	if len(s)%2 == 0 {
+		return (s[mid-1] + s[mid]) / 2
+	}
+	return s[mid]
 }
 
 // renderCandles draws continuous block-character candlesticks (█ bodies,
@@ -417,7 +681,8 @@ func renderCandles(snap bars.Snapshot, w, h int, opts ChartOpts) []string {
 		min, max = 0, 1
 	}
 
-	g := newGrid(w, h)
+	g := acquireGrid(w, h)
+	defer releaseGrid(g)
 
 	// Cell-row mapping for solid candles (row 0 = max, row h-1 = min).
 	cellSpan := float64(h - 1)
@@ -669,9 +934,9 @@ func volumeScale(vols []float64) float64 {
 // renderVolume draws volume bars for the newest bars into h lines, using
 // the same barStride spacing as the candle pane so columns line up.
 //
-// Styling is performed via the precomputed chartStyles table (no NewStyle per
-// cell), and the per-column (fg, bg) pair is computed once per bar. Cells are
-// run-coalesced per row so a volume bar's same-color cells flush in one Render.
+// Styling uses pre-baked ANSI sequences (writeStyled); the per-column (fg, bg)
+// pair is computed once per bar. Cells are run-coalesced per row so a volume
+// bar's same-color cells flush in one write.
 func renderVolume(snap bars.Snapshot, w, h int, shading bool) []string {
 	if w <= 0 || h <= 0 || len(snap.Bars) == 0 {
 		return blankLines(h)
@@ -739,30 +1004,38 @@ func renderVolume(snap bars.Snapshot, w, h int, shading bool) []string {
 		return cellSpace
 	}
 
+	// Precompute column-to-bar index mapping once per frame (O(W) instead of O(W*H*N)).
+	barMap := make([]int, w)
+	for x := 0; x < w; x++ {
+		barMap[x] = -1
+	}
+	for i := 0; i < n; i++ {
+		cx := barCol(w, n, i)
+		if cx >= 0 && cx < w {
+			barMap[cx] = i
+		}
+	}
+
 	lines := make([]string, h)
+	var sb strings.Builder
+	var runSB strings.Builder
+	sb.Grow(w * 24)
+	runSB.Grow(w * 3)
 	for y := 0; y < h; y++ {
-		var sb strings.Builder
-		var runSB strings.Builder
+		sb.Reset()
+		runSB.Reset()
 		var runFG, runBG uint8
 		runActive := false
 		flush := func() {
 			if runSB.Len() == 0 {
 				return
 			}
-			sb.WriteString(chartStyleAt(runFG, runBG).Render(runSB.String()))
+			writeStyled(&sb, runFG, runBG, runSB.String())
 			runSB.Reset()
 			runActive = false
 		}
 		for x := 0; x < w; x++ {
-			// Determine column. Linear scan is fine (terminal widths are small)
-			// and avoids precomputing a column map each frame.
-			colIdx := -1
-			for i := 0; i < n; i++ {
-				if barCol(w, n, i) == x {
-					colIdx = i
-					break
-				}
-			}
+			colIdx := barMap[x]
 			var fg, bg uint8 = colNone, bgNone
 			runeIdx := uint8(cellSpace)
 			rn := ' '

@@ -7,9 +7,36 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"trade-kernel/internal/bars"
 	"trade-kernel/internal/session"
 )
+
+// TestWriteStyledMatchesLipgloss ensures pre-baked ANSI wrappers produce the
+// same output as a one-shot lipgloss.Style.Render for every palette entry.
+func TestWriteStyledMatchesLipgloss(t *testing.T) {
+	const sample = "█│ ·"
+	for bg := uint8(0); bg < numBg; bg++ {
+		for fg := uint8(0); fg < 8; fg++ {
+			st := lipgloss.NewStyle()
+			if fc, ok := fgColors[fg]; ok {
+				st = st.Foreground(fc)
+			}
+			if bg > 0 {
+				if bc, ok := bgColors[bg]; ok {
+					st = st.Background(bc)
+				}
+			}
+			want := st.Render(sample)
+			var sb strings.Builder
+			writeStyled(&sb, fg, bg, sample)
+			got := sb.String()
+			if got != want {
+				t.Fatalf("fg=%d bg=%d:\n want %q\n  got %q", fg, bg, want, got)
+			}
+		}
+	}
+}
 
 // TestSessionBGDistinct ensures each non-regular session has its own tint
 // so overnight / pre-market / after-hours don't share a single color.

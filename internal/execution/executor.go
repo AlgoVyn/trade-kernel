@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -105,29 +104,42 @@ func (e *RESTExecutor) LimitSell(ctx context.Context, symbol string, qty int, pr
 	})
 }
 
-// Flatten submits the opposite-side order for the full position size. If
-// the market is locally Closed (weekend halt, holiday override), or the
-// session-aware builder cannot price an extended-hours exit (no NBBO /
-// last trade), it falls back to DELETE /v2/positions/{symbol} — the
-// emergency exit must always work.
+// Flatten submits the opposite-side order for the full position size using
+// the session-appropriate order form: market in Regular, aggressive limit
+// with extended_hours=true in PreMarket/AfterHours/Overnight — for both
+// long (sell) and short (buy) exits. Market orders are not allowed outside
+// regular hours, so extended-session flattens never fall back to
+// DELETE /v2/positions/{symbol} (which liquidates at market); builder or
+// pricing errors are returned to the operator instead.
 //
-// Non-integral quantities (fractional shares or sub-share residuals) use
-// ClosePosition directly so a single flatten fully exits; whole-share
-// positions use the session-aware order path.
+// ClosePosition is used when the order path cannot work: the market is
+// locally Closed (weekend halt, holiday override), or the quantity is
+// fractional during Regular (fractionals cannot be truncated without a
+// residual). Fractional qty in PreMarket/AfterHours/Overnight is rejected
+// with an error — ClosePosition would also submit a market liquidation,
+// which is not allowed outside regular hours.
 func (e *RESTExecutor) Flatten(ctx context.Context, symbol string, positionQty float64) (alpaca.Order, error) {
 	if positionQty == 0 {
 		return alpaca.Order{}, fmt.Errorf("no position in %s", symbol)
 	}
-	abs := math.Abs(positionQty)
-	qty := int(abs)
-	// Fractional / sub-share: liquidate fully via the positions endpoint.
-	// Truncating to whole shares would leave a residual open.
-	if qty == 0 || abs != float64(qty) {
-		return e.closePosition(ctx, symbol)
-	}
 	// Capture session once so a boundary between checks cannot pick
 	// ClosePosition for one branch and the order path for the other.
 	sess := e.sessionNow()
+	abs := math.Abs(positionQty)
+	qty := int(abs)
+	// Fractional / sub-share: truncating would leave a residual open.
+	if qty == 0 || abs != float64(qty) {
+		switch sess {
+		case session.Regular, session.Closed:
+			// Regular: broker accepts market liquidate. Closed: endpoint
+			// queues for the next open (same as whole-share Closed path).
+			return e.closePosition(ctx, symbol)
+		default:
+			return alpaca.Order{}, fmt.Errorf(
+				"cannot flatten fractional position in %s outside regular hours (qty=%g); wait for RTH or close the residual in the broker UI",
+				symbol, positionQty)
+		}
+	}
 	// Closed locally ⇒ the builder would reject ("market is closed"). Use
 	// the position-close endpoint, which works outside any session.
 	if sess == session.Closed {
@@ -137,40 +149,20 @@ func (e *RESTExecutor) Flatten(ctx context.Context, symbol string, positionQty f
 	if positionQty < 0 {
 		side = "buy"
 	}
+	// No ClosePosition fallback here: in extended sessions that endpoint
+	// submits a market order, which is not allowed outside regular hours.
+	// Broker transport/reject errors are surfaced as-is too — the order
+	// may already be live, and the operator needs the original error.
 	o, err := e.submit(ctx, BuildInput{
 		Symbol: symbol, Side: side, Qty: qty,
 		Session: sess, RegularTIF: e.regularTIF,
 	})
-	if err != nil {
-		// Only fall back for known builder/pricing failures. Do not call
-		// ClosePosition after a PlaceOrder transport/reject error — the
-		// order may already be live, and operators need the original error.
-		if isFlattenPricingFallback(err) {
-			o2, err2 := e.closePosition(ctx, symbol)
-			if err2 == nil {
-				// Keep original failure visible on the synthetic order so
-				// the UI/status line is not a silent close_requested alone.
-				o2.Status = "close_requested (" + err.Error() + ")"
-				return o2, nil
-			}
-			return alpaca.Order{}, fmt.Errorf("%w (close position: %v)", err, err2)
-		}
-		return alpaca.Order{}, err
+	if err != nil && session.Extended(sess) {
+		return alpaca.Order{}, fmt.Errorf(
+			"flatten %s in %s: %w (wait for RTH or use broker UI if pricing/eligibility failed)",
+			symbol, sess, err)
 	}
-	return o, nil
-}
-
-// isFlattenPricingFallback reports whether err is a session/pricing failure
-// from the order builder (safe to liquidate via DELETE positions) rather
-// than a broker submit failure after the order may have been accepted.
-func isFlattenPricingFallback(err error) bool {
-	if err == nil {
-		return false
-	}
-	return errors.Is(err, ErrMarketClosed) ||
-		errors.Is(err, ErrNoExtendedPrice) ||
-		errors.Is(err, ErrNotOvernightTradable) ||
-		errors.Is(err, ErrOvernightEligibility)
+	return o, err
 }
 
 func (e *RESTExecutor) closePosition(ctx context.Context, symbol string) (alpaca.Order, error) {

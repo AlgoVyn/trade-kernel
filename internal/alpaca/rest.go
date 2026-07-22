@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -98,69 +99,140 @@ func (c *REST) SetBaseURL(u string) { c.tradingBase = u }
 // based integration tests; not used in production.
 func (c *REST) SetDataURL(u string) { c.dataBase = u }
 
+// doRateLimitRetries is how many times a GET or HEAD request is retried
+// after HTTP 429 before surfacing the error. Other methods (including
+// body-less DELETE/Cancel) are never retried — orders may already be live.
+const doRateLimitRetries = 2
+
 func (c *REST) do(ctx context.Context, hc *http.Client, method, base, path string, query url.Values, body any, out any) error {
 	u := base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	var rdr io.Reader
+	var bodyBytes []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("marshal %s %s: %w", method, path, err)
 		}
-		rdr = bytes.NewReader(b)
+		bodyBytes = b
 	}
-	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
-	if err != nil {
-		return err
+
+	// Retry only GET/HEAD on 429. Mutating calls are not retried —
+	// PlaceOrder must not double-submit; Cancel/DELETE are not replayed either.
+	maxAttempts := 1
+	if bodyBytes == nil && (method == http.MethodGet || method == http.MethodHead) {
+		maxAttempts = 1 + doRateLimitRetries
 	}
-	req.Header.Set("APCA-API-KEY-ID", c.keyID)
-	req.Header.Set("APCA-API-SECRET-KEY", c.secretKey)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, path, err)
-	}
-	defer resp.Body.Close()
-	// 1 MB cap per response — enough for any single Alpaca envelope we
-	// consume (positions/orders/bars pages are far smaller; pagination keeps
-	// individual calls bounded). Reading up to N+1 bytes lets us detect a
-	// truncation rather than silently chopping the tail, which would yield a
-	// misleading decode error or, worse, a partial parse.
-	//
-	// A pooled buffer backs the read, status check, and decode — which all
-	// happen synchronously here — so callers never hold a reference into it
-	// and no per-response []byte escapes into the heap.
-	buf := respBufPool.Get().(*bytes.Buffer)
-	defer func() {
+
+	// retryAfter is set from the previous 429 response's Retry-After header
+	// (when present) and preferred over the fixed exponential backoff, capped
+	// at 2s so a large server value cannot stall the UI refresh loop.
+	var retryAfter time.Duration
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// Fixed exponential backoff: 250ms, 500ms; honor Retry-After when larger.
+			backoff := time.Duration(250*(1<<(attempt-1))) * time.Millisecond
+			if retryAfter > backoff {
+				backoff = retryAfter
+			}
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		var rdr io.Reader
+		if bodyBytes != nil {
+			rdr = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, u, rdr)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("APCA-API-KEY-ID", c.keyID)
+		req.Header.Set("APCA-API-SECRET-KEY", c.secretKey)
+		if bodyBytes != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := hc.Do(req)
+		if err != nil {
+			return fmt.Errorf("%s %s: %w", method, path, err)
+		}
+
+		// Capture Retry-After before consuming the body so GET 429 retries can
+		// honor a bounded server delay.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+		} else {
+			retryAfter = 0
+		}
+
+		// 1 MB cap per response — enough for any single Alpaca envelope we
+		// consume (positions/orders/bars pages are far smaller; pagination keeps
+		// individual calls bounded). Reading up to N+1 bytes lets us detect a
+		// truncation rather than silently chopping the tail, which would yield a
+		// misleading decode error or, worse, a partial parse.
+		//
+		// A pooled buffer backs the read, status check, and decode — which all
+		// happen synchronously here — so callers never hold a reference into it
+		// and no per-response []byte escapes into the heap.
+		buf := respBufPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		buf.Grow(1<<20 + 1)
+		_, copyErr := io.Copy(buf, io.LimitReader(resp.Body, 1<<20+1))
+		_ = resp.Body.Close()
+		if copyErr != nil {
+			buf.Reset()
+			respBufPool.Put(buf)
+			return fmt.Errorf("read %s %s: %w", method, path, copyErr)
+		}
+		data := append([]byte(nil), buf.Bytes()...)
 		buf.Reset()
 		respBufPool.Put(buf)
-	}()
-	buf.Grow(1<<20 + 1)
-	if _, err := io.Copy(buf, io.LimitReader(resp.Body, 1<<20+1)); err != nil {
-		return fmt.Errorf("read %s %s: %w", method, path, err)
-	}
-	data := buf.Bytes()
-	if len(data) > 1<<20 {
-		return fmt.Errorf("read %s %s: %w", method, path, ErrResponseTruncated)
-	}
-	if resp.StatusCode >= 400 {
-		var ae apiError
-		if json.Unmarshal(data, &ae) == nil && ae.Message != "" {
-			return fmt.Errorf("%s %s: %d: %s", method, path, resp.StatusCode, ae.Message)
+
+		if len(data) > 1<<20 {
+			return fmt.Errorf("read %s %s: %w", method, path, ErrResponseTruncated)
 		}
-		return fmt.Errorf("%s %s: %d: %s", method, path, resp.StatusCode, string(data))
-	}
-	if out == nil {
+		if resp.StatusCode == http.StatusTooManyRequests && attempt+1 < maxAttempts {
+			continue
+		}
+		// Final-attempt 429 and all other 4xx/5xx fall through here (no
+		// unreachable post-loop branch).
+		if resp.StatusCode >= 400 {
+			var ae apiError
+			if json.Unmarshal(data, &ae) == nil && ae.Message != "" {
+				return fmt.Errorf("%s %s: %d: %s", method, path, resp.StatusCode, ae.Message)
+			}
+			return fmt.Errorf("%s %s: %d: %s", method, path, resp.StatusCode, string(data))
+		}
+		if out == nil {
+			return nil
+		}
+		if err := json.Unmarshal(data, out); err != nil {
+			return fmt.Errorf("decode %s %s: %w", method, path, err)
+		}
 		return nil
 	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("decode %s %s: %w", method, path, err)
+	return fmt.Errorf("%s %s: exhausted retries", method, path)
+}
+
+// parseRetryAfter parses an HTTP Retry-After value as a delay-seconds integer.
+// HTTP-date forms and invalid values yield 0 (caller uses fixed backoff).
+// The result is not capped here; do() caps the applied sleep at 2s.
+func parseRetryAfter(h string) time.Duration {
+	if h == "" {
+		return 0
 	}
-	return nil
+	// Prefer delta-seconds (what Alpaca and most APIs send).
+	if secs, err := strconv.Atoi(strings.TrimSpace(h)); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
 }
 
 func (c *REST) trading(ctx context.Context, method, path string, q url.Values, body, out any) error {
@@ -236,6 +308,157 @@ func (c *REST) OpenOrders(ctx context.Context, symbol string) ([]Order, error) {
 	var o []Order
 	err := c.trading(ctx, http.MethodGet, "/v2/orders", q, nil, &o)
 	return o, err
+}
+
+// closedOrdersPage is the maximum Alpaca returns per /v2/orders page.
+const closedOrdersPage = 500
+
+// ClosedOrders fetches closed orders whose *submission* time falls in
+// [after, until). Alpaca's /v2/orders after/until parameters filter on
+// submitted_at, not filled_at — a GTC (or other) order submitted before
+// `after` and filled inside the window will not appear. Callers that need
+// fill-time coverage should prefer Fills (activity FILL, filtered by
+// transaction_time) or widen `after` for inventory reconstruction.
+//
+// Paginates ascending by submission time. On HTTP/decode errors after at
+// least one successful page, returns the rows accumulated so far with a
+// non-nil error so callers can checkpoint progress; err != nil always means
+// the history is incomplete. A full page of identical submitted_at values,
+// a full page that yields only duplicate ids, or a zero last timestamp is an
+// error with a nil slice (cannot resume safely). Empty ids are dropped.
+//
+// Exclusive `after=T` would drop remaining rows at T on the next page, so a
+// full page advances the cursor to last.SubmittedAt − 1ns and relies on id
+// de-dupe for the overlap.
+func (c *REST) ClosedOrders(ctx context.Context, after, until time.Time) ([]Order, error) {
+	var all []Order
+	seen := make(map[string]struct{})
+	cursor := after
+	for {
+		q := url.Values{
+			"status":    {"closed"},
+			"direction": {"asc"},
+			"limit":     {strconv.Itoa(closedOrdersPage)},
+			"nested":    {"false"},
+		}
+		if !cursor.IsZero() {
+			q.Set("after", cursor.UTC().Format(time.RFC3339Nano))
+		}
+		if !until.IsZero() {
+			q.Set("until", until.UTC().Format(time.RFC3339Nano))
+		}
+		var page []Order
+		if err := c.trading(ctx, http.MethodGet, "/v2/orders", q, nil, &page); err != nil {
+			if len(all) > 0 {
+				return all, fmt.Errorf("closed orders: incomplete after %d orders: %w", len(all), err)
+			}
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		added := 0
+		for _, o := range page {
+			if o.ID == "" {
+				continue
+			}
+			if _, ok := seen[o.ID]; ok {
+				continue
+			}
+			seen[o.ID] = struct{}{}
+			all = append(all, o)
+			added++
+		}
+		if len(page) < closedOrdersPage {
+			break
+		}
+		// Full page: cannot use exclusive after=last (siblings at last would
+		// be skipped). Overlap with after=last−1ns and de-dupe by id.
+		firstTS := page[0].SubmittedAt
+		last := page[len(page)-1].SubmittedAt
+		if last.IsZero() {
+			return nil, fmt.Errorf("closed orders: full page of %d but last submitted_at is zero (partial history)", closedOrdersPage)
+		}
+		if !firstTS.IsZero() && !last.After(firstTS) {
+			return nil, fmt.Errorf("closed orders: full page of %d with identical submitted_at (cannot paginate exclusive after; partial history)", closedOrdersPage)
+		}
+		if added == 0 {
+			return nil, fmt.Errorf("closed orders: full page of %d with no new order ids (pagination stuck; partial history)", closedOrdersPage)
+		}
+		// after is exclusive; last−1ns re-includes rows at last so same-T
+		// siblings on the next page are not skipped.
+		next := last.Add(-time.Nanosecond)
+		if !next.After(cursor) {
+			return nil, fmt.Errorf("closed orders: full page of %d but submitted_at cursor did not advance (partial history)", closedOrdersPage)
+		}
+		cursor = next
+	}
+	return all, nil
+}
+
+// fillPageSize is the activities page size for FILL history.
+const fillPageSize = 100
+
+// Fills fetches account FILL activities with transaction_time >= after
+// (and < until when until is set). Results are returned oldest-first.
+// page_token is the last activity id (Alpaca pagination).
+//
+// On HTTP/context/decode errors after at least one successful page, returns
+// the rows accumulated so far with a non-nil error so callers can checkpoint
+// progress (e.g. warm a fill cache and resume via delta after the last
+// timestamp). err != nil always means the history is incomplete — never
+// treat the slice as a full lookback. A full page whose page_token cannot
+// advance returns (nil, err) (cannot resume safely). Results are de-duped
+// by activity id (first occurrence wins); empty ids are dropped so
+// overlapping pages cannot double-count inventory.
+func (c *REST) Fills(ctx context.Context, after, until time.Time) ([]Fill, error) {
+	var all []Fill
+	seen := make(map[string]struct{})
+	var pageToken string
+	for {
+		q := url.Values{
+			"direction": {"asc"},
+			"page_size": {strconv.Itoa(fillPageSize)},
+		}
+		if !after.IsZero() {
+			q.Set("after", after.UTC().Format(time.RFC3339Nano))
+		}
+		if !until.IsZero() {
+			q.Set("until", until.UTC().Format(time.RFC3339Nano))
+		}
+		if pageToken != "" {
+			q.Set("page_token", pageToken)
+		}
+		var page []Fill
+		if err := c.trading(ctx, http.MethodGet, "/v2/account/activities/FILL", q, nil, &page); err != nil {
+			if len(all) > 0 {
+				return all, fmt.Errorf("fills: incomplete after %d activities: %w", len(all), err)
+			}
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, f := range page {
+			if f.ID == "" {
+				continue
+			}
+			if _, ok := seen[f.ID]; ok {
+				continue
+			}
+			seen[f.ID] = struct{}{}
+			all = append(all, f)
+		}
+		if len(page) < fillPageSize {
+			break
+		}
+		lastID := page[len(page)-1].ID
+		if lastID == "" || lastID == pageToken {
+			return nil, fmt.Errorf("fills: full page of %d but page_token did not advance (partial history)", fillPageSize)
+		}
+		pageToken = lastID
+	}
+	return all, nil
 }
 
 // CancelAll cancels every open order.

@@ -288,11 +288,9 @@ func TestCancelActiveSymbolOnly(t *testing.T) {
 	}
 }
 
-// TestInfoBarShowsDayWeekPnL renders account day/wk with open marks stripped.
+// TestInfoBarShowsDayWeekPnL renders fill-based realized day/wk.
 func TestInfoBarShowsDayWeekPnL(t *testing.T) {
 	d, _, st, _ := testDeps(t)
-	// +1500 equity day, +200 open intraday mark → day +1300.
-	// Week base 100000, equity 101500, window strip 500 → +1000.
 	st.Reconcile(
 		alpaca.Account{Equity: 101500, LastEquity: 100000, Cash: 50000, BuyingPower: 200000},
 		[]alpaca.Position{{
@@ -301,15 +299,31 @@ func TestInfoBarShowsDayWeekPnL(t *testing.T) {
 		}},
 		nil,
 	)
-	st.SetWeekPnL(100000, 500)
+	st.SetRealizedPnL(1300, 1000)
 	m := NewModel(d)
 	m.width = 160
 	row1, _ := m.buildInfoBarRows(160, st.Snapshot(), bars.MarketSnapshot{})
-	if !strings.Contains(row1, "day") || !strings.Contains(row1, "+1.3k") {
-		t.Fatalf("row1 missing day PnL: %q", row1)
+	if !strings.Contains(row1, "rday") || !strings.Contains(row1, "+1.3k") {
+		t.Fatalf("row1 missing realized day PnL: %q", row1)
 	}
-	if !strings.Contains(row1, "wk") || !strings.Contains(row1, "+1.0k") {
-		t.Fatalf("row1 missing week PnL: %q", row1)
+	if !strings.Contains(row1, "rwk") || !strings.Contains(row1, "+1.0k") {
+		t.Fatalf("row1 missing realized week PnL: %q", row1)
+	}
+	if strings.Contains(row1, "rday*") || strings.Contains(row1, "rwk*") {
+		t.Fatalf("full sample must not show partial marker: %q", row1)
+	}
+}
+
+// TestInfoBarShowsPartialRealizedMarker marks undercount samples with *.
+func TestInfoBarShowsPartialRealizedMarker(t *testing.T) {
+	d, _, st, _ := testDeps(t)
+	st.Reconcile(alpaca.Account{Equity: 100000, Cash: 50000, BuyingPower: 200000}, nil, nil)
+	st.SetRealizedPnLSample(500, 500, []string{"ZZZ"})
+	m := NewModel(d)
+	m.width = 160
+	row1, _ := m.buildInfoBarRows(160, st.Snapshot(), bars.MarketSnapshot{})
+	if !strings.Contains(row1, "rday*") || !strings.Contains(row1, "rwk*") {
+		t.Fatalf("partial sample must mark rday*/rwk*: %q", row1)
 	}
 }
 

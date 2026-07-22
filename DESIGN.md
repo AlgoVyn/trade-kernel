@@ -44,7 +44,7 @@ Keyboard ──> ui.Model ──> risk.Checker ──> execution.Executor ──
 | `internal/alpaca` | REST client (account, positions, orders, clock, assets, portfolio history, bars w/ pagination); SIP market-data WS client (auth, subscribe, hot-switch, exponential-backoff reconnect, resync callback); trading WS client (`trade_updates`). |
 | `internal/bars` | Aggregates trades into 1s/5s/15s/1m/5m/15m/1h/1d bars in preallocated ring buffers (2048/TF). Daily bars anchor at 20:00 ET (the overnight open) so a "day" is one 24/5 trading day. Handles late/out-of-order trades (H/L/V correction in-place). Maintains per-TF dual EMA and session VWAP; caches latest NBBO + last trade for the order builder. |
 | `internal/indicators` | Pure incremental O(1) EMA, resettable VWAP (SMA retained as a utility), each with non-mutating `Peek` for live forming-bar values. |
-| `internal/state` | Mutex-guarded cache of account/positions/open orders. REST snapshot at startup + every 5 s; trading-WS events applied incrementally; full refresh on WS reconnect. Account **day/week PnL** (realized-only, open marks stripped at REST time): day = equity−last_equity − Σ `unrealized_intraday_pl`; week = (equity − 1W history base_value) − Σ signedQty × (mark_now − window-start daily close), i.e. only unrealized that accrued *inside* the trailing week is stripped — never lifetime unrealized (refreshed every 5 min, not on the 5 s path). Snapshots avoid WS fill rewrites zeroing marks. |
+| `internal/state` | Mutex-guarded cache of account/positions/open orders. REST snapshot at startup + every 5 s; trading-WS events applied incrementally; full refresh on WS reconnect. Account **realized day/week PnL** from closed **order fills** (avg-cost inventory over FILL activities with open-position cost-basis seeds from the last REST reconcile for pre-lookback lots; retained REST avg after positions go flat so pure-exit books of previously seeded names stay continuous; fallback closed orders) — not equity MTM. Symbols with opposite-side seed/fill disagreement or ghost inventory without retained avg (full exit of a lot opened before the ~180d lookback with unknown cost basis) are excluded — partial samples log a soft warning and the TUI marks `rday*`/`rwk*`. Same-side REST-ahead-of-FILL lag trusts the fill book. If nothing trustworthy remains (or a fetch fails), the prior sample is kept; `PnL()` hides figures older than the stale threshold. FILL buffer is cached and delta-fetched on the 60 s refresh (empty successful caches re-poll a short tail, with a periodic full lookback heal). `rday` / `rwk` bucket by `DayStart` / `WeekStart` (last real overnight open Sun–Thu 20:00 ET, weekend pins to Thu 20:00 so Friday rday stays visible / Sunday 20:00 week). POS still shows open unrealized. |
 | `internal/execution` | `Executor` interface (`Buy/Sell/LimitBuy/LimitSell/Flatten/CancelAll/CancelSymbol`). `Builder` applies session rules. `RESTExecutor` submits with generated client order IDs. `EligibilityCache` caches overnight-tradability per symbol (1 h TTL). |
 | `internal/risk` | `Checker`: optional lock, max order qty, projected max position qty (reducing exposure always allowed), duplicate-order debounce (Check/Record split). |
 | `internal/cmdline` | `:` command parser → typed `Command` structs. |
@@ -95,6 +95,13 @@ price in extended sessions.
    confirmation. Scope is always the selected symbol (switch with
    `:sym` and panic each name separately). When other symbols remain
    open, the status line reminds the operator (`:sym` then `X`).
+   Flatten (F / `:flatten` / panic) uses the session-appropriate order
+   form for both long and short exits — market in Regular, aggressive
+   limit with `extended_hours=true` in extended sessions. It never falls
+   back to `DELETE /v2/positions` outside regular hours (that endpoint
+   liquidates at market, which extended sessions do not allow); that
+   endpoint is reserved for the Closed session and fractional
+   quantities, where the order path cannot work.
 3. **Idempotency**: every order carries a generated client order ID;
    state reconciliation after reconnect prevents duplicates.
 
@@ -172,6 +179,12 @@ bars flat. Reset to 0 wherever `panOffset` is reset (symbol/TF switch).
   stay as-is); high TFs / pan / closed slow to ≥100 ms. Quiet-tape status
   price reuses the frame chart Snapshot when live; when panned, takes a
   live-edge Snapshot so history does not overwrite the quote.
+- Chart/volume cell runs use **pre-baked ANSI open/close sequences** (hex
+  → terminal profile converted once at init). The render path must not
+  call `lipgloss.Style.Render` per run — that re-parses colors every frame
+  and was measured at ~1 core at 20 Hz.
+- Frame stack uses plain `"\n"` joins, not `lipgloss.JoinVertical`, so the
+  render path does not re-run ANSI `stringWidth` over the full chart.
 - `GOGC`/ballast tuning deliberately deferred: measure with
   `GODEBUG=gctrace` on the target VM first.
 - Local laptop vs near-Alpaca VM: app optimizations remove *extra* RTTs
@@ -212,7 +225,7 @@ forces live mode (still requires acknowledgement).
 
 | Failure | Behavior |
 |---|---|
-| Market-data WS drop | Exponential backoff (250 ms→10 s), re-auth, re-subscribe, REST backfill to heal gaps. |
+| Market-data WS drop | Exponential backoff (250 ms→10 s; resets only after an authed session lasts ≥5 s), re-auth, re-subscribe, forced REST backfill on reconnect (not debounced) to heal gaps. |
 | Trading WS drop | Same reconnect; full state reconcile from REST on re-auth. |
 | App restart mid-position | Startup reconcile (account + positions + open orders) before TUI starts. |
 | REST 4xx | Alpaca error envelope surfaced to the status line. |

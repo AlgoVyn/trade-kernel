@@ -5,8 +5,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -401,6 +403,76 @@ func TestCancelSymbolReturnsFailureCount(t *testing.T) {
 	}
 }
 
+// GET 429 retries honor a bounded Retry-After and succeed after the wait.
+func TestGET429HonorsRetryAfter(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"message":"rate limit"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"acct","equity":"1","cash":"1","buying_power":"1","status":"ACTIVE"}`))
+	}))
+	defer srv.Close()
+
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	start := time.Now()
+	if _, err := rest.Account(t.Context()); err != nil {
+		t.Fatalf("Account after 429: %v", err)
+	}
+	// Fixed backoff is 250ms; Retry-After=1s is preferred and capped at 2s.
+	// Require we waited at least ~750ms so the header path was used (not 250ms alone).
+	if elapsed := time.Since(start); elapsed < 750*time.Millisecond {
+		t.Fatalf("elapsed %v, want ≥750ms (Retry-After path)", elapsed)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("hits = %d, want 2", hits.Load())
+	}
+}
+
+// Final-attempt 429 must surface the error (no silent exhausted-retries path).
+func TestGET429ExhaustedReturnsError(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"slow down"}`))
+	}))
+	defer srv.Close()
+
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	_, err := rest.Account(t.Context())
+	if err == nil {
+		t.Fatal("expected 429 error after retries")
+	}
+	if !strings.Contains(err.Error(), "429") {
+		t.Fatalf("err = %v, want 429", err)
+	}
+	// 1 initial + doRateLimitRetries
+	if want := int32(1 + doRateLimitRetries); hits.Load() != want {
+		t.Fatalf("hits = %d, want %d", hits.Load(), want)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	if d := parseRetryAfter("2"); d != 2*time.Second {
+		t.Fatalf("seconds: got %v", d)
+	}
+	if d := parseRetryAfter(""); d != 0 {
+		t.Fatalf("empty: got %v", d)
+	}
+	if d := parseRetryAfter("not-a-number"); d != 0 {
+		t.Fatalf("http-date/invalid: got %v", d)
+	}
+}
+
 // TestResponseTruncatedDetected: a body larger than the 1 MB cap must return
 // ErrResponseTruncated rather than being silently chopped (which would
 // produce a misleading decode error or a partial parse).
@@ -426,5 +498,394 @@ func TestResponseTruncatedDetected(t *testing.T) {
 	_, err := rest.Account(t.Context())
 	if !errors.Is(err, ErrResponseTruncated) {
 		t.Fatalf("err = %v, want ErrResponseTruncated", err)
+	}
+}
+
+func TestFillsStuckPageTokenErrors(t *testing.T) {
+	// Full page with empty last activity id must not be treated as complete.
+	page := make([]map[string]any, fillPageSize)
+	for i := range page {
+		page[i] = map[string]any{
+			"id":               "",
+			"symbol":           "AAPL",
+			"side":             "buy",
+			"qty":              "1",
+			"price":            "10",
+			"transaction_time": "2026-07-15T14:00:00Z",
+		}
+	}
+	body, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/v2/account/activities/FILL") {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	got, err := rest.Fills(t.Context(), time.Time{}, time.Time{})
+	if err == nil {
+		t.Fatal("expected partial-history error on stuck page_token")
+	}
+	if got != nil {
+		t.Fatalf("on error must return nil fills, got len=%d", len(got))
+	}
+	if !strings.Contains(err.Error(), "page_token did not advance") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestClosedOrdersIdenticalSubmittedAtFullPageErrors(t *testing.T) {
+	// Full page of equal submitted_at cannot be continued with exclusive after.
+	ts := "2026-07-15T14:00:00.000000000Z"
+	page := make([]map[string]any, closedOrdersPage)
+	for i := range page {
+		page[i] = map[string]any{
+			"id":           "ord-" + strconv.Itoa(i),
+			"symbol":       "AAPL",
+			"side":         "buy",
+			"qty":          "1",
+			"filled_qty":   "1",
+			"status":       "filled",
+			"submitted_at": ts,
+			"filled_at":    ts,
+		}
+	}
+	body, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/v2/orders") {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		n++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	got, err := rest.ClosedOrders(t.Context(), time.Time{}, time.Time{})
+	if err == nil {
+		t.Fatal("expected partial-history error on identical submitted_at full page")
+	}
+	if got != nil {
+		t.Fatalf("on error must return nil orders, got len=%d", len(got))
+	}
+	if !strings.Contains(err.Error(), "identical submitted_at") {
+		t.Fatalf("err = %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("requests = %d, want 1 (fail before next page)", n)
+	}
+}
+
+func TestClosedOrdersTrailingSameSubmittedAtStuckErrors(t *testing.T) {
+	// Overlap cursor (last−1ns) re-fetches the same full page when the
+	// server keeps returning it; zero new ids must fail closed, not loop.
+	base := time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC)
+	page := make([]map[string]any, closedOrdersPage)
+	lastTS := base.Add(time.Duration(closedOrdersPage-2) * time.Second)
+	for i := range page {
+		ts := base.Add(time.Duration(i) * time.Second)
+		if i >= closedOrdersPage-2 {
+			ts = lastTS
+		}
+		page[i] = map[string]any{
+			"id":           "ord-" + strconv.Itoa(i),
+			"symbol":       "AAPL",
+			"side":         "buy",
+			"qty":          "1",
+			"filled_qty":   "1",
+			"status":       "filled",
+			"submitted_at": ts.Format(time.RFC3339Nano),
+			"filled_at":    ts.Format(time.RFC3339Nano),
+		}
+	}
+	body, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	got, err := rest.ClosedOrders(t.Context(), time.Time{}, time.Time{})
+	if err == nil {
+		t.Fatal("expected partial-history error when pagination yields only duplicates")
+	}
+	if got != nil {
+		t.Fatalf("on error must return nil orders, got len=%d", len(got))
+	}
+	if !strings.Contains(err.Error(), "no new order ids") {
+		t.Fatalf("err = %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("requests = %d, want 2 (first page + stuck overlap page)", n)
+	}
+}
+
+// Exclusive after=T used to drop the second order at T when a full page
+// ended with trailingSame==1. Overlap cursor must include the sibling.
+func TestClosedOrdersSingleTrailingSameTimestampIncludesSibling(t *testing.T) {
+	base := time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC)
+	// Page 1: 499 unique times + first of two orders at lastTS.
+	lastTS := base.Add(time.Duration(closedOrdersPage-1) * time.Second)
+	page1 := make([]map[string]any, closedOrdersPage)
+	for i := range page1 {
+		ts := base.Add(time.Duration(i) * time.Second)
+		if i == closedOrdersPage-1 {
+			ts = lastTS
+		}
+		page1[i] = map[string]any{
+			"id":           "ord-" + strconv.Itoa(i),
+			"symbol":       "AAPL",
+			"side":         "buy",
+			"qty":          "1",
+			"filled_qty":   "1",
+			"status":       "filled",
+			"submitted_at": ts.Format(time.RFC3339Nano),
+			"filled_at":    ts.Format(time.RFC3339Nano),
+		}
+	}
+	// Page 2: sibling at same lastTS, then one later order (short page).
+	page2 := []map[string]any{
+		{
+			"id":           "ord-sibling",
+			"symbol":       "AAPL",
+			"side":         "sell",
+			"qty":          "1",
+			"filled_qty":   "1",
+			"status":       "filled",
+			"submitted_at": lastTS.Format(time.RFC3339Nano),
+			"filled_at":    lastTS.Format(time.RFC3339Nano),
+		},
+		{
+			"id":           "ord-later",
+			"symbol":       "AAPL",
+			"side":         "buy",
+			"qty":          "1",
+			"filled_qty":   "1",
+			"status":       "filled",
+			"submitted_at": lastTS.Add(time.Second).Format(time.RFC3339Nano),
+			"filled_at":    lastTS.Add(time.Second).Format(time.RFC3339Nano),
+		},
+	}
+	body1, err := json.Marshal(page1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2, err := json.Marshal(page2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_, _ = w.Write(body1)
+			return
+		}
+		// Overlap page may re-include last of page1; return sibling + later.
+		// Optionally prepend last of page1 to simulate real after=last-1ns.
+		overlap := append([]map[string]any{page1[closedOrdersPage-1]}, page2...)
+		b, _ := json.Marshal(overlap)
+		_, _ = w.Write(b)
+	}))
+	defer srv.Close()
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	got, err := rest.ClosedOrders(t.Context(), time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatalf("ClosedOrders: %v", err)
+	}
+	ids := make(map[string]bool, len(got))
+	for _, o := range got {
+		ids[o.ID] = true
+	}
+	if !ids["ord-sibling"] {
+		t.Fatal("sibling at same submitted_at must not be dropped across pages")
+	}
+	if !ids["ord-later"] {
+		t.Fatal("later order missing")
+	}
+	if len(got) != closedOrdersPage+2 {
+		t.Fatalf("len = %d, want %d (page1 + sibling + later, de-duped)", len(got), closedOrdersPage+2)
+	}
+	if n != 2 {
+		t.Fatalf("requests = %d, want 2", n)
+	}
+	_ = body2 // page2 embedded via overlap construction
+}
+
+func TestFillsDedupesByActivityID(t *testing.T) {
+	// Overlapping page content must not double-count the same activity id.
+	page1 := make([]map[string]any, fillPageSize)
+	base := time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC)
+	for i := range page1 {
+		ts := base.Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano)
+		page1[i] = map[string]any{
+			"id":               "fill-" + strconv.Itoa(i),
+			"symbol":           "AAPL",
+			"side":             "buy",
+			"qty":              "1",
+			"price":            "10",
+			"transaction_time": ts,
+		}
+	}
+	// Second page: last id of page1 repeated, then one new fill.
+	page2 := []map[string]any{
+		page1[fillPageSize-1],
+		{
+			"id":               "fill-new",
+			"symbol":           "AAPL",
+			"side":             "sell",
+			"qty":              "1",
+			"price":            "11",
+			"transaction_time": base.Add(time.Duration(fillPageSize) * time.Second).Format(time.RFC3339Nano),
+		},
+	}
+	b1, err := json.Marshal(page1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := json.Marshal(page2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_, _ = w.Write(b1)
+			return
+		}
+		_, _ = w.Write(b2)
+	}))
+	defer srv.Close()
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	got, err := rest.Fills(t.Context(), time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// fillPageSize unique from page1 + 1 new (duplicate of last dropped).
+	if len(got) != fillPageSize+1 {
+		t.Fatalf("len(fills) = %d, want %d", len(got), fillPageSize+1)
+	}
+	if got[len(got)-1].ID != "fill-new" {
+		t.Fatalf("last id = %q, want fill-new", got[len(got)-1].ID)
+	}
+	seen := make(map[string]int)
+	for _, f := range got {
+		seen[f.ID]++
+	}
+	for id, c := range seen {
+		if c != 1 {
+			t.Fatalf("id %s counted %d times", id, c)
+		}
+	}
+}
+
+func TestClosedOrdersHTTPErrorReturnsPartial(t *testing.T) {
+	// Mid-pagination HTTP error returns rows already fetched with err so
+	// callers can checkpoint; err != nil still means incomplete history.
+	okPage := make([]map[string]any, closedOrdersPage)
+	base := time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC)
+	for i := range okPage {
+		ts := base.Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano)
+		okPage[i] = map[string]any{
+			"id":           "ord-" + strconv.Itoa(i),
+			"symbol":       "AAPL",
+			"side":         "buy",
+			"qty":          "1",
+			"filled_qty":   "1",
+			"status":       "filled",
+			"submitted_at": ts,
+			"filled_at":    ts,
+		}
+	}
+	body, err := json.Marshal(okPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		if n == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+			return
+		}
+		http.Error(w, "boom", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	got, err := rest.ClosedOrders(t.Context(), time.Time{}, time.Time{})
+	if err == nil {
+		t.Fatal("expected HTTP error on second page")
+	}
+	if len(got) != closedOrdersPage {
+		t.Fatalf("partial checkpoint: got len=%d, want %d", len(got), closedOrdersPage)
+	}
+	if !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("err should mark incomplete: %v", err)
+	}
+}
+
+func TestFillsHTTPErrorReturnsPartial(t *testing.T) {
+	okPage := make([]map[string]any, fillPageSize)
+	base := time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC)
+	for i := range okPage {
+		okPage[i] = map[string]any{
+			"id":               "fill-" + strconv.Itoa(i),
+			"symbol":           "AAPL",
+			"side":             "buy",
+			"qty":              "1",
+			"price":            "10",
+			"transaction_time": base.Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano),
+		}
+	}
+	body, err := json.Marshal(okPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		if n == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+			return
+		}
+		http.Error(w, "boom", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	got, err := rest.Fills(t.Context(), time.Time{}, time.Time{})
+	if err == nil {
+		t.Fatal("expected HTTP error on second page")
+	}
+	if len(got) != fillPageSize {
+		t.Fatalf("partial checkpoint: got len=%d, want %d", len(got), fillPageSize)
+	}
+	if !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("err should mark incomplete: %v", err)
 	}
 }

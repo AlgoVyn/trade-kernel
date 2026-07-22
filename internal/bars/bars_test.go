@@ -106,6 +106,37 @@ func TestResetMarketClearsQuoteAndTrade(t *testing.T) {
 	}
 }
 
+func TestOnQuoteOneSidedUpdates(t *testing.T) {
+	a := NewAggregator(2, 3)
+	a.OnQuote("AAPL", 150.20, 150.30, base)
+	// One-sided ask-only update must refresh ask and keep prior bid.
+	// quoteAt must stay at the older side (bid@base) so staleness is honest.
+	a.OnQuote("AAPL", 0, 150.35, base.Add(time.Second))
+	bid, ask, qAt := a.LatestQuote()
+	if bid != 150.20 || ask != 150.35 {
+		t.Fatalf("ask-only update: quote = %v×%v, want 150.20×150.35", bid, ask)
+	}
+	if !qAt.Equal(base) {
+		t.Fatalf("ask-only quoteAt = %v, want older side %v (not advanced)", qAt, base)
+	}
+	// One-sided bid-only update must refresh bid and keep prior ask.
+	// Both sides now at base+1s / base+2s → quoteAt = older (base+1s).
+	a.OnQuote("AAPL", 150.15, 0, base.Add(2*time.Second))
+	bid, ask, qAt = a.LatestQuote()
+	if bid != 150.15 || ask != 150.35 {
+		t.Fatalf("bid-only update: quote = %v×%v, want 150.15×150.35", bid, ask)
+	}
+	if !qAt.Equal(base.Add(time.Second)) {
+		t.Fatalf("bid-only quoteAt = %v, want min(side times) %v", qAt, base.Add(time.Second))
+	}
+	// Both sides invalid must not wipe the cache.
+	a.OnQuote("AAPL", 0, -1, base.Add(3*time.Second))
+	bid, ask, _ = a.LatestQuote()
+	if bid != 150.15 || ask != 150.35 {
+		t.Fatalf("invalid quote wiped cache: %v×%v", bid, ask)
+	}
+}
+
 func TestLateTradeUpdatesHistoricalBar(t *testing.T) {
 	a := NewAggregator(2, 3)
 	feed(a, []tick{

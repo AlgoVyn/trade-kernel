@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"trade-kernel/internal/alpaca"
 	"trade-kernel/internal/session"
@@ -55,9 +56,11 @@ func TestFlattenClosedFallback(t *testing.T) {
 	}
 }
 
-// TestFlattenPricingFailureFallsBack closes via DELETE when the builder
-// cannot price an extended-hours exit (no quote).
-func TestFlattenPricingFailureFallsBack(t *testing.T) {
+// TestFlattenExtendedPricingFailureNoMarketFallback: when the builder
+// cannot price an extended-hours exit, Flatten returns the error and must
+// NOT fall back to DELETE /v2/positions — that endpoint liquidates with a
+// market order, which is not allowed outside regular hours.
+func TestFlattenExtendedPricingFailureNoMarketFallback(t *testing.T) {
 	var gotDelete string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete && len(r.URL.Path) > len("/v2/positions/") {
@@ -73,45 +76,75 @@ func TestFlattenPricingFailureFallsBack(t *testing.T) {
 	rest.SetBaseURL(srv.URL)
 	// Empty quotes → builder fails for extended hours.
 	b := NewBuilder(fakeQuotes{}, nil, 25, 0)
-	exec := NewRESTExecutor(rest, b, func() session.Session { return session.PreMarket }, "day")
-
-	o, err := exec.Flatten(context.Background(), "AAPL", 100)
-	if err != nil {
-		t.Fatalf("Flatten: %v", err)
-	}
-	if gotDelete != "AAPL" {
-		t.Fatalf("expected ClosePosition fallback, got %q", gotDelete)
-	}
-	if !strings.HasPrefix(o.Status, "close_requested") {
-		t.Fatalf("status = %q, want close_requested…", o.Status)
-	}
-	if !strings.Contains(o.Status, "no quote") {
-		t.Fatalf("status should surface original builder error, got %q", o.Status)
+	for _, sess := range []session.Session{session.PreMarket, session.AfterHours, session.Overnight} {
+		gotDelete = ""
+		exec := NewRESTExecutor(rest, b, func() session.Session { return sess }, "day")
+		_, err := exec.Flatten(context.Background(), "AAPL", 100)
+		if err == nil {
+			t.Fatalf("%s: expected pricing error, got nil", sess)
+		}
+		if !strings.Contains(err.Error(), "no quote") {
+			t.Fatalf("%s: error should be the builder pricing failure, got %v", sess, err)
+		}
+		if gotDelete != "" {
+			t.Fatalf("%s: must not ClosePosition (market order) in extended session, got delete %q", sess, gotDelete)
+		}
 	}
 }
 
-// TestFlattenPricingAndCloseBothFail joins both errors for the operator.
-func TestFlattenPricingAndCloseBothFail(t *testing.T) {
+// TestFlattenOvernightLongShortLimitOrder: overnight flattens of both a
+// long (sell) and a short (buy) position submit aggressive LIMIT orders
+// with extended_hours=true — never market orders.
+func TestFlattenOvernightLongShortLimitOrder(t *testing.T) {
+	type captured struct {
+		Type          string `json:"type"`
+		Side          string `json:"side"`
+		TimeInForce   string `json:"time_in_force"`
+		ExtendedHours bool   `json:"extended_hours"`
+		LimitPrice    string `json:"limit_price"`
+		Qty           string `json:"qty"`
+	}
+	var (
+		got       captured
+		gotDelete string
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			http.Error(w, "position close failed", http.StatusInternalServerError)
-			return
+		switch {
+		case r.Method == http.MethodDelete && len(r.URL.Path) > len("/v2/positions/"):
+			gotDelete = r.URL.Path[len("/v2/positions/"):]
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/orders":
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(alpaca.Order{ID: "ord-1"})
 		}
-		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
 	rest := alpaca.NewREST("k", "s", true)
 	rest.SetBaseURL(srv.URL)
-	b := NewBuilder(fakeQuotes{}, nil, 25, 0)
-	exec := NewRESTExecutor(rest, b, func() session.Session { return session.PreMarket }, "day")
+	quotes := fakeQuotes{bid: 100.00, ask: 100.10, qAt: time.Now(), last: 100.05, tAt: time.Now()}
+	b := NewBuilder(quotes, nil, 25, 0)
+	exec := NewRESTExecutor(rest, b, func() session.Session { return session.Overnight }, "day")
 
-	_, err := exec.Flatten(context.Background(), "AAPL", 100)
-	if err == nil {
-		t.Fatal("expected joined error")
+	// Long exit → sell limit at bid × (1 − 25bps) = 99.75.
+	got = captured{}
+	if _, err := exec.Flatten(context.Background(), "AAPL", 100); err != nil {
+		t.Fatalf("flatten long: %v", err)
 	}
-	if !strings.Contains(err.Error(), "close position") {
-		t.Fatalf("error should include ClosePosition detail, got %v", err)
+	if got.Type != "limit" || got.Side != "sell" || !got.ExtendedHours || got.LimitPrice != "99.75" || got.Qty != "100" {
+		t.Fatalf("long flatten order = %+v, want limit sell 100 @99.75 extended_hours", got)
+	}
+	// Short exit → buy limit at ask × (1 + 25bps) = 100.36 (ceiled).
+	got = captured{}
+	if _, err := exec.Flatten(context.Background(), "AAPL", -100); err != nil {
+		t.Fatalf("flatten short: %v", err)
+	}
+	if got.Type != "limit" || got.Side != "buy" || !got.ExtendedHours || got.LimitPrice != "100.36" || got.Qty != "100" {
+		t.Fatalf("short flatten order = %+v, want limit buy 100 @100.36 extended_hours", got)
+	}
+	if gotDelete != "" {
+		t.Fatalf("must not ClosePosition for whole-share overnight flatten, got delete %q", gotDelete)
 	}
 }
 
@@ -153,7 +186,7 @@ func TestFlattenBrokerRejectDoesNotFallback(t *testing.T) {
 }
 
 // TestFlattenFractionalUsesClosePosition ensures non-integral qty never
-// truncates to a partial exit via the order path.
+// truncates to a partial exit via the order path in Regular/Closed.
 func TestFlattenFractionalUsesClosePosition(t *testing.T) {
 	var (
 		gotDelete string
@@ -175,18 +208,52 @@ func TestFlattenFractionalUsesClosePosition(t *testing.T) {
 	rest := alpaca.NewREST("k", "s", true)
 	rest.SetBaseURL(srv.URL)
 	b := NewBuilder(fakeQuotes{}, nil, 25, 0)
-	exec := NewRESTExecutor(rest, b, func() session.Session { return session.Regular }, "day")
 
-	for _, qty := range []float64{100.5, 0.5, -2.25} {
-		gotDelete, gotPost = "", 0
-		if _, err := exec.Flatten(context.Background(), "AAPL", qty); err != nil {
-			t.Fatalf("Flatten(%v): %v", qty, err)
+	for _, sess := range []session.Session{session.Regular, session.Closed} {
+		exec := NewRESTExecutor(rest, b, func() session.Session { return sess }, "day")
+		for _, qty := range []float64{100.5, 0.5, -2.25} {
+			gotDelete, gotPost = "", 0
+			if _, err := exec.Flatten(context.Background(), "AAPL", qty); err != nil {
+				t.Fatalf("%s Flatten(%v): %v", sess, qty, err)
+			}
+			if gotDelete != "AAPL" {
+				t.Fatalf("%s qty=%v: expected ClosePosition, delete=%q post=%d", sess, qty, gotDelete, gotPost)
+			}
+			if gotPost != 0 {
+				t.Fatalf("%s qty=%v: should not POST whole-share order, got %d", sess, qty, gotPost)
+			}
 		}
-		if gotDelete != "AAPL" {
-			t.Fatalf("qty=%v: expected ClosePosition, delete=%q post=%d", qty, gotDelete, gotPost)
+	}
+}
+
+// TestFlattenFractionalExtendedRejected: fractionals in extended hours must
+// not call ClosePosition (market liquidate) — return a clear error instead.
+func TestFlattenFractionalExtendedRejected(t *testing.T) {
+	var gotDelete string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && len(r.URL.Path) > len("/v2/positions/") {
+			gotDelete = r.URL.Path[len("/v2/positions/"):]
+			w.WriteHeader(http.StatusOK)
 		}
-		if gotPost != 0 {
-			t.Fatalf("qty=%v: should not POST whole-share order, got %d", qty, gotPost)
+	}))
+	defer srv.Close()
+
+	rest := alpaca.NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	b := NewBuilder(fakeQuotes{}, nil, 25, 0)
+
+	for _, sess := range []session.Session{session.PreMarket, session.AfterHours, session.Overnight} {
+		exec := NewRESTExecutor(rest, b, func() session.Session { return sess }, "day")
+		gotDelete = ""
+		_, err := exec.Flatten(context.Background(), "AAPL", 100.5)
+		if err == nil {
+			t.Fatalf("%s: expected error for fractional flatten", sess)
+		}
+		if !strings.Contains(err.Error(), "fractional") {
+			t.Fatalf("%s: error %q should mention fractional", sess, err)
+		}
+		if gotDelete != "" {
+			t.Fatalf("%s: must not ClosePosition for fractional in extended hours, got %q", sess, gotDelete)
 		}
 	}
 }

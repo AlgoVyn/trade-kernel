@@ -213,6 +213,44 @@ func (e *Engine) SyncClock(isOpen bool, nextOpen time.Time) {
 	}
 }
 
+// WeekStart returns the start of the current 24/5 trading week containing t:
+// the most recent Sunday 20:00 ET at or before t (the overnight open that
+// follows the Friday 20:00 ET weekend halt). Mirrors the daily-bar anchor.
+func WeekStart(t time.Time) time.Time {
+	te := t.In(et)
+	daysBack := int(te.Weekday()) // Sunday=0 … Saturday=6
+	candidate := time.Date(te.Year(), te.Month(), te.Day()-daysBack, 20, 0, 0, 0, et)
+	if te.Before(candidate) {
+		// Sunday before 20:00 (or a clock landing before the computed
+		// candidate): the trading week started a week earlier.
+		candidate = candidate.AddDate(0, 0, -7)
+	}
+	return candidate
+}
+
+// DayStart returns the start of the current 24/5 trading day containing t:
+// the most recent real overnight open (Sun–Thu 20:00 ET) at or before t.
+// Friday 20:00 and Saturday 20:00 are not overnight opens (weekend halt /
+// closed); while the market is Closed from Fri 20:00 through Sun 20:00,
+// DayStart stays on Thursday 20:00 so Friday’s realized window remains
+// visible over the weekend. Matches the realized day/week bucket used by
+// rday (not calendar midnight).
+func DayStart(t time.Time) time.Time {
+	te := t.In(et)
+	candidate := time.Date(te.Year(), te.Month(), te.Day(), 20, 0, 0, 0, et)
+	if te.Before(candidate) {
+		candidate = candidate.AddDate(0, 0, -1)
+	}
+	// Skip non-overnight 20:00s (Fri halt, Sat closed).
+	for {
+		wd := candidate.Weekday()
+		if wd != time.Friday && wd != time.Saturday {
+			return candidate
+		}
+		candidate = candidate.AddDate(0, 0, -1)
+	}
+}
+
 // nextExpectedRTHOpen returns the next 09:30 ET Monday–Friday open strictly
 // after t (or at t if t is exactly 09:30 on a weekday — callers use After).
 // Weekend candidates roll forward to Monday.

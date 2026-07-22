@@ -212,3 +212,53 @@ func TestSyncClockHolidayPreMarketForced(t *testing.T) {
 		t.Fatalf("Current() = %v, want Closed (pre-market holiday override)", got)
 	}
 }
+
+func TestWeekStart(t *testing.T) {
+	cases := []struct {
+		name string
+		at   time.Time
+		want time.Time
+	}{
+		// Trading week opens Sunday 20:00 ET.
+		{"sunday before open", etTime(2026, 7, 19, 19, 0), etTime(2026, 7, 12, 20, 0)},
+		{"sunday at open", etTime(2026, 7, 19, 20, 0), etTime(2026, 7, 19, 20, 0)},
+		{"sunday after open", etTime(2026, 7, 19, 23, 30), etTime(2026, 7, 19, 20, 0)},
+		{"monday pre-market", etTime(2026, 7, 20, 4, 30), etTime(2026, 7, 19, 20, 0)},
+		{"wednesday regular", etTime(2026, 7, 22, 11, 0), etTime(2026, 7, 19, 20, 0)},
+		{"friday evening", etTime(2026, 7, 24, 19, 0), etTime(2026, 7, 19, 20, 0)},
+		{"saturday (weekend halt)", etTime(2026, 7, 25, 12, 0), etTime(2026, 7, 19, 20, 0)},
+	}
+	for _, c := range cases {
+		if got := WeekStart(c.at); !got.Equal(c.want) {
+			t.Errorf("%s: WeekStart(%v) = %v, want %v", c.name, c.at, got, c.want)
+		}
+	}
+}
+
+func TestDayStart(t *testing.T) {
+	// 2026-07-17 is a Friday; Thu 16th 20:00 is Friday's trading-day open.
+	// Weekend halt Fri 20:00 → Sun 20:00 pins DayStart to Thu 20:00.
+	cases := []struct {
+		name string
+		at   time.Time
+		want time.Time
+	}{
+		{"before 20:00", etTime(2026, 7, 22, 15, 0), etTime(2026, 7, 21, 20, 0)},
+		{"at 20:00", etTime(2026, 7, 22, 20, 0), etTime(2026, 7, 22, 20, 0)},
+		{"after 20:00", etTime(2026, 7, 22, 21, 30), etTime(2026, 7, 22, 20, 0)},
+		{"overnight pre-market", etTime(2026, 7, 21, 4, 0), etTime(2026, 7, 20, 20, 0)},
+		// Friday still in AfterHours: trading day opened Thu 20:00.
+		{"friday 19:59 after-hours", etTime(2026, 7, 17, 19, 59), etTime(2026, 7, 16, 20, 0)},
+		// Fri 20:00+ is weekend halt — keep Friday's day (Thu 20:00), not Fri 20:00.
+		{"friday 20:01 closed", etTime(2026, 7, 17, 20, 1), etTime(2026, 7, 16, 20, 0)},
+		{"saturday noon", etTime(2026, 7, 18, 12, 0), etTime(2026, 7, 16, 20, 0)},
+		{"sunday before weekly open", etTime(2026, 7, 19, 19, 0), etTime(2026, 7, 16, 20, 0)},
+		// Sunday 20:00 opens the new week / new trading day.
+		{"sunday 20:00 weekly open", etTime(2026, 7, 19, 20, 0), etTime(2026, 7, 19, 20, 0)},
+	}
+	for _, c := range cases {
+		if got := DayStart(c.at); !got.Equal(c.want) {
+			t.Errorf("%s: DayStart(%v) = %v, want %v", c.name, c.at, got, c.want)
+		}
+	}
+}

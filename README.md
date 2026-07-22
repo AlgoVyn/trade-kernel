@@ -28,9 +28,10 @@ SSH + tmux.
   overnight: Alpaca's websocket doesn't stream the overnight session, so
   20:00–04:00 ET the chart, volume, and last price are kept live by
   polling the BOATS REST feed every 2 s.
-- **Resilient.** WebSocket auto-reconnect with REST backfill, state
-  reconciliation on startup and reconnect, client order IDs for
-  idempotency, keypress→ack latency (p50/p99) in the status bar.
+- **Resilient.** WebSocket auto-reconnect with REST backfill plus a
+  ping/pong watchdog (detects silently dead connections during quiet
+  hours), state reconciliation on startup and reconnect, client order
+  IDs for idempotency, keypress→ack latency (p50/p99) in the status bar.
 
 ## Quickstart
 

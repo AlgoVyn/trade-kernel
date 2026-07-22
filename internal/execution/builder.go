@@ -15,8 +15,8 @@ import (
 	"trade-kernel/internal/session"
 )
 
-// Sentinel errors from Build. Flatten matches these with errors.Is rather
-// than substring matching so reworded messages still fall back safely.
+// Sentinel errors from Build. Callers may match these with errors.Is for
+// UI messaging (Flatten no longer falls back to ClosePosition on Build errors).
 var (
 	// ErrMarketClosed is returned when the session is Closed.
 	ErrMarketClosed = errors.New("market is closed")
@@ -148,16 +148,22 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (alpaca.OrderRequest
 
 // aggressivePrice computes the far-side price with slippage for the
 // given side, falling back to the last trade when the quote is stale.
+// Buys use ask only; sells use bid only — so a one-sided extended-hours
+// book still prices Flatten. quoteAt is the older valid side (see
+// bars.OnQuote), so a fresh print on the unused side cannot make a stale
+// far side look current.
 func (b *Builder) aggressivePrice(side string) (float64, string) {
 	slip := b.slippageBps / 10000.0
 	now := b.now()
 	if b.quotes != nil {
 		bid, ask, qAt := b.quotes.LatestQuote()
-		if bid > 0 && ask > 0 && now.Sub(qAt) <= b.quoteStaleFor {
-			if side == "buy" {
+		if !qAt.IsZero() && now.Sub(qAt) <= b.quoteStaleFor {
+			if side == "buy" && ask > 0 {
 				return math.Ceil(ask*(1+slip)*100) / 100, ""
 			}
-			return math.Floor(bid*(1-slip)*100) / 100, ""
+			if side == "sell" && bid > 0 {
+				return math.Floor(bid*(1-slip)*100) / 100, ""
+			}
 		}
 		price, tAt := b.quotes.LatestTrade()
 		if price > 0 && now.Sub(tAt) <= b.quoteStaleFor {

@@ -73,9 +73,11 @@ type Chart struct {
 	// Timeframe is the initial chart resolution: built-ins (1s, 5s, 15s,
 	// 1m, 5m, 15m, 1h, 1d) or a custom duration (e.g. 2m, 3m, 30s, 4h).
 	// Change at runtime with :tf <resolution>.
-	Timeframe      string `yaml:"timeframe"`
-	BarsVisible    int    `yaml:"bars_visible"`
-	SessionShading bool   `yaml:"session_shading"`
+	Timeframe string `yaml:"timeframe"`
+	// BarsVisible optionally caps how many bars the chart paints (CPU/history).
+	// When ≤0 after Validate, defaults to 120. The UI uses min(width-fit, BarsVisible).
+	BarsVisible    int  `yaml:"bars_visible"`
+	SessionShading bool `yaml:"session_shading"`
 	// TickMS is the base UI render interval in milliseconds (default 50).
 	// Short timeframes refresh slightly faster (capped at 33ms when base is
 	// higher; aggressive configs below 33ms are honored). Panned history and

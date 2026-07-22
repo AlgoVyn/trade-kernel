@@ -37,18 +37,22 @@ func NewTradingWS(keyID, secretKey string, paper bool) *TradingWS {
 }
 
 // Run connects and maintains the connection until ctx is cancelled.
-// Backoff resets after any session that successfully authorized.
+//
+// Backoff (250ms → 10s cap) resets only when a session both authorized and
+// stayed up for at least 5s — same anti-flap rule as MarketWS. Sub-5s
+// auth-then-die sessions keep exponential backoff.
 func (t *TradingWS) Run(ctx context.Context) {
 	backoff := 250 * time.Millisecond
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		start := time.Now()
 		authed, err := t.runOnce(ctx)
 		if err != nil && t.OnError != nil && ctx.Err() == nil {
 			t.OnError(err)
 		}
-		if authed {
+		if authed && time.Since(start) >= 5*time.Second {
 			backoff = 250 * time.Millisecond
 		} else {
 			backoff *= 2
@@ -74,6 +78,7 @@ func (t *TradingWS) runOnce(ctx context.Context) (authed bool, err error) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "bye")
 	conn.SetReadLimit(1 << 20)
+	go pingWatchdog(ctx, conn)
 
 	write := func(v any) error {
 		b, err := json.Marshal(v)

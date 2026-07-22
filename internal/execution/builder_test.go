@@ -97,6 +97,50 @@ func TestBuildExtendedAggressiveSell(t *testing.T) {
 	}
 }
 
+// One-sided books (common in thin extended hours) must still price the
+// aggressive side without requiring both bid and ask.
+func TestBuildExtendedOneSidedQuote(t *testing.T) {
+	// Bid-only: sell Flatten off bid.
+	q := fakeQuotes{bid: 100.00, ask: 0, qAt: testNow.Add(-time.Second)}
+	b := newTestBuilder(q, nil)
+	req, warn, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "sell", Qty: 100, Session: session.AfterHours,
+	})
+	if err != nil || warn != "" {
+		t.Fatalf("bid-only sell: err=%v warn=%q", err, warn)
+	}
+	if req.LimitPrice != "99.75" {
+		t.Fatalf("bid-only sell price = %s, want 99.75", req.LimitPrice)
+	}
+	// Ask-only: buy off ask.
+	q = fakeQuotes{bid: 0, ask: 100.10, qAt: testNow.Add(-time.Second)}
+	b = newTestBuilder(q, nil)
+	req, warn, err = b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "buy", Qty: 100, Session: session.PreMarket,
+	})
+	if err != nil || warn != "" {
+		t.Fatalf("ask-only buy: err=%v warn=%q", err, warn)
+	}
+	if req.LimitPrice != "100.36" {
+		t.Fatalf("ask-only buy price = %s, want 100.36", req.LimitPrice)
+	}
+	// Bid-only cannot price a buy — fall back to last trade when present.
+	q = fakeQuotes{bid: 100.00, ask: 0, qAt: testNow.Add(-time.Second), last: 101.00, tAt: testNow.Add(-time.Second)}
+	b = newTestBuilder(q, nil)
+	req, warn, err = b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "buy", Qty: 100, Session: session.PreMarket,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warn == "" {
+		t.Fatal("expected last-trade warning when buy has no ask")
+	}
+	if req.LimitPrice != "101.26" {
+		t.Fatalf("buy without ask = %s, want last-trade 101.26", req.LimitPrice)
+	}
+}
+
 func TestBuildExtendedStaleQuoteFallsBack(t *testing.T) {
 	q := fakeQuotes{
 		bid: 100.00, ask: 100.10, qAt: testNow.Add(-time.Hour), // stale

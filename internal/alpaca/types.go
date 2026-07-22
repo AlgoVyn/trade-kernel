@@ -135,6 +135,24 @@ type Order struct {
 	FilledAvgPrice flexFloat `json:"filled_avg_price"`
 }
 
+// Fill is one execution from GET /v2/account/activities/FILL (or the
+// order-level aggregate used when synthesizing from closed orders).
+type Fill struct {
+	ID        string    `json:"id"`
+	Symbol    string    `json:"symbol"`
+	Side      string    `json:"side"` // "buy" | "sell"
+	Qty       flexFloat `json:"qty"`
+	Price     flexFloat `json:"price"`
+	OrderID   string    `json:"order_id"`
+	Timestamp time.Time `json:"transaction_time"`
+}
+
+// SetQty sets fill size (used when synthesizing seed / order-derived fills).
+func (f *Fill) SetQty(q float64) { f.Qty = flexFloat(q) }
+
+// SetPrice sets fill price.
+func (f *Fill) SetPrice(p float64) { f.Price = flexFloat(p) }
+
 // Clock is the /v2/clock response.
 type Clock struct {
 	IsOpen    bool      `json:"is_open"`
@@ -185,8 +203,13 @@ type Bar struct {
 	TradeCount int       `json:"n"`
 }
 
-// Trade is a trade message from the market-data WS ("T":"t").
+// Trade is a trade message from the market-data WS ("T":"t") and REST
+// /trades responses. MsgType must be declared: encoding/json matches keys
+// case-insensitively, so without an exact "T" field the message type letter
+// ("t") is applied to Timestamp (`json:"t"`) and unmarshaling fails — which
+// silently drops every live SIP print (chart freezes after backfill).
 type Trade struct {
+	MsgType   string    `json:"T,omitempty"`
 	Symbol    string    `json:"S"`
 	Price     flexFloat `json:"p"`
 	Size      flexFloat `json:"s"`
@@ -194,8 +217,11 @@ type Trade struct {
 	ID        int64     `json:"i"`
 }
 
-// Quote is a quote message from the market-data WS ("T":"q").
+// Quote is a quote message from the market-data WS ("T":"q") and REST
+// /quotes responses. MsgType absorbs the wire "T" field for the same
+// case-insensitive collision reason as Trade (see Trade docs).
 type Quote struct {
+	MsgType   string    `json:"T,omitempty"`
 	Symbol    string    `json:"S"`
 	BidPrice  flexFloat `json:"bp"`
 	BidSize   flexFloat `json:"bs"`

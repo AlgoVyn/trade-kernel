@@ -501,7 +501,7 @@ func (m *Model) cycleIndicators() {
 
 // chartWidth returns how many bars fit in the candle plot (excluding the
 // right-side price axis gutter). Accounts for barStride spacing. Mirrors
-// the layout math in View().
+// the layout math in View() so pan/focus steps match what is painted.
 func (m *Model) chartWidth() int {
 	axisW := priceAxisWidth
 	// Drop the price axis when the window is too narrow to host it.
@@ -1053,7 +1053,14 @@ func (m *Model) View() string {
 	// leftCrop narrows the window from the left (focus mode): bars cluster at
 	// the live edge and the blank left region lets volume/price scale rebase
 	// onto the recent window. barCol right-aligns so fewer bars = blank left.
+	// chart.bars_visible caps painted bars (Validate defaults omit/≤0 → 120).
+	// When the cap is below the width-fit count, the left gutter stays blank.
 	nBars := maxBars(plotW) - m.leftCrop
+	if m.d.Cfg != nil {
+		if cap := m.d.Cfg.Chart.BarsVisible; cap > 0 && nBars > cap {
+			nBars = cap
+		}
+	}
 	if nBars < 1 {
 		nBars = 1
 	}
@@ -1086,7 +1093,16 @@ func (m *Model) View() string {
 	}
 
 	// Stack: candles (+ price axis), then the time ruler, then volume.
-	chart := lipgloss.JoinVertical(lipgloss.Left, append(append(chartLines, rulerLine), volLines...)...)
+	// Plain "\n" join — not lipgloss.JoinVertical — so we never re-scan full
+	// ANSI chart lines for display width on the 10–30 Hz path (stringWidth
+	// was the post-bake CPU hot spot). Safe without JoinVertical's width
+	// normalization: chart/ruler/volume rows are fixed to plotW+axisW, and
+	// status/info/bottom already target m.width.
+	chartParts := make([]string, 0, len(chartLines)+1+len(volLines))
+	chartParts = append(chartParts, chartLines...)
+	chartParts = append(chartParts, rulerLine)
+	chartParts = append(chartParts, volLines...)
+	chart := strings.Join(chartParts, "\n")
 
 	// Pass chart snap into the status bar so quiet-tape OHLCV fallback does
 	// not take a second Aggregator.Snapshot (same mutex as ingest).
@@ -1095,7 +1111,7 @@ func (m *Model) View() string {
 		parts = append(parts, m.renderInfoBar(m.width, panelH, book, market))
 	}
 	parts = append(parts, chart, m.renderBottom())
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	return strings.Join(parts, "\n")
 }
 
 // statusBar palette + cached styles (Tokyo Night; rebuilt every frame was
@@ -1518,7 +1534,9 @@ func (m *Model) buildInfoBarRows(w int, book state.BookSnapshot, market bars.Mar
 		otherPos = muted.Render(fmt.Sprintf("+%d open (:sym+X)", otherN))
 	}
 
-	// --- Account: eq + day/week PnL (open marks stripped at REST) + bp; cash lower ---
+	// --- Account: eq + realized day/week PnL + bp; cash lower ---
+	// rday/rwk are fill-based realized P&L (closed orders), not equity MTM.
+	// Per-position unrealized stays on the POS segment.
 	eqText, cashText, bpText, dayText, weekText := "", "", "", "", ""
 	if book.HasAccount {
 		a := book.Account
@@ -1530,10 +1548,19 @@ func (m *Model) buildInfoBarRows(w int, book state.BookSnapshot, market bars.Mar
 	}
 	pnl := book.PnL
 	if pnl.HasDay {
-		dayText = lbl.Render("day") + " " + signedPLStyle(pnl.Day).Render(signedCompactMoney(pnl.Day))
+		dayLbl := "rday"
+		if pnl.Partial {
+			// Asterisk: sample excluded unreconcilable symbols (may undercount).
+			dayLbl = "rday*"
+		}
+		dayText = lbl.Render(dayLbl) + " " + signedPLStyle(pnl.Day).Render(signedCompactMoney(pnl.Day))
 	}
 	if pnl.HasWeek {
-		weekText = lbl.Render("wk") + " " + signedPLStyle(pnl.Week).Render(signedCompactMoney(pnl.Week))
+		weekLbl := "rwk"
+		if pnl.Partial {
+			weekLbl = "rwk*"
+		}
+		weekText = lbl.Render(weekLbl) + " " + signedPLStyle(pnl.Week).Render(signedCompactMoney(pnl.Week))
 	}
 
 	// --- VWAP absolute (delta already on POS) ---
@@ -1626,7 +1653,7 @@ func (m *Model) buildInfoBarRows(w int, book state.BookSnapshot, market bars.Mar
 		return r1, r2
 	}
 
-	// Quiet row: POS · eq · day · wk · bp · vwap · cash · +N sym.
+	// Quiet row: POS · eq · rday · rwk · bp · vwap · cash · +N sym.
 	r1 := fitInfoSegs(w, sep, sepW, []infoSeg{
 		{posText, pPOS},
 		{eqText, pEQ},

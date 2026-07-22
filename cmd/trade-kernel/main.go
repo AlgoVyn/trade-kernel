@@ -142,14 +142,46 @@ func main() {
 	}()
 
 	// --- State reconciliation ---
-	// Account/positions/orders every 5s; week portfolio history on a slower
-	// cadence so the hot reconcile path is not paying an extra history RTT.
+	// Account/positions/open orders every 5s. Realized day/week PnL comes
+	// from closed-order / FILL history (heavier) on a slower cadence.
 	if err := store.Refresh(ctx, rest); err != nil {
 		log.Printf("initial reconcile: %v", err)
 	}
-	if err := store.RefreshWeekPnL(ctx, rest); err != nil {
-		log.Printf("initial week PnL: %v", err)
+	// Bound the initial FILL history walk so multi-page accounts do not
+	// block TUI startup indefinitely; the 60s ticker will retry.
+	// Rate-limit repeated identical errors (e.g. inventory inconsistent)
+	// so a stuck symbol does not spam the log every tick.
+	var (
+		realizedLogMu     sync.Mutex
+		lastRealizedErr   string
+		lastRealizedLogAt time.Time
+	)
+	const realizedLogCooldown = 5 * time.Minute
+	logRealizedErr := func(prefix string, err error) {
+		if err == nil {
+			return
+		}
+		msg := err.Error()
+		realizedLogMu.Lock()
+		defer realizedLogMu.Unlock()
+		if msg == lastRealizedErr && time.Since(lastRealizedLogAt) < realizedLogCooldown {
+			return
+		}
+		lastRealizedErr = msg
+		lastRealizedLogAt = time.Now()
+		log.Printf("%s: %v", prefix, err)
 	}
+	// Multi-page FILL history can exceed a short budget on active accounts.
+	// Run the initial walk asynchronously so market WS, trading WS, and the
+	// TUI start immediately — rday/rwk is display-only and may stay blank
+	// until the first successful sample (same as a cold/stale status bar).
+	go func() {
+		rctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		if err := store.RefreshRealizedPnL(rctx, rest); err != nil {
+			logRealizedErr("initial realized PnL", err)
+		}
+	}()
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
@@ -165,22 +197,24 @@ func main() {
 		}
 	}()
 	go func() {
-		t := time.NewTicker(5 * time.Minute)
+		// FILL history pagination is slower than account reconcile; 60s is
+		// enough for rday/rwk while keeping rate-limit headroom. Bound each
+		// tick so a multi-page walk cannot block the goroutine indefinitely.
+		const realizedTickBudget = 60 * time.Second
+		t := time.NewTicker(60 * time.Second)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				// Refresh first so SetWeekPnL pairs history with REST mark
-				// snaps (not WS-zeroed unrealized fields after fills).
-				if err := store.Refresh(ctx, rest); err != nil {
-					log.Printf("reconcile before week PnL: %v", err)
-					// Still attempt history; strip uses last good REST snap.
-				}
-				if err := store.RefreshWeekPnL(ctx, rest); err != nil {
-					log.Printf("week PnL: %v", err)
-				}
+				func() {
+					rctx, cancel := context.WithTimeout(ctx, realizedTickBudget)
+					defer cancel()
+					if err := store.RefreshRealizedPnL(rctx, rest); err != nil {
+						logRealizedErr("realized PnL", err)
+					}
+				}()
 			}
 		}
 	}()
@@ -192,14 +226,26 @@ func main() {
 	// Serialise backfills and ignore superseded generations so reconnect
 	// + symbol switch cannot interleave Loads for different symbols.
 	var (
-		backfillMu  sync.Mutex
-		backfillGen atomic.Uint64
+		backfillMu       sync.Mutex
+		backfillGen      atomic.Uint64
+		lastBackfillTime = make(map[string]time.Time)
 	)
+	const backfillDebounce = 5 * time.Second
+	// stampBackfill records a successful backfill and prunes expired debounce
+	// entries. Caller must hold backfillMu.
+	stampBackfill := func(symbol string, now time.Time) {
+		lastBackfillTime[symbol] = now
+		for k, t := range lastBackfillTime {
+			if now.Sub(t) >= backfillDebounce {
+				delete(lastBackfillTime, k)
+			}
+		}
+	}
 	// liveCursor holds the end time (time.Time) of the most recent
 	// backfill. The overnight poller reads it so it never re-applies
 	// trades that Load / ReplayTrades already folded into the aggregator.
 	liveCursor := &atomic.Value{}
-	runBackfill := func(symbol string, gen uint64) {
+	runBackfill := func(symbol string, gen uint64, force bool) {
 		backfillMu.Lock()
 		defer backfillMu.Unlock()
 		if backfillGen.Load() != gen {
@@ -208,13 +254,23 @@ func main() {
 		if activeSymbol.Load().(string) != symbol {
 			return
 		}
+		// Debounce only non-forced paths (e.g. duplicate OnInitial). Reconnect
+		// always forces so a drop within 5s of the last success still catch-ups.
+		if !force {
+			if last, ok := lastBackfillTime[symbol]; ok && time.Since(last) < backfillDebounce {
+				return
+			}
+		}
 		if err := backfill(context.Background(), rest, agg, symbol, liveCursor); err != nil {
 			log.Printf("backfill %s: %v", symbol, err)
+			return
 		}
+		// Stamp only after success so a failed backfill does not block retries.
+		stampBackfill(symbol, time.Now())
 	}
-	scheduleBackfill := func(symbol string) {
+	scheduleBackfill := func(symbol string, force bool) {
 		gen := backfillGen.Add(1)
-		go runBackfill(symbol, gen)
+		go runBackfill(symbol, gen, force)
 	}
 
 	mws := alpaca.NewMarketWS(cfg.APIKeyID, cfg.APISecretKey)
@@ -232,11 +288,11 @@ func main() {
 	}
 	mws.OnInitial = func() {
 		log.Printf("market ws subscribed; backfilling %s", mws.Symbol())
-		scheduleBackfill(mws.Symbol())
+		scheduleBackfill(mws.Symbol(), false)
 	}
 	mws.OnReconnect = func() {
 		log.Printf("market ws reconnected; backfilling %s", mws.Symbol())
-		scheduleBackfill(mws.Symbol())
+		scheduleBackfill(mws.Symbol(), true)
 	}
 	mws.OnError = func(err error) { log.Printf("market ws: %v", err) }
 	_ = mws.SetSymbol(cfg.DefaultSymbol)
@@ -295,6 +351,9 @@ func main() {
 		if err := backfill(context.Background(), rest, agg, symbol, liveCursor); err != nil {
 			return err
 		}
+		// Stamp debounce map for consistency with runBackfill so a later
+		// non-forced schedule does not immediately re-fetch the same symbol.
+		stampBackfill(symbol, time.Now())
 		prefetchElig(symbol)
 		return nil
 	}

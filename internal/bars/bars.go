@@ -187,6 +187,11 @@ func newBar(start time.Time, price, vol float64) Bar {
 }
 
 func (b *Bar) add(price, vol float64) {
+	// Caller (OnTrade) already rejects non-positive prices; keep the guard
+	// so late/replay paths cannot drive Low to 0 and collapse the Y-axis.
+	if !validTradePrice(price) {
+		return
+	}
 	if price > b.High {
 		b.High = price
 	}
@@ -194,7 +199,9 @@ func (b *Bar) add(price, vol float64) {
 		b.Low = price
 	}
 	b.Close = price
-	b.Volume += vol
+	if vol > 0 && !math.IsNaN(vol) && !math.IsInf(vol, 0) {
+		b.Volume += vol
+	}
 }
 
 // ring is a fixed-capacity circular buffer of bars with parallel
@@ -290,7 +297,8 @@ type Aggregator struct {
 	lastTradePrice float64
 	lastTradeAt    time.Time
 	bid, ask       float64
-	quoteAt        time.Time
+	bidAt, askAt   time.Time // per-side timestamps (one-sided books)
+	quoteAt        time.Time // min of valid sides — drives staleness checks
 }
 
 // NewAggregator creates an Aggregator with two EMA periods (fast, slow).
@@ -337,10 +345,46 @@ func bucket(tf TF, ts time.Time) time.Time {
 	return time.Date(prev.Year(), prev.Month(), prev.Day(), 20, 0, 0, 0, session.Location())
 }
 
+// validTradePrice reports whether price is usable for OHLC / last / VWAP.
+// Non-positive, NaN, and Inf prints must never enter the rings — a single
+// zero low expands the chart scale to the origin and flattens every candle.
+func validTradePrice(price float64) bool {
+	return price > 0 && !math.IsNaN(price) && !math.IsInf(price, 0)
+}
+
+// maxLiveTradeJumpRatio rejects live prints that jump by more than this
+// factor vs the last accepted trade (or below 1/ratio). Catches bad SIP
+// ticks like 1e20 without blocking real multi-percent gaps after halts.
+// Historical ReplayTrades does not apply this filter.
+const maxLiveTradeJumpRatio = 10.0
+
+// liveTradePlausibleLocked reports whether price is a sane live print given
+// the last accepted trade. Caller holds a.mu. First print (no last) is always
+// accepted when validTradePrice already passed.
+func (a *Aggregator) liveTradePlausibleLocked(price float64) bool {
+	last := a.lastTradePrice
+	if last <= 0 {
+		return true
+	}
+	hi := last * maxLiveTradeJumpRatio
+	lo := last / maxLiveTradeJumpRatio
+	return price <= hi && price >= lo
+}
+
 // OnTrade folds one trade into every timeframe. Must not block.
+// Invalid or absurd live prices are ignored (no last-trade update, no bar mutation).
 func (a *Aggregator) OnTrade(symbol string, price, size float64, ts time.Time) {
+	if !validTradePrice(price) {
+		return
+	}
+	if size < 0 || math.IsNaN(size) || math.IsInf(size, 0) {
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if !a.liveTradePlausibleLocked(price) {
+		return
+	}
 	a.lastTradePrice = price
 	a.lastTradeAt = ts
 	a.vwap.Update(price, size)
@@ -380,6 +424,12 @@ func (a *Aggregator) ReplayTrades(trades []TradeReplay) {
 		a.resetSeriesLocked(a.series[tf])
 	}
 	for _, tr := range trades {
+		if !validTradePrice(tr.Price) {
+			continue
+		}
+		if tr.Size < 0 || math.IsNaN(tr.Size) || math.IsInf(tr.Size, 0) {
+			continue
+		}
 		for _, tf := range []TF{TF1s, TF5s, TF15s} {
 			a.aggregateInto(tf, tr.Price, tr.Size, tr.Timestamp)
 		}
@@ -484,11 +534,52 @@ func bucketDur(d time.Duration, ts time.Time) time.Time {
 	return ts.UTC().Truncate(d)
 }
 
-// OnQuote caches the latest NBBO.
+// OnQuote caches the latest NBBO. Each side is updated independently when
+// valid so a one-sided or temporarily zeroed book still refreshes the good
+// side (common in thin extended-hours quotes). A quote with both sides
+// invalid is ignored so a zero print cannot wipe a good cache.
+//
+// quoteAt is the older of the two valid side timestamps so a fresh ask-only
+// (or bid-only) print cannot make the retained opposite side look current for
+// staleness checks (extended-hours Flatten prices sells off bid / buys off ask).
 func (a *Aggregator) OnQuote(symbol string, bid, ask float64, ts time.Time) {
+	bidOK := validTradePrice(bid)
+	askOK := validTradePrice(ask)
+	if !bidOK && !askOK {
+		return
+	}
 	a.mu.Lock()
-	a.bid, a.ask, a.quoteAt = bid, ask, ts
+	if bidOK {
+		a.bid = bid
+		a.bidAt = ts
+	}
+	if askOK {
+		a.ask = ask
+		a.askAt = ts
+	}
+	a.recomputeQuoteAtLocked()
 	a.mu.Unlock()
+}
+
+// recomputeQuoteAtLocked sets quoteAt to the older valid side timestamp.
+// Caller holds a.mu.
+func (a *Aggregator) recomputeQuoteAtLocked() {
+	bidOK := a.bid > 0 && !a.bidAt.IsZero()
+	askOK := a.ask > 0 && !a.askAt.IsZero()
+	switch {
+	case bidOK && askOK:
+		if a.bidAt.Before(a.askAt) {
+			a.quoteAt = a.bidAt
+		} else {
+			a.quoteAt = a.askAt
+		}
+	case bidOK:
+		a.quoteAt = a.bidAt
+	case askOK:
+		a.quoteAt = a.askAt
+	default:
+		a.quoteAt = time.Time{}
+	}
 }
 
 // LatestQuote returns the cached NBBO and its timestamp.
@@ -560,6 +651,7 @@ func (a *Aggregator) ResetMarket() {
 	a.lastTradePrice = 0
 	a.lastTradeAt = time.Time{}
 	a.bid, a.ask = 0, 0
+	a.bidAt, a.askAt = time.Time{}, time.Time{}
 	a.quoteAt = time.Time{}
 	for _, tf := range []TF{TF1s, TF5s, TF15s} {
 		a.resetSeriesLocked(a.series[tf])
