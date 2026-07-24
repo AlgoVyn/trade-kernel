@@ -30,6 +30,15 @@ var (
 	ErrOvernightEligibility = errors.New("overnight eligibility check failed")
 )
 
+// exitStaleLastTradeMax is how old a last trade may be when AllowStaleLastTrade
+// is set (flatten/panic exits). Quiet overnight tape often has no print for
+// minutes; hard-failing at quoteStaleFor (3s) leaves risk open.
+const exitStaleLastTradeMax = 5 * time.Minute
+
+// maxEligibilityEntries bounds the overnight-tradability cache so multi-day
+// :sym hopping cannot grow the map without bound.
+const maxEligibilityEntries = 256
+
 // QuoteSource provides the latest NBBO and last trade for the active
 // symbol (implemented by bars.Aggregator).
 type QuoteSource interface {
@@ -51,6 +60,9 @@ type BuildInput struct {
 	Session    session.Session
 	LimitPrice float64 // >0: explicit limit (from ':' command); 0: hotkey default
 	RegularTIF string  // "day" | "ioc" for regular-hours orders
+	// AllowStaleLastTrade widens the last-trade age budget for exit paths
+	// (flatten/panic) when the NBBO is missing or stale on a quiet tape.
+	AllowStaleLastTrade bool
 }
 
 // Builder applies session-aware order-form rules.
@@ -134,7 +146,7 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (alpaca.OrderRequest
 			req.LimitPrice = fmt.Sprintf("%.2f", in.LimitPrice)
 			return req, "", nil
 		}
-		price, warn := b.aggressivePrice(in.Side)
+		price, warn := b.aggressivePrice(in.Side, in.AllowStaleLastTrade)
 		if price <= 0 {
 			return alpaca.OrderRequest{}, "", ErrNoExtendedPrice
 		}
@@ -152,7 +164,11 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (alpaca.OrderRequest
 // book still prices Flatten. quoteAt is the older valid side (see
 // bars.OnQuote), so a fresh print on the unused side cannot make a stale
 // far side look current.
-func (b *Builder) aggressivePrice(side string) (float64, string) {
+//
+// When allowStaleLastTrade is true (exit paths), a last trade older than
+// quoteStaleFor but within exitStaleLastTradeMax is still used with a
+// warning so quiet overnight/extended tape does not hard-fail flatten/panic.
+func (b *Builder) aggressivePrice(side string, allowStaleLastTrade bool) (float64, string) {
 	slip := b.slippageBps / 10000.0
 	now := b.now()
 	if b.quotes != nil {
@@ -166,11 +182,26 @@ func (b *Builder) aggressivePrice(side string) (float64, string) {
 			}
 		}
 		price, tAt := b.quotes.LatestTrade()
-		if price > 0 && now.Sub(tAt) <= b.quoteStaleFor {
-			if side == "buy" {
-				return math.Ceil(price*(1+slip)*100) / 100, "NBBO stale: priced off last trade"
+		if price > 0 && !tAt.IsZero() {
+			age := now.Sub(tAt)
+			// Future-dated stamps (clock skew) would yield negative age and
+			// always pass the stale window without the quiet-tape path.
+			if age < 0 {
+				age = 0
 			}
-			return math.Floor(price*(1-slip)*100) / 100, "NBBO stale: priced off last trade"
+			if age <= b.quoteStaleFor {
+				if side == "buy" {
+					return math.Ceil(price*(1+slip)*100) / 100, "NBBO stale: priced off last trade"
+				}
+				return math.Floor(price*(1-slip)*100) / 100, "NBBO stale: priced off last trade"
+			}
+			if allowStaleLastTrade && age <= exitStaleLastTradeMax {
+				warn := fmt.Sprintf("quiet tape: priced off last trade (age %s)", age.Round(time.Second))
+				if side == "buy" {
+					return math.Ceil(price*(1+slip)*100) / 100, warn
+				}
+				return math.Floor(price*(1-slip)*100) / 100, warn
+			}
 		}
 	}
 	return 0, ""
@@ -178,8 +209,15 @@ func (b *Builder) aggressivePrice(side string) (float64, string) {
 
 // PreviewLimit returns the aggressive limit price that Build would use
 // for a hotkey order right now (for the status-bar confirmation line).
+// Exit paths that use AllowStaleLastTrade should call PreviewLimitExit.
 func (b *Builder) PreviewLimit(side string) (float64, string) {
-	return b.aggressivePrice(side)
+	return b.aggressivePrice(side, false)
+}
+
+// PreviewLimitExit is PreviewLimit with the wider last-trade budget used by
+// flatten/panic so the confirmation line matches submit pricing.
+func (b *Builder) PreviewLimitExit(side string) (float64, string) {
+	return b.aggressivePrice(side, true)
 }
 
 // EligibilityCache caches per-symbol overnight-tradability from the
@@ -215,7 +253,33 @@ func (c *EligibilityCache) OvernightTradable(ctx context.Context, symbol string)
 	}
 	ok := a.Tradable && a.IsOvernightTradable()
 	c.mu.Lock()
+	c.pruneExpiredLocked()
+	if len(c.ent) >= maxEligibilityEntries {
+		// Evict oldest-by-at so multi-day :sym hopping does not thrash the
+		// currently active symbol (which is refreshed on each insert).
+		var oldestK string
+		var oldestAt time.Time
+		first := true
+		for k, e := range c.ent {
+			if first || e.at.Before(oldestAt) {
+				oldestK, oldestAt = k, e.at
+				first = false
+			}
+		}
+		if oldestK != "" {
+			delete(c.ent, oldestK)
+		}
+	}
 	c.ent[symbol] = eligEntry{ok: ok, at: time.Now()}
 	c.mu.Unlock()
 	return ok, nil
+}
+
+func (c *EligibilityCache) pruneExpiredLocked() {
+	now := time.Now()
+	for k, e := range c.ent {
+		if now.Sub(e.at) >= c.ttl {
+			delete(c.ent, k)
+		}
+	}
 }

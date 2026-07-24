@@ -961,11 +961,61 @@ func TestResetMarketClearsCustomBars(t *testing.T) {
 	}
 }
 
+// TestResetMarketClearsAllTimeframes ensures critical backfill rollback cannot
+// leave mixed-symbol minute+ rings after a partial Load.
+func TestResetMarketClearsAllTimeframes(t *testing.T) {
+	a := NewAggregator(2, 3)
+	// Closed hist bars (start in the past) so rings retain entries after Load.
+	past := base.Add(-2 * time.Hour).Truncate(time.Hour)
+	hist := []Bar{{
+		Start: past, Open: 100, High: 101, Low: 99, Close: 100.5, Volume: 50,
+	}}
+	for _, tf := range []TF{TF1m, TF5m, TF15m, TF1h, TF1d} {
+		a.Load(tf, hist)
+		if a.HistoryDepth(tf) == 0 {
+			t.Fatalf("setup: %v should have closed history", tf)
+		}
+	}
+	// Two sub-minute prints a minute apart so TF1s closes a ring entry.
+	a.OnTrade("AAPL", 100, 10, past)
+	a.OnTrade("AAPL", 101, 10, past.Add(2*time.Second))
+	if a.HistoryDepth(TF1s) == 0 {
+		t.Fatal("setup: 1s should have closed history")
+	}
+	a.ResetMarket()
+	for tf := TF(0); tf < numTF; tf++ {
+		if a.HistoryDepth(tf) != 0 {
+			t.Fatalf("%v history after ResetMarket = %d, want 0", tf, a.HistoryDepth(tf))
+		}
+		if _, ok := a.LastBarTime(tf); ok {
+			t.Fatalf("%v still has forming/closed bar after ResetMarket", tf)
+		}
+	}
+}
+
 func TestParseDurationTokenRejectsOverflow(t *testing.T) {
 	// Pathological magnitudes must fail before Duration wrap.
 	for _, bad := range []string{"999999999h", "100000000s", "999999m", "99d"} {
 		if _, ok := ParseChartTF(bad); ok {
 			t.Fatalf("ParseChartTF(%q) should fail", bad)
 		}
+	}
+}
+
+
+// TestResetMarketDropsBackfillBuffer ensures a symbol switch cannot drain
+// prints buffered under a previous symbol into the new rings.
+func TestResetMarketDropsBackfillBuffer(t *testing.T) {
+	a := NewAggregator(2, 3)
+	a.BeginBackfill()
+	a.OnTrade("AAPL", 150, 10, base.Add(time.Second))
+	a.ResetMarket()
+	// EndBackfill after Reset must be a no-op (buffer discarded, not drained).
+	a.EndBackfill()
+	if px, _ := a.LatestTrade(); px != 0 {
+		t.Fatalf("last trade after ResetMarket+EndBackfill = %v, want 0", px)
+	}
+	if a.HistoryDepth(TF1s) != 0 {
+		t.Fatal("1s history should stay empty when buffer was dropped")
 	}
 }

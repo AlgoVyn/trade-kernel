@@ -67,7 +67,7 @@ func TestOvernightFeedRespectsBackfillCursor(t *testing.T) {
 		return []alpaca.Trade{old, new}, nil
 	})
 	// Backfill covered everything up to now-2s: the old print must be skipped.
-	feed.backfillCursor.Store(now.Add(-2 * time.Second))
+	feed.backfillCursor.Store(backfillHighWater{Symbol: "TEST", At: now.Add(-2 * time.Second)})
 
 	feed.pollOnce(context.Background(), "TEST")
 	snap := agg.Snapshot(bars.TF1m, 10, 0)
@@ -94,6 +94,8 @@ func TestOvernightFeedSymbolSwitchResetsState(t *testing.T) {
 	feed.cursor = now.Add(-time.Minute)
 	feed.seen[999] = struct{}{}
 	feed.mu.Unlock()
+	// Stale high-water for the previous symbol must not gate the new tape.
+	feed.backfillCursor.Store(backfillHighWater{Symbol: "OLD", At: now.Add(time.Hour)})
 
 	feed.pollOnce(context.Background(), "NEW")
 	price, _ := agg.LatestTrade()
@@ -174,5 +176,67 @@ func TestOvernightFeedSkipsZeroQuote(t *testing.T) {
 	bid, ask, _ := agg.LatestQuote()
 	if bid != 0 || ask != 0 {
 		t.Fatalf("quote = %vx%v, want 0x0 (zero quote not cached)", bid, ask)
+	}
+}
+
+// One-sided overnight books must still refresh the good side (matches SIP).
+func TestOvernightFeedOneSidedQuote(t *testing.T) {
+	now := time.Now()
+	feed, agg := testFeedQ(t,
+		func(_ context.Context, _ string, _, _ time.Time, _ int) ([]alpaca.Trade, error) {
+			return nil, nil
+		},
+		func(_ context.Context, _ string) (alpaca.Quote, error) {
+			return alpaca.Quote{Symbol: "TEST", BidPrice: 99.5, AskPrice: 0, Timestamp: now}, nil
+		})
+	feed.pollOnce(context.Background(), "TEST")
+	bid, ask, _ := agg.LatestQuote()
+	if bid != 99.5 || ask != 0 {
+		t.Fatalf("quote = %vx%v, want 99.5x0 (one-sided bid)", bid, ask)
+	}
+}
+
+// Zero-ID trades at the cursor high-water mark must not re-apply every poll.
+func TestOvernightFeedZeroIDNotDoubleCounted(t *testing.T) {
+	now := time.Now()
+	tr := alpaca.Trade{Symbol: "TEST", ID: 0, Price: 100, Size: 10, Timestamp: now.Add(-time.Second)}
+	feed, agg := testFeed(t, func(_ context.Context, _ string, _, _ time.Time, _ int) ([]alpaca.Trade, error) {
+		return []alpaca.Trade{tr}, nil
+	})
+	feed.pollOnce(context.Background(), "TEST")
+	feed.pollOnce(context.Background(), "TEST")
+	snap := agg.Snapshot(bars.TF1m, 10, 0)
+	if len(snap.Bars) == 0 {
+		t.Fatal("no bars")
+	}
+	if snap.Bars[len(snap.Bars)-1].Volume != 10 {
+		t.Fatalf("volume = %v, want 10 (zero-ID trade applied once)", snap.Bars[len(snap.Bars)-1].Volume)
+	}
+}
+
+// Non-zero-ID trades exactly at the backfill high-water must not double-count
+// after Load/Replay (exclusive high-water contract).
+func TestOvernightFeedExclusiveHighWaterNonZeroID(t *testing.T) {
+	now := time.Now()
+	atMark := now.Add(-2 * time.Second)
+	boundary := alpaca.Trade{Symbol: "TEST", ID: 1, Price: 100, Size: 10, Timestamp: atMark}
+	newer := alpaca.Trade{Symbol: "TEST", ID: 2, Price: 101, Size: 20, Timestamp: now.Add(-1 * time.Second)}
+	feed, agg := testFeed(t, func(_ context.Context, _ string, _, _ time.Time, _ int) ([]alpaca.Trade, error) {
+		return []alpaca.Trade{boundary, newer}, nil
+	})
+	// Empty seen after backfill; cursor raised to the REST trade window end.
+	feed.backfillCursor.Store(backfillHighWater{Symbol: "TEST", At: atMark})
+
+	feed.pollOnce(context.Background(), "TEST")
+	snap := agg.Snapshot(bars.TF1m, 10, 0)
+	if len(snap.Bars) == 0 {
+		t.Fatal("no bars after polling")
+	}
+	last := snap.Bars[len(snap.Bars)-1]
+	if last.Volume != 20 {
+		t.Fatalf("volume = %v, want 20 (boundary non-zero ID at high-water skipped)", last.Volume)
+	}
+	if last.Close != 101 {
+		t.Fatalf("close = %v, want 101", last.Close)
 	}
 }

@@ -276,6 +276,13 @@ type Snapshot struct {
 	VWAP []float64 // session VWAP value at each bar's close
 }
 
+// bufferedTrade is a live print held during REST backfill so Load cannot
+// wipe volume applied while the multi-second fetch ran.
+type bufferedTrade struct {
+	price, size float64
+	ts          time.Time
+}
+
 // Aggregator builds bars for all timeframes from one trade stream.
 // All methods are safe for concurrent use.
 type Aggregator struct {
@@ -299,7 +306,20 @@ type Aggregator struct {
 	bid, ask       float64
 	bidAt, askAt   time.Time // per-side timestamps (one-sided books)
 	quoteAt        time.Time // min of valid sides — drives staleness checks
+
+	// backfillBuffer holds live OnTrade prints while BeginBackfill…EndBackfill
+	// runs. Load resets rings from REST; buffered prints are replayed after
+	// so reconnect/symbol-switch cannot leave permanent volume holes.
+	// Capped at maxBackfillBuf so a slow multi-TF REST fetch on a hot tape
+	// cannot grow without bound.
+	backfillBuffering bool
+	backfillBuf       []bufferedTrade
 }
+
+// maxBackfillBuf is the maximum number of live prints retained while REST
+// backfill runs. When exceeded, the oldest half is dropped so recent edge
+// prints still apply after EndBackfillAfterReplay.
+const maxBackfillBuf = 8192
 
 // NewAggregator creates an Aggregator with two EMA periods (fast, slow).
 func NewAggregator(emaPeriod, ema2Period int) *Aggregator {
@@ -371,6 +391,91 @@ func (a *Aggregator) liveTradePlausibleLocked(price float64) bool {
 	return price <= hi && price >= lo
 }
 
+// BeginBackfill starts buffering live OnTrade prints instead of folding them
+// into rings. Pair with EndBackfill / EndBackfillAfterReplay after
+// Load/ReplayTrades so REST history does not wipe prints that arrived during
+// the multi-second fetch window.
+//
+// Idempotent while already buffering: a second Begin keeps the existing
+// buffer (does not clear or re-log). Callers may pre-arm buffering before
+// re-enabling live ingest (e.g. switchSymbol before activeSymbol.Store) and
+// then call Begin again from backfill without dropping those early prints.
+func (a *Aggregator) BeginBackfill() {
+	a.mu.Lock()
+	if a.backfillBuffering {
+		a.mu.Unlock()
+		return
+	}
+	a.backfillBuffering = true
+	a.backfillBuf = a.backfillBuf[:0]
+	a.mu.Unlock()
+}
+
+// EndBackfill stops buffering and applies any held live prints to all series.
+// Prefer EndBackfillAfterReplay in production after Load/ReplayTrades so
+// series already rebuilt from REST are not double-counted.
+// Safe to call without a matching Begin (no-op). Idempotent after a drain.
+func (a *Aggregator) EndBackfill() {
+	a.finishBackfill(time.Time{}, time.Time{})
+}
+
+// EndBackfillAfterReplay stops buffering and applies held live prints after
+// Load/ReplayTrades with cutoffs so REST history is not double-counted:
+//
+//   - Sub-minute series (1s/5s/15s and 1s-sourced custom): only prints with
+//     Timestamp strictly after replayEnd (already folded by ReplayTrades).
+//   - Minute+ series and session VWAP: only prints strictly after barEnd
+//     (REST bar-request end). Overnight BOATS and any path that buffers
+//     historical prints during BeginBackfill would otherwise re-fold volume
+//     already present in Load.
+//
+// Zero cutoffs mean "no gate" for that class (apply all). Safe/idempotent
+// like EndBackfill.
+func (a *Aggregator) EndBackfillAfterReplay(replayEnd, barEnd time.Time) {
+	a.finishBackfill(replayEnd, barEnd)
+}
+
+func (a *Aggregator) finishBackfill(subMinuteAfter, minutePlusAfter time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.backfillBuffering && len(a.backfillBuf) == 0 {
+		return
+	}
+	a.backfillBuffering = false
+	buf := a.backfillBuf
+	a.backfillBuf = nil
+	for _, tr := range buf {
+		a.applyBufferedTradeLocked(tr, subMinuteAfter, minutePlusAfter)
+	}
+}
+
+// applyBufferedTradeLocked folds a buffered live print after backfill.
+// Zero cutoffs ⇒ apply that class to every series (EndBackfill). Non-zero ⇒
+// skip prints at or before the cutoff (already in REST Load / ReplayTrades).
+// Caller holds a.mu. lastTradePrice/At already set at buffer time.
+func (a *Aggregator) applyBufferedTradeLocked(tr bufferedTrade, subMinuteAfter, minutePlusAfter time.Time) {
+	applyMin := minutePlusAfter.IsZero() || tr.ts.After(minutePlusAfter)
+	if applyMin {
+		a.vwap.Update(tr.price, tr.size)
+		for tf := TF1m; tf < numTF; tf++ {
+			a.aggregateInto(tf, tr.price, tr.size, tr.ts)
+		}
+		if a.custom != nil && a.customDur > 0 && customSourceTF(a.customDur) == TF1m {
+			a.aggregateIntoCustom(tr.price, tr.size, tr.ts)
+		}
+	}
+	applySub := subMinuteAfter.IsZero() || tr.ts.After(subMinuteAfter)
+	if !applySub {
+		return
+	}
+	for _, tf := range []TF{TF1s, TF5s, TF15s} {
+		a.aggregateInto(tf, tr.price, tr.size, tr.ts)
+	}
+	if a.custom != nil && a.customDur > 0 && customSourceTF(a.customDur) == TF1s {
+		a.aggregateIntoCustom(tr.price, tr.size, tr.ts)
+	}
+}
+
 // OnTrade folds one trade into every timeframe. Must not block.
 // Invalid or absurd live prices are ignored (no last-trade update, no bar mutation).
 func (a *Aggregator) OnTrade(symbol string, price, size float64, ts time.Time) {
@@ -385,8 +490,25 @@ func (a *Aggregator) OnTrade(symbol string, price, size float64, ts time.Time) {
 	if !a.liveTradePlausibleLocked(price) {
 		return
 	}
+	// Always refresh last trade for order pricing during backfill.
 	a.lastTradePrice = price
 	a.lastTradeAt = ts
+	if a.backfillBuffering {
+		if len(a.backfillBuf) >= maxBackfillBuf {
+			// Keep newest half; oldest prints are less useful after a long fetch.
+			half := maxBackfillBuf / 2
+			copy(a.backfillBuf[:half], a.backfillBuf[maxBackfillBuf-half:])
+			a.backfillBuf = a.backfillBuf[:half]
+		}
+		a.backfillBuf = append(a.backfillBuf, bufferedTrade{price: price, size: size, ts: ts})
+		return
+	}
+	a.applyTradeLocked(price, size, ts)
+}
+
+// applyTradeLocked folds a validated trade into VWAP and all series.
+// Caller holds a.mu; lastTradePrice/At already set.
+func (a *Aggregator) applyTradeLocked(price, size float64, ts time.Time) {
 	a.vwap.Update(price, size)
 	for tf := TF(0); tf < numTF; tf++ {
 		a.aggregateInto(tf, price, size, ts)
@@ -642,10 +764,15 @@ func (a *Aggregator) ResetVWAP() {
 // switch so the status bar and order builder don't price off the previous
 // symbol's quote until a new tick for the new symbol arrives.
 //
-// It also clears sub-minute rings and the custom series (keeping custom
-// duration/name) so live OnTrade during backfill cannot mix the previous
-// symbol into 1s-sourced custom charts. Minute+ series are replaced by
-// Load; custom rebuilds after Load(TF1m) or ReplayTrades as usual.
+// It also clears every built-in timeframe ring (sub-minute through 1d) and
+// the custom series (keeping custom duration/name). Clearing minute+ is
+// required so a critical backfill failure after partial Load cannot leave
+// mixed-symbol history, and so live OnTrade during backfill cannot mix the
+// previous symbol into any TF. Successful Load/ReplayTrades re-seed history;
+// custom rebuilds after Load(TF1m) or ReplayTrades as usual.
+//
+// Any in-progress BeginBackfill buffer is dropped (not drained) so prints
+// buffered under a previous symbol cannot fold into the new rings.
 func (a *Aggregator) ResetMarket() {
 	a.mu.Lock()
 	a.lastTradePrice = 0
@@ -653,7 +780,9 @@ func (a *Aggregator) ResetMarket() {
 	a.bid, a.ask = 0, 0
 	a.bidAt, a.askAt = time.Time{}, time.Time{}
 	a.quoteAt = time.Time{}
-	for _, tf := range []TF{TF1s, TF5s, TF15s} {
+	a.backfillBuffering = false
+	a.backfillBuf = nil
+	for tf := TF(0); tf < numTF; tf++ {
 		a.resetSeriesLocked(a.series[tf])
 	}
 	if a.customDur > 0 {

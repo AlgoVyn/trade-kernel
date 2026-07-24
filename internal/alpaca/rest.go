@@ -204,11 +204,12 @@ func (c *REST) do(ctx context.Context, hc *http.Client, method, base, path strin
 		// Final-attempt 429 and all other 4xx/5xx fall through here (no
 		// unreachable post-loop branch).
 		if resp.StatusCode >= 400 {
+			msg := string(data)
 			var ae apiError
 			if json.Unmarshal(data, &ae) == nil && ae.Message != "" {
-				return fmt.Errorf("%s %s: %d: %s", method, path, resp.StatusCode, ae.Message)
+				msg = ae.Message
 			}
-			return fmt.Errorf("%s %s: %d: %s", method, path, resp.StatusCode, string(data))
+			return &HTTPStatusError{Method: method, Path: path, Status: resp.StatusCode, Body: msg}
 		}
 		if out == nil {
 			return nil
@@ -277,14 +278,42 @@ func (c *REST) Positions(ctx context.Context) ([]Position, error) {
 	return p, err
 }
 
-// Position fetches the position for symbol. Returns (nil, nil) when flat.
+// Position fetches the position for symbol. Returns (nil, nil) when flat
+// (Alpaca responds HTTP 404 for no position).
 func (c *REST) Position(ctx context.Context, symbol string) (*Position, error) {
 	var p Position
 	err := c.trading(ctx, http.MethodGet, "/v2/positions/"+url.PathEscape(symbol), nil, nil, &p)
 	if err != nil {
+		if isHTTPStatus(err, http.StatusNotFound) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &p, nil
+}
+
+// HTTPStatusError is returned for non-2xx Alpaca HTTP responses.
+// Match with errors.As (not string parsing) so 404→flat and similar
+// mappings stay robust across format changes.
+type HTTPStatusError struct {
+	Method string
+	Path   string
+	Status int
+	Body   string
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e == nil {
+		return "http status error"
+	}
+	return fmt.Sprintf("%s %s: %d: %s", e.Method, e.Path, e.Status, e.Body)
+}
+
+// isHTTPStatus reports whether err (or a wrapped cause) is an HTTPStatusError
+// with the given status code.
+func isHTTPStatus(err error, code int) bool {
+	var he *HTTPStatusError
+	return errors.As(err, &he) && he.Status == code
 }
 
 // ClosePosition flattens symbol via DELETE /v2/positions/{symbol}.

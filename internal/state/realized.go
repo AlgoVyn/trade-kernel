@@ -325,8 +325,8 @@ func walkFills(fills []alpaca.Fill, dayStart, weekStart time.Time) (RealizedWind
 		if qty <= 0 || px <= 0 || f.Symbol == "" {
 			continue
 		}
-		side := strings.ToLower(f.Side)
-		if side != "buy" && side != "sell" {
+		side, ok := normalizeTradeSide(f.Side)
+		if !ok {
 			continue
 		}
 		st := book[f.Symbol]
@@ -389,27 +389,64 @@ func inventoryConsistent(endBook map[string]*inv, seeds map[string]PositionSeed,
 // Positions with zero/missing avg entry still contribute qty (Avg=0) so a
 // complete in-window fill book is not treated as ghost inventory; cost-basis
 // bridging is skipped until avg is available.
+//
+// Alpaca REST may return qty already signed (negative for shorts) or absolute
+// with side="short". WS-applied positions store absolute qty. Always emit a
+// signed seed (+long, −short).
 func SeedsFromPositions(positions []alpaca.Position) []PositionSeed {
 	if len(positions) == 0 {
 		return nil
 	}
 	out := make([]PositionSeed, 0, len(positions))
 	for _, p := range positions {
-		q := float64(p.Qty)
+		signed := SignedPositionQty(p)
 		avg := float64(p.AvgEntryPrice)
-		if p.Symbol == "" || q <= 0 {
+		if p.Symbol == "" || absFloat(signed) < invQtyTol {
 			continue
 		}
 		if avg < 0 {
 			avg = 0
 		}
-		signed := q
-		if p.Side == "short" {
-			signed = -q
-		}
 		out = append(out, PositionSeed{Symbol: p.Symbol, Qty: signed, Avg: avg})
 	}
 	return out
+}
+
+// SignedPositionQty returns position size as +long / −short.
+// Handles both absolute qty+side and signed REST qty forms (Alpaca often
+// returns already-negative qty for shorts). Used by the local book and by
+// REST-first flatten/panic sizing so short exits never double-negate.
+func SignedPositionQty(p alpaca.Position) float64 {
+	q := float64(p.Qty)
+	abs := absFloat(q)
+	if abs < invQtyTol {
+		return 0
+	}
+	switch strings.ToLower(p.Side) {
+	case "short":
+		return -abs
+	case "long":
+		return abs
+	default:
+		if q < 0 {
+			return -abs
+		}
+		return abs
+	}
+}
+
+// normalizeTradeSide maps Alpaca fill/order side strings to buy|sell.
+// Activity FILL can emit sell_short for short opens; inventory only needs
+// the signed direction.
+func normalizeTradeSide(side string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(side)) {
+	case "buy", "buy_minus":
+		return "buy", true
+	case "sell", "sell_short", "sell_short_exempt", "sell_plus":
+		return "sell", true
+	default:
+		return "", false
+	}
 }
 
 // RealizedFromOrders converts closed orders with fills into synthetic
@@ -437,6 +474,10 @@ func RealizedFromOrdersWithHints(orders []alpaca.Order, dayStart, weekStart time
 		if fq <= 0 || px <= 0 {
 			continue
 		}
+		side, ok := normalizeTradeSide(o.Side)
+		if !ok {
+			continue
+		}
 		at := o.FilledAt
 		if at.IsZero() {
 			at = o.SubmittedAt
@@ -447,7 +488,7 @@ func RealizedFromOrdersWithHints(orders []alpaca.Order, dayStart, weekStart time
 		fills = append(fills, alpaca.Fill{
 			ID:        o.ID,
 			Symbol:    o.Symbol,
-			Side:      o.Side,
+			Side:      side,
 			Qty:       o.FilledQty,
 			Price:     o.FilledAvgPrice,
 			OrderID:   o.ID,

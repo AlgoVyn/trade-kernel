@@ -69,13 +69,15 @@ func main() {
 
 	elig := execution.NewEligibilityCache(rest)
 	builder := execution.NewBuilder(agg, elig, cfg.ExtendedHours.SlippageBps, cfg.QuoteStaleAfter())
-	exec := execution.NewRESTExecutor(rest, builder, sessions.Current, "day")
+	exec := execution.NewRESTExecutor(rest, builder, sessions.Current, cfg.RegularTIF())
 
 	checker := risk.NewChecker(risk.Limits{
 		MaxOrderQty:    cfg.Limits.MaxOrderQty,
 		MaxPositionQty: cfg.Limits.MaxPositionQty,
 		Debounce:       cfg.Debounce(),
 	}, store, nil)
+	// Include resting open-order exposure in projected max position.
+	checker.SetWorkingLookup(store)
 
 	// Prefetch overnight eligibility for a symbol so the first overnight
 	// hotkey does not serialize GET /v2/assets before PlaceOrder.
@@ -148,7 +150,7 @@ func main() {
 		log.Printf("initial reconcile: %v", err)
 	}
 	// Bound the initial FILL history walk so multi-page accounts do not
-	// block TUI startup indefinitely; the 60s ticker will retry.
+	// block TUI startup indefinitely; the periodic ticker will retry.
 	// Rate-limit repeated identical errors (e.g. inventory inconsistent)
 	// so a stuck symbol does not spam the log every tick.
 	var (
@@ -157,6 +159,12 @@ func main() {
 		lastRealizedLogAt time.Time
 	)
 	const realizedLogCooldown = 5 * time.Minute
+	// FILL history pagination is slower than account reconcile; bound each
+	// walk so a multi-page fetch cannot hang the ticker or post-fill kick.
+	const realizedTickBudget = 60 * time.Second
+	// Periodic heal when no fills fire (long-held marks / delayed activities).
+	// Live fills update rday/rwk immediately via the trading WS path.
+	const realizedTickEvery = 30 * time.Second
 	logRealizedErr := func(prefix string, err error) {
 		if err == nil {
 			return
@@ -197,11 +205,7 @@ func main() {
 		}
 	}()
 	go func() {
-		// FILL history pagination is slower than account reconcile; 60s is
-		// enough for rday/rwk while keeping rate-limit headroom. Bound each
-		// tick so a multi-page walk cannot block the goroutine indefinitely.
-		const realizedTickBudget = 60 * time.Second
-		t := time.NewTicker(60 * time.Second)
+		t := time.NewTicker(realizedTickEvery)
 		defer t.Stop()
 		for {
 			select {
@@ -241,9 +245,10 @@ func main() {
 			}
 		}
 	}
-	// liveCursor holds the end time (time.Time) of the most recent
-	// backfill. The overnight poller reads it so it never re-applies
-	// trades that Load / ReplayTrades already folded into the aggregator.
+	// liveCursor holds a symbol-scoped high-water (backfillHighWater) of the
+	// most recent successful backfill. The overnight poller reads it so it
+	// never re-applies trades that Load / ReplayTrades already folded in,
+	// and never inherits another symbol's wall clock after a switch.
 	liveCursor := &atomic.Value{}
 	runBackfill := func(symbol string, gen uint64, force bool) {
 		backfillMu.Lock()
@@ -314,8 +319,65 @@ func main() {
 	go onFeed.run(ctx)
 
 	// --- Trading stream ---
+	// Debounced REST realized refresh after fills: WS path updates rday/rwk
+	// immediately from trade_updates; this heals the fill cache when the
+	// activities endpoint catches up (and covers fills that lack event qty).
+	var (
+		realizedKickMu   sync.Mutex
+		realizedKickAt   time.Time
+		realizedKickPend bool
+	)
+	const realizedKickDelay = 2 * time.Second
+	// Trailing-edge debounce: kicks only stamp realizedKickAt while a worker
+	// is pending. The worker keeps pend true through the wait+refresh, then
+	// re-checks kickAt so a kick that lands after wait<=0 (or during refresh)
+	// is not lost until the 30s ticker.
+	kickRealizedRefresh := func() {
+		realizedKickMu.Lock()
+		realizedKickAt = time.Now()
+		if realizedKickPend {
+			realizedKickMu.Unlock()
+			return
+		}
+		realizedKickPend = true
+		realizedKickMu.Unlock()
+		go func() {
+			for {
+				realizedKickMu.Lock()
+				wait := realizedKickDelay - time.Since(realizedKickAt)
+				// Leave pend true while waiting/refreshing so concurrent kicks
+				// only update kickAt (they must not spawn a second worker).
+				realizedKickMu.Unlock()
+				if wait > 0 {
+					time.Sleep(wait)
+					continue
+				}
+				rctx, cancel := context.WithTimeout(ctx, realizedTickBudget)
+				if err := store.RefreshRealizedPnL(rctx, rest); err != nil {
+					logRealizedErr("realized PnL (post-fill)", err)
+				}
+				cancel()
+				realizedKickMu.Lock()
+				wait = realizedKickDelay - time.Since(realizedKickAt)
+				if wait > 0 {
+					// Kick arrived during refresh (or after wait hit 0); loop.
+					realizedKickMu.Unlock()
+					continue
+				}
+				realizedKickPend = false
+				realizedKickMu.Unlock()
+				return
+			}
+		}()
+	}
+
 	tws := alpaca.NewTradingWS(cfg.APIKeyID, cfg.APISecretKey, !cfg.Live())
-	tws.OnUpdate = func(u alpaca.TradeUpdate) { store.ApplyUpdate(u) }
+	tws.OnUpdate = func(u alpaca.TradeUpdate) {
+		store.ApplyUpdate(u)
+		if u.Event == "fill" || u.Event == "partial_fill" {
+			kickRealizedRefresh()
+		}
+	}
 	// Initial reconcile happens synchronously below before the TUI starts;
 	// OnReconnect re-syncs from REST only on a real drop+reconnect.
 	tws.OnReconnect = func() {
@@ -325,41 +387,102 @@ func main() {
 			if err := store.Refresh(rctx, rest); err != nil {
 				log.Printf("reconcile after trading ws reconnect: %v", err)
 			}
+			kickRealizedRefresh()
 		}()
 	}
 	tws.OnError = func(err error) { log.Printf("trading ws: %v", err) }
 	go tws.Run(ctx)
 
 	// --- Symbol switching (re-subscribe + backfill) ---
-	// Order: update active filter + clear stale quotes before subscribe so
-	// ticks for the new symbol are not dropped and old prices cannot price
-	// the new symbol's orders.
-	switchSymbol := func(symbol string) error {
-		gen := backfillGen.Add(1)
-		activeSymbol.Store(symbol)
-		agg.ResetMarket()
-		agg.ResetVWAP()
-		if err := mws.SetSymbol(symbol); err != nil {
-			return err
-		}
-		// Synchronous backfill under the same serialisation as async ones.
+	// Transactional under backfillMu: ResetMarket / activeSymbol / backfill
+	// never interleave with runBackfill. Gen is bumped under the lock so a
+	// concurrent scheduleBackfill Add cannot false-supersede a switch that
+	// has not yet taken the lock. Reconnect may still bump gen while we hold
+	// the lock; that only queues a later force catch-up after we unlock and
+	// must not abort work already past the gate.
+	// switchSymbol returns the committed active symbol after success or
+	// rollback so the UI can re-sync m.symbol even when the request fails.
+	switchSymbol := func(symbol string) (active string, err error) {
 		backfillMu.Lock()
 		defer backfillMu.Unlock()
-		if backfillGen.Load() != gen {
-			return nil
+
+		prev, _ := activeSymbol.Load().(string)
+		if prev == symbol {
+			return symbol, nil
 		}
+		// Invalidate in-flight runBackfill generations. Do not re-check gen
+		// after Add: scheduleBackfill may bump while we hold the lock.
+		_ = backfillGen.Add(1)
+
+		// Pause ingest for both symbols while the subscription moves.
+		// Clear overnight high-water so the poller does not inherit prev's clock.
+		activeSymbol.Store("")
+		liveCursor.Store(backfillHighWater{})
+		if err := mws.SetSymbol(symbol); err != nil {
+			activeSymbol.Store(prev)
+			if prev != "" {
+				if err2 := mws.SetSymbol(prev); err2 != nil {
+					activeSymbol.Store("")
+					return "", fmt.Errorf("subscribe %s: %w; restore %s: %v", symbol, err, prev, err2)
+				}
+			}
+			return prev, err
+		}
+		// ResetMarket clears all TF rings + any foreign backfill buffer so
+		// partial Load / old-symbol prints cannot mix into the new book.
+		agg.ResetMarket()
+		agg.ResetVWAP()
+		// Arm the live-trade buffer before re-enabling ingest. Otherwise
+		// OnTrade accepts the new symbol, folds into rings, and Load wipes
+		// those prints without them ever entering the buffer. backfill's
+		// BeginBackfill is idempotent and keeps this pre-armed buffer.
+		agg.BeginBackfill()
+		activeSymbol.Store(symbol)
 		if err := backfill(context.Background(), rest, agg, symbol, liveCursor); err != nil {
-			return err
+			// Critical failure (no usable TF1m): roll back filter + book so
+			// the UI can re-sync to prev. ResetMarket clears any partial
+			// coarser TFs that Load may have applied for the new symbol.
+			activeSymbol.Store(prev)
+			agg.ResetMarket()
+			agg.ResetVWAP()
+			liveCursor.Store(backfillHighWater{})
+			if prev != "" {
+				if err2 := mws.SetSymbol(prev); err2 != nil {
+					// Do not claim alignment when subscribe restore failed.
+					activeSymbol.Store("")
+					return "", fmt.Errorf("backfill %s: %w; restore subscribe %s: %v", symbol, err, prev, err2)
+				}
+				// Async re-seed previous symbol. scheduleBackfill bumps gen —
+				// safe after we finish; caller still holds the lock until
+				// return, so the async path waits.
+				scheduleBackfill(prev, true)
+			}
+			return prev, err
 		}
 		// Stamp debounce map for consistency with runBackfill so a later
 		// non-forced schedule does not immediately re-fetch the same symbol.
 		stampBackfill(symbol, time.Now())
 		prefetchElig(symbol)
-		return nil
+		return symbol, nil
 	}
 
 	// Warm eligibility for the default symbol before the first keystroke.
 	prefetchElig(cfg.DefaultSymbol)
+
+	// LivePosition: REST-first position lookup for flatten/panic; the UI falls
+	// back to the local book only when REST errors (see resolvePositionQty).
+	// Use state.SignedPositionQty so already-negative short REST qty is not
+	// double-negated into a false long (would exit the wrong side).
+	livePosition := func(ctx context.Context, symbol string) (float64, error) {
+		p, err := rest.Position(ctx, symbol)
+		if err != nil {
+			return 0, err
+		}
+		if p == nil {
+			return 0, nil
+		}
+		return state.SignedPositionQty(*p), nil
+	}
 
 	// --- UI ---
 	deps := ui.Deps{
@@ -372,6 +495,7 @@ func main() {
 		Builder:      builder,
 		Latency:      ui.NewLatencyTracker(256),
 		SwitchSymbol: switchSymbol,
+		LivePosition: livePosition,
 		Paper:        !cfg.Live(),
 	}
 	p := tea.NewProgram(ui.NewModel(deps), tea.WithAltScreen())
@@ -379,6 +503,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
 	}
 	stop()
+}
+
+// backfillHighWater is the overnight poller's high-water mark after a
+// successful backfill. Symbol-scoped so a switch cannot inherit another
+// symbol's clock and skip the new tape until backfill finishes.
+type backfillHighWater struct {
+	Symbol string
+	At     time.Time
 }
 
 // backfill loads historical bars for the REST-backed timeframes, then
@@ -389,9 +521,15 @@ func main() {
 // feed supplies the overnight session (20:00–04:00 ET). The two series are
 // merged by timestamp so the chart shows the full trading day.
 //
-// liveCursor (when non-nil) receives the fetch end time once the trades
-// replay has landed; the overnight poller uses it as a high-water mark so
-// it never re-applies trades already folded into the aggregator here.
+// Live OnTrade prints that arrive during the multi-second REST window are
+// buffered (Aggregator.BeginBackfill / EndBackfillAfterReplay) so Load cannot
+// wipe them; sub-minute applies only prints after the REST trade window and
+// minute+/VWAP only prints after the REST bar window (avoids overnight BOATS
+// double-count against Load). liveCursor is stamped with max(reqEnd, tradeEnd)
+// for the active symbol (not a late wall stamp that opens a poller hole).
+//
+// Returns an error only on critical failure (TF1m unusable). Soft SIP errors
+// on coarser TFs or trades are logged and do not fail the switch.
 func backfill(ctx context.Context, rest *alpaca.REST, agg *bars.Aggregator, symbol string, liveCursor *atomic.Value) error {
 	windows := []struct {
 		tf       bars.TF
@@ -404,85 +542,177 @@ func backfill(ctx context.Context, rest *alpaca.REST, agg *bars.Aggregator, symb
 		{bars.TF1h, "1Hour", 30 * 24 * time.Hour},
 		{bars.TF1d, "1Day", 365 * 24 * time.Hour},
 	}
-	end := time.Now()
-	var firstErr error
-	for _, w := range windows {
-		start := end.Add(-w.lookback)
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		sip, errSIP := rest.Bars(cctx, symbol, w.api, start, end, 10000, "sip")
-		cancel()
-		if errSIP != nil {
-			log.Printf("backfill %s %s sip: %v", symbol, w.api, errSIP)
-			if firstErr == nil {
-				firstErr = errSIP
+	// Buffer live OnTrade for the whole fetch+Load+Replay window so multi-second
+	// REST work cannot leave permanent volume holes when Load resets rings.
+	// Begin before capturing reqEnd so prints in the arm→reqEnd window are
+	// buffered (not applied then wiped by Load). Drain with EndBackfillAfterReplay
+	// so REST windows are not double-counted. Idempotent if switchSymbol already
+	// pre-armed the buffer before activeSymbol.Store.
+	agg.BeginBackfill()
+	// Bar-request end: also gates minute+/VWAP drain of the live buffer.
+	reqEnd := time.Now()
+	var tradeEnd time.Time
+	defer func() {
+		if !tradeEnd.IsZero() {
+			agg.EndBackfillAfterReplay(tradeEnd, reqEnd)
+		} else {
+			agg.EndBackfill()
+		}
+	}()
+
+	type tfResult struct {
+		tf       bars.TF
+		api      string
+		ab       []alpaca.Bar
+		errSIP   error
+		errBoats error
+		nSIP     int
+		nBoats   int
+	}
+	results := make([]tfResult, len(windows))
+	var wg sync.WaitGroup
+	// Parallelize TF fetches with a small semaphore so free/paper rate limits
+	// are less likely to 429 when all five timeframes fire at once. SIP+BOATS
+	// for a given TF stay sequential inside each worker.
+	const maxTFFetchers = 3
+	sem := make(chan struct{}, maxTFFetchers)
+	for i, w := range windows {
+		wg.Add(1)
+		go func(i int, w struct {
+			tf       bars.TF
+			api      string
+			lookback time.Duration
+		}) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			start := reqEnd.Add(-w.lookback)
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			sip, errSIP := rest.Bars(cctx, symbol, w.api, start, reqEnd, 10000, "sip")
+			cancel()
+			cctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+			boats, errBoats := rest.Bars(cctx, symbol, w.api, start, reqEnd, 10000, "boats")
+			cancel()
+			results[i] = tfResult{
+				tf: w.tf, api: w.api,
+				ab: alpaca.MergeBars(sip, boats),
+				errSIP: errSIP, errBoats: errBoats,
+				nSIP: len(sip), nBoats: len(boats),
+			}
+		}(i, w)
+	}
+	wg.Wait()
+
+	// Apply TF1m first so session VWAP seed and custom rebuilds see 1m history
+	// before coarser TFs (Load only seeds VWAP from TF1m). Built from TF tags
+	// so reordering windows cannot silently break the seed order.
+	order := make([]int, 0, len(windows))
+	for i, w := range windows {
+		if w.tf == bars.TF1m {
+			order = append(order, i)
+		}
+	}
+	for i, w := range windows {
+		if w.tf != bars.TF1m {
+			order = append(order, i)
+		}
+	}
+
+	// Apply TF1m first; on critical failure (SIP hard-failed, nothing loaded)
+	// return before coarser Loads or trade replay so reconnect cannot leave a
+	// mixed multi-TF book (new 5m/15m/… over unusable/missing 1m).
+	var tf1mLoaded bool
+	var tf1mErr error
+	loadTF := func(r tfResult) {
+		if r.errSIP != nil {
+			log.Printf("backfill %s %s sip: %v", symbol, r.api, r.errSIP)
+			if r.tf == bars.TF1m && tf1mErr == nil {
+				tf1mErr = r.errSIP
 			}
 		}
-		// Overnight (BOATS). Soft-fail: paper/free plans may lack access;
-		// we still show SIP (regular + extended) if boats is unavailable.
-		cctx, cancel = context.WithTimeout(ctx, 30*time.Second)
-		boats, errBoats := rest.Bars(cctx, symbol, w.api, start, end, 10000, "boats")
-		cancel()
-		if errBoats != nil {
-			log.Printf("backfill %s %s boats (overnight): %v", symbol, w.api, errBoats)
-			// Don't set firstErr solely from boats — SIP-only is still usable.
+		if r.errBoats != nil {
+			log.Printf("backfill %s %s boats (overnight): %v", symbol, r.api, r.errBoats)
 		}
-		ab := alpaca.MergeBars(sip, boats)
-		if len(ab) == 0 {
-			if errSIP != nil {
-				continue
+		if len(r.ab) == 0 {
+			if r.errSIP != nil {
+				return
 			}
-			log.Printf("backfill %s %s: empty (sip=%d boats=%d)", symbol, w.api, len(sip), len(boats))
-			continue
+			log.Printf("backfill %s %s: empty (sip=%d boats=%d)", symbol, r.api, r.nSIP, r.nBoats)
+			return
 		}
-		if len(boats) > 0 {
+		if r.nBoats > 0 {
 			log.Printf("backfill %s %s: %d bars (sip=%d + boats overnight=%d → merged=%d)",
-				symbol, w.api, len(ab), len(sip), len(boats), len(ab))
+				symbol, r.api, len(r.ab), r.nSIP, r.nBoats, len(r.ab))
 		}
-		hist := make([]bars.Bar, len(ab))
-		for i, b := range ab {
-			hist[i] = bars.Bar{
+		hist := make([]bars.Bar, len(r.ab))
+		for j, b := range r.ab {
+			hist[j] = bars.Bar{
 				Start: b.Timestamp, Open: float64(b.Open), High: float64(b.High),
 				Low: float64(b.Low), Close: float64(b.Close), Volume: float64(b.Volume),
-				// Per-bar VWAP from Alpaca; Load reconstructs session VWAP from it.
 				VWAP: float64(b.VWAP),
 			}
 		}
-		agg.Load(w.tf, hist)
+		agg.Load(r.tf, hist)
+		if r.tf == bars.TF1m {
+			tf1mLoaded = true
+		}
+	}
+	for _, i := range order {
+		if results[i].tf != bars.TF1m {
+			continue
+		}
+		loadTF(results[i])
+	}
+	// Critical path: TF1m SIP hard-failed with nothing loaded. Empty history
+	// without error (halted/new listing) is still a successful switch.
+	if !tf1mLoaded && tf1mErr != nil {
+		return fmt.Errorf("backfill %s 1m: %w", symbol, tf1mErr)
+	}
+	for _, i := range order {
+		if results[i].tf == bars.TF1m {
+			continue
+		}
+		loadTF(results[i])
 	}
 
-	// Sub-minute TFs: replay recent trades through the aggregator so 1s/5s/15s
-	// charts aren't blank at startup / on symbol switch. Anchor the window
-	// start to the newest backfilled 1m bar's time (a real trading time)
-	// rather than time.Now() — otherwise a launch outside market hours
-	// (weekend, holiday, pre-market) fetches an empty window and sub-minute
-	// charts stay blank. The window ends at now so the partial current
-	// minute's prints also land in the sub-minute rings; trades only exist
-	// up to the last print, so a far-future end costs nothing.
-	// SIP + BOATS (soft-fail boats) for overnight 24/5 coverage.
-	// Page limit 2000 keeps each response well under the 1 MB read cap —
-	// 30 min of an active symbol at 10000/page overflows it.
+	// Sub-minute TFs: replay recent trades. Anchor to newest 1m bar when present.
 	tradesCtx, tradesCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer tradesCancel()
 	trLookback := 30 * time.Minute
-	anchor := end
+	// Use wall-now for the trade window end so partial current minute is covered.
+	// Captured for EndBackfillAfterReplay (sub-minute cutoff).
+	tradeEnd = time.Now()
+	anchor := tradeEnd
 	if last, ok := agg.LastBarTime(bars.TF1m); ok {
 		anchor = last
 	}
 	startTr := anchor.Add(-trLookback)
-	sipTr, errSIP := rest.Trades(tradesCtx, symbol, startTr, end, 2000, "sip")
+	var (
+		sipTr, boatsTr   []alpaca.Trade
+		errSIP, errBoats error
+	)
+	var twg sync.WaitGroup
+	twg.Add(2)
+	go func() {
+		defer twg.Done()
+		var e error
+		sipTr, e = rest.Trades(tradesCtx, symbol, startTr, tradeEnd, 2000, "sip")
+		errSIP = e
+	}()
+	go func() {
+		defer twg.Done()
+		var e error
+		boatsTr, e = rest.Trades(tradesCtx, symbol, startTr, tradeEnd, 2000, "boats")
+		errBoats = e
+	}()
+	twg.Wait()
 	if errSIP != nil {
 		log.Printf("backfill trades %s sip: %v", symbol, errSIP)
-		if firstErr == nil {
-			firstErr = errSIP
-		}
 	}
-	boatsTr, errBoats := rest.Trades(tradesCtx, symbol, startTr, end, 2000, "boats")
 	if errBoats != nil {
 		log.Printf("backfill trades %s boats (overnight): %v", symbol, errBoats)
 	}
 	atr := alpaca.MergeTrades(sipTr, boatsTr)
-	// Always ReplayTrades (even empty): resets 1s/5s/15s and rebuilds any
-	// 1s-sourced custom TF so reconnect/symbol switch cannot keep stale rings.
 	replay := make([]bars.TradeReplay, len(atr))
 	for i, tr := range atr {
 		replay[i] = bars.TradeReplay{
@@ -490,12 +720,17 @@ func backfill(ctx context.Context, rest *alpaca.REST, agg *bars.Aggregator, symb
 		}
 	}
 	agg.ReplayTrades(replay)
-	// Publish the high-water mark for the overnight poller: trades at or
-	// before end are now reflected in the aggregator (bars Load covers the
-	// current partial minute; replay covers the sub-minute rings), so the
-	// poller must only apply strictly newer prints.
-	if liveCursor != nil {
-		liveCursor.Store(end)
+
+	// High-water for overnight poller: max(reqEnd, tradeEnd) — REST already
+	// covers that window; buffered live prints cover post-reqEnd overlap.
+	// Avoid stamping a later wall clock that opens a poller hole if no live
+	// OnTrade arrived during the multi-second fetch.
+	hw := reqEnd
+	if tradeEnd.After(hw) {
+		hw = tradeEnd
 	}
-	return firstErr
+	if liveCursor != nil {
+		liveCursor.Store(backfillHighWater{Symbol: symbol, At: hw})
+	}
+	return nil
 }

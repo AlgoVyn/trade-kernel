@@ -14,18 +14,23 @@ import (
 
 // Executor is the order-execution boundary. v1 = REST; a FIX engine
 // (quickfixgo) can implement the same interface later.
+//
+// Session is always supplied by the caller (captured at intent/confirm time)
+// so a session boundary during y/n confirmation cannot change order class
+// (e.g. extended limit → regular market) without a re-prompt.
 type Executor interface {
 	// Buy/Sell submit a hotkey-style order: market in regular hours,
 	// aggressive limit in extended sessions.
-	Buy(ctx context.Context, symbol string, qty int) (alpaca.Order, error)
-	Sell(ctx context.Context, symbol string, qty int) (alpaca.Order, error)
+	Buy(ctx context.Context, symbol string, qty int, sess session.Session) (alpaca.Order, error)
+	Sell(ctx context.Context, symbol string, qty int, sess session.Session) (alpaca.Order, error)
 	// LimitBuy/LimitSell submit explicit-limit orders (from ':'
 	// commands); in extended sessions they carry extended_hours=true.
-	LimitBuy(ctx context.Context, symbol string, qty int, price float64) (alpaca.Order, error)
-	LimitSell(ctx context.Context, symbol string, qty int, price float64) (alpaca.Order, error)
+	LimitBuy(ctx context.Context, symbol string, qty int, price float64, sess session.Session) (alpaca.Order, error)
+	LimitSell(ctx context.Context, symbol string, qty int, price float64, sess session.Session) (alpaca.Order, error)
 	// Flatten closes the entire position in symbol using the
-	// session-appropriate order form. positionQty is signed.
-	Flatten(ctx context.Context, symbol string, positionQty float64) (alpaca.Order, error)
+	// session-appropriate order form. positionQty is signed. sess is the
+	// pinned session from intent time.
+	Flatten(ctx context.Context, symbol string, positionQty float64, sess session.Session) (alpaca.Order, error)
 	// CancelAll cancels every open order.
 	CancelAll(ctx context.Context) error
 	// CancelSymbol cancels open orders for one symbol only. Returns the
@@ -39,12 +44,13 @@ type Executor interface {
 type RESTExecutor struct {
 	rest       *alpaca.REST
 	builder    *Builder
-	sessionNow func() session.Session
-	regularTIF string // "day" | "ioc"
+	sessionNow func() session.Session // fallback only when tests omit sess
+	regularTIF string                 // "day" | "ioc"
 }
 
-// NewRESTExecutor wires an executor. sessionNow reports the current
-// session (session.Engine.Current).
+// NewRESTExecutor wires an executor. sessionNow is retained for tests that
+// call helper paths without an explicit session; production UI always pins
+// session at intent time.
 func NewRESTExecutor(rest *alpaca.REST, builder *Builder, sessionNow func() session.Session, regularTIF string) *RESTExecutor {
 	if regularTIF != "ioc" {
 		regularTIF = "day"
@@ -76,31 +82,31 @@ func (e *RESTExecutor) submit(ctx context.Context, in BuildInput) (alpaca.Order,
 	return e.rest.PlaceOrder(ctx, req)
 }
 
-func (e *RESTExecutor) Buy(ctx context.Context, symbol string, qty int) (alpaca.Order, error) {
+func (e *RESTExecutor) Buy(ctx context.Context, symbol string, qty int, sess session.Session) (alpaca.Order, error) {
 	return e.submit(ctx, BuildInput{
 		Symbol: symbol, Side: "buy", Qty: qty,
-		Session: e.sessionNow(), RegularTIF: e.regularTIF,
+		Session: sess, RegularTIF: e.regularTIF,
 	})
 }
 
-func (e *RESTExecutor) Sell(ctx context.Context, symbol string, qty int) (alpaca.Order, error) {
+func (e *RESTExecutor) Sell(ctx context.Context, symbol string, qty int, sess session.Session) (alpaca.Order, error) {
 	return e.submit(ctx, BuildInput{
 		Symbol: symbol, Side: "sell", Qty: qty,
-		Session: e.sessionNow(), RegularTIF: e.regularTIF,
+		Session: sess, RegularTIF: e.regularTIF,
 	})
 }
 
-func (e *RESTExecutor) LimitBuy(ctx context.Context, symbol string, qty int, price float64) (alpaca.Order, error) {
+func (e *RESTExecutor) LimitBuy(ctx context.Context, symbol string, qty int, price float64, sess session.Session) (alpaca.Order, error) {
 	return e.submit(ctx, BuildInput{
 		Symbol: symbol, Side: "buy", Qty: qty, LimitPrice: price,
-		Session: e.sessionNow(), RegularTIF: e.regularTIF,
+		Session: sess, RegularTIF: e.regularTIF,
 	})
 }
 
-func (e *RESTExecutor) LimitSell(ctx context.Context, symbol string, qty int, price float64) (alpaca.Order, error) {
+func (e *RESTExecutor) LimitSell(ctx context.Context, symbol string, qty int, price float64, sess session.Session) (alpaca.Order, error) {
 	return e.submit(ctx, BuildInput{
 		Symbol: symbol, Side: "sell", Qty: qty, LimitPrice: price,
-		Session: e.sessionNow(), RegularTIF: e.regularTIF,
+		Session: sess, RegularTIF: e.regularTIF,
 	})
 }
 
@@ -118,13 +124,13 @@ func (e *RESTExecutor) LimitSell(ctx context.Context, symbol string, qty int, pr
 // residual). Fractional qty in PreMarket/AfterHours/Overnight is rejected
 // with an error — ClosePosition would also submit a market liquidation,
 // which is not allowed outside regular hours.
-func (e *RESTExecutor) Flatten(ctx context.Context, symbol string, positionQty float64) (alpaca.Order, error) {
+//
+// AllowStaleLastTrade is set so quiet extended/overnight tape still prices
+// exits off a last trade within a few minutes rather than hard-failing.
+func (e *RESTExecutor) Flatten(ctx context.Context, symbol string, positionQty float64, sess session.Session) (alpaca.Order, error) {
 	if positionQty == 0 {
 		return alpaca.Order{}, fmt.Errorf("no position in %s", symbol)
 	}
-	// Capture session once so a boundary between checks cannot pick
-	// ClosePosition for one branch and the order path for the other.
-	sess := e.sessionNow()
 	abs := math.Abs(positionQty)
 	qty := int(abs)
 	// Fractional / sub-share: truncating would leave a residual open.
@@ -153,9 +159,14 @@ func (e *RESTExecutor) Flatten(ctx context.Context, symbol string, positionQty f
 	// submits a market order, which is not allowed outside regular hours.
 	// Broker transport/reject errors are surfaced as-is too — the order
 	// may already be live, and the operator needs the original error.
+	//
+	// Always day TIF for flatten/panic exits: orders.regular_tif (incl. ioc)
+	// applies to hotkey/':' buy-sell only. An IOC market exit can partial-fill
+	// and leave residual risk — the opposite of flatten.
 	o, err := e.submit(ctx, BuildInput{
 		Symbol: symbol, Side: side, Qty: qty,
-		Session: sess, RegularTIF: e.regularTIF,
+		Session: sess, RegularTIF: "day",
+		AllowStaleLastTrade: true,
 	})
 	if err != nil && session.Extended(sess) {
 		return alpaca.Order{}, fmt.Errorf(

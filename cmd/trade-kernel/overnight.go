@@ -56,10 +56,11 @@ type overnightFeed struct {
 	// pricing falls back to the last trade, which is often older than the
 	// stale-quote window on the thin overnight tape.
 	fetchQuote quoteFetcher
-	// backfillCursor carries the end time of the most recent backfill
-	// (atomic.Value of time.Time). Trades at or before it are already
-	// reflected in the aggregator via Load / ReplayTrades, so the poller
-	// must never re-apply them (that would double-count volume).
+	// backfillCursor carries a symbol-scoped exclusive high-water of the most
+	// recent backfill (atomic.Value of backfillHighWater). Trades at or before
+	// At for the matching Symbol are already reflected via Load / ReplayTrades,
+	// so the poller must never re-apply them (that would double-count volume).
+	// Marks for other symbols are ignored after a switch.
 	backfillCursor *atomic.Value
 
 	mu     sync.Mutex
@@ -120,8 +121,10 @@ func (f *overnightFeed) pollOnce(ctx context.Context, sym string) {
 		f.fifo = nil
 	}
 	cursor := f.cursor
-	if bc, ok := f.backfillCursor.Load().(time.Time); ok && bc.After(cursor) {
-		cursor = bc
+	// Only raise from a backfill mark for *this* symbol. A shared wall stamp
+	// from the previous symbol would skip early BOATS prints on the new tape.
+	if bc, ok := f.backfillCursor.Load().(backfillHighWater); ok && bc.Symbol == sym && bc.At.After(cursor) {
+		cursor = bc.At
 	}
 	active := f.active
 	f.mu.Unlock()
@@ -157,7 +160,10 @@ func (f *overnightFeed) pollOnce(ctx context.Context, sym string) {
 		qcancel()
 		if qerr != nil {
 			log.Printf("overnight quote %s: %v", sym, qerr)
-		} else if q.BidPrice > 0 && q.AskPrice > 0 {
+		} else if q.BidPrice > 0 || q.AskPrice > 0 {
+			// One-sided books are common overnight; OnQuote updates each valid
+			// side independently (same as SIP). Requiring both sides left the
+			// quote cache empty and forced pricing off a often-stale last trade.
 			f.agg.OnQuote(sym, float64(q.BidPrice), float64(q.AskPrice), q.Timestamp)
 		}
 	}
@@ -169,8 +175,11 @@ func (f *overnightFeed) pollOnce(ctx context.Context, sym string) {
 	}
 	maxTS := cursor
 	for _, tr := range trades {
-		if tr.Timestamp.Before(cursor) {
-			continue // older than the high-water mark
+		// Exclusive high-water: at-or-before cursor is already in Load/Replay
+		// or a prior poll (zero-ID and non-zero-ID alike). ID dedupe still
+		// catches reprints whose timestamps advance past the mark.
+		if !tr.Timestamp.After(cursor) {
+			continue
 		}
 		if tr.ID != 0 {
 			if _, dup := f.seen[tr.ID]; dup {
@@ -184,12 +193,15 @@ func (f *overnightFeed) pollOnce(ctx context.Context, sym string) {
 		if tr.ID != 0 {
 			f.seen[tr.ID] = struct{}{}
 			f.fifo = append(f.fifo, tr.ID)
+			// Bound the dedupe set; drop a prefix in one go (avoid per-id shift).
+			if len(f.fifo) > maxSeenTradeIDs {
+				drop := len(f.fifo) - maxSeenTradeIDs
+				for i := 0; i < drop; i++ {
+					delete(f.seen, f.fifo[i])
+				}
+				f.fifo = append([]int64(nil), f.fifo[drop:]...)
+			}
 		}
 	}
 	f.cursor = maxTS
-	// Bound the dedupe set FIFO-style.
-	for len(f.fifo) > maxSeenTradeIDs {
-		delete(f.seen, f.fifo[0])
-		f.fifo = f.fifo[1:]
-	}
 }

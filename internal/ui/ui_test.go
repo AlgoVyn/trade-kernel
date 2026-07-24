@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -21,23 +22,23 @@ type fakeExec struct {
 	calls []string
 }
 
-func (f *fakeExec) Buy(_ context.Context, sym string, qty int) (alpaca.Order, error) {
+func (f *fakeExec) Buy(_ context.Context, sym string, qty int, _ session.Session) (alpaca.Order, error) {
 	f.calls = append(f.calls, "buy "+sym)
 	return alpaca.Order{ID: "o1"}, nil
 }
-func (f *fakeExec) Sell(_ context.Context, sym string, qty int) (alpaca.Order, error) {
+func (f *fakeExec) Sell(_ context.Context, sym string, qty int, _ session.Session) (alpaca.Order, error) {
 	f.calls = append(f.calls, "sell "+sym)
 	return alpaca.Order{ID: "o2"}, nil
 }
-func (f *fakeExec) LimitBuy(_ context.Context, sym string, qty int, px float64) (alpaca.Order, error) {
+func (f *fakeExec) LimitBuy(_ context.Context, sym string, qty int, px float64, _ session.Session) (alpaca.Order, error) {
 	f.calls = append(f.calls, "limitbuy "+sym)
 	return alpaca.Order{ID: "o3"}, nil
 }
-func (f *fakeExec) LimitSell(_ context.Context, sym string, qty int, px float64) (alpaca.Order, error) {
+func (f *fakeExec) LimitSell(_ context.Context, sym string, qty int, px float64, _ session.Session) (alpaca.Order, error) {
 	f.calls = append(f.calls, "limitsell "+sym)
 	return alpaca.Order{ID: "o4"}, nil
 }
-func (f *fakeExec) Flatten(_ context.Context, sym string, qty float64) (alpaca.Order, error) {
+func (f *fakeExec) Flatten(_ context.Context, sym string, qty float64, _ session.Session) (alpaca.Order, error) {
 	f.calls = append(f.calls, "flatten "+sym)
 	return alpaca.Order{ID: "o5"}, nil
 }
@@ -74,7 +75,7 @@ func testDeps(t *testing.T) (Deps, *fakeExec, *state.Store, *bars.Aggregator) {
 		Sessions:     eng,
 		Builder:      execution.NewBuilder(agg, nil, 25, 3*time.Second),
 		Latency:      NewLatencyTracker(16),
-		SwitchSymbol: func(s string) error { return nil },
+		SwitchSymbol: func(s string) (string, error) { return s, nil },
 		Paper:        true,
 	}
 	cfg.DefaultSymbol = "AAPL"
@@ -162,9 +163,9 @@ type slowExec struct {
 	delay time.Duration
 }
 
-func (s *slowExec) Buy(ctx context.Context, sym string, qty int) (alpaca.Order, error) {
+func (s *slowExec) Buy(ctx context.Context, sym string, qty int, sess session.Session) (alpaca.Order, error) {
 	time.Sleep(s.delay)
-	return s.fakeExec.Buy(ctx, sym, qty)
+	return s.fakeExec.Buy(ctx, sym, qty, sess)
 }
 
 // TestOrderLatencyIncludesBrokerWait checks that recorded latency includes
@@ -734,7 +735,7 @@ func TestPanResetsOnSymbolSwitch(t *testing.T) {
 	}
 
 	// Switch symbol via cmdline; the success path resets panOffset.
-	m.d.SwitchSymbol = func(s string) error { return nil }
+	m.d.SwitchSymbol = func(s string) (string, error) { return s, nil }
 	m.handleKey(key(':'))
 	for _, r := range "sym NVDA" {
 		if r == ' ' {
@@ -812,7 +813,7 @@ func TestCommandLine(t *testing.T) {
 	d, fx, _, _ := testDeps(t)
 	m := NewModel(d)
 	switched := ""
-	d.SwitchSymbol = func(s string) error { switched = s; return nil }
+	d.SwitchSymbol = func(s string) (string, error) { switched = s; return s, nil }
 	m.d.SwitchSymbol = d.SwitchSymbol
 
 	// Open cmdline, type a symbol switch command.
@@ -913,5 +914,289 @@ func TestRenderCandlesShape(t *testing.T) {
 	// Empty snapshot renders blanks without panic.
 	if got := renderCandles(bars.Snapshot{}, 10, 3, ChartOpts{}); len(got) != 3 {
 		t.Fatalf("empty: %d lines", len(got))
+	}
+}
+
+
+func TestFlattenRESTPreviewWhenLocalFlat(t *testing.T) {
+	d, fx, st, _ := testDeps(t)
+	d.Cfg.ConfirmOrders = true
+	// Flat local book; REST reports short 200.
+	st.Reconcile(alpaca.Account{Equity: 100000}, nil, nil)
+	d.LivePosition = func(_ context.Context, sym string) (float64, error) {
+		if sym != "AAPL" {
+			t.Fatalf("unexpected symbol %s", sym)
+		}
+		return -200, nil
+	}
+	m := NewModel(d)
+	_, cmd := m.handleKey(key('F'))
+	if cmd == nil {
+		t.Fatal("expected async REST preview cmd")
+	}
+	// First cmd returns flattenPreviewMsg.
+	msg := cmd()
+	_, cmd2 := m.Update(msg)
+	if m.pending == nil {
+		t.Fatal("expected pending flatten after REST preview")
+	}
+	if !strings.Contains(m.pending.label, "BUY") || !strings.Contains(m.pending.label, "200") {
+		t.Fatalf("pending label = %q, want BUY 200 cover", m.pending.label)
+	}
+	// Confirm.
+	if cmd2 != nil {
+		t.Fatal("confirm path should not auto-submit")
+	}
+	_, cmd = m.handleKey(key('y'))
+	drain(m, cmd)
+	if len(fx.calls) != 1 || fx.calls[0] != "flatten AAPL" {
+		t.Fatalf("calls = %v", fx.calls)
+	}
+}
+
+func TestFlattenNoPositionWhenLocalAndRESTFlat(t *testing.T) {
+	d, _, st, _ := testDeps(t)
+	st.Reconcile(alpaca.Account{Equity: 100000}, nil, nil)
+	d.LivePosition = func(context.Context, string) (float64, error) { return 0, nil }
+	m := NewModel(d)
+	_, cmd := m.handleKey(key('F'))
+	msg := cmd()
+	m.Update(msg)
+	if m.pending != nil {
+		t.Fatal("should not pending when flat")
+	}
+	if !m.statusErr || !strings.Contains(m.status, "no position") {
+		t.Fatalf("status = %q err=%v", m.status, m.statusErr)
+	}
+}
+
+// When LivePosition is wired, flatten always REST-resolves at intent even if
+// the local book is non-zero so confirm qty matches submit.
+func TestFlattenRESTPreviewWhenLocalNonZero(t *testing.T) {
+	d, fx, st, _ := testDeps(t)
+	d.Cfg.ConfirmOrders = true
+	st.Reconcile(
+		alpaca.Account{Equity: 100000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 100, Side: "long"}},
+		nil,
+	)
+	d.LivePosition = func(_ context.Context, _ string) (float64, error) {
+		return 50, nil // REST smaller than stale-high local
+	}
+	m := NewModel(d)
+	_, cmd := m.handleKey(key('F'))
+	if cmd == nil {
+		t.Fatal("expected async REST preview even with local position")
+	}
+	msg := cmd()
+	m.Update(msg)
+	if m.pending == nil {
+		t.Fatal("expected pending flatten after REST preview")
+	}
+	if !strings.Contains(m.pending.label, "50") || strings.Contains(m.pending.label, "100") {
+		t.Fatalf("pending label = %q, want REST qty 50 not local 100", m.pending.label)
+	}
+	_, cmd = m.handleKey(key('y'))
+	drain(m, cmd)
+	if len(fx.calls) != 1 || fx.calls[0] != "flatten AAPL" {
+		t.Fatalf("calls = %v", fx.calls)
+	}
+}
+
+// REST flat is trusted even when the local book still shows size (local lag
+// after a true exit must not force a flatten). Status must call out the
+// REST/local disagreement explicitly.
+func TestFlattenRESTFlatLocalNonZeroTrustsREST(t *testing.T) {
+	d, _, st, _ := testDeps(t)
+	st.Reconcile(
+		alpaca.Account{Equity: 100000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 25, Side: "long"}},
+		nil,
+	)
+	// Two REST flats (confirm re-read) then done.
+	n := 0
+	d.LivePosition = func(context.Context, string) (float64, error) {
+		n++
+		return 0, nil
+	}
+	m := NewModel(d)
+	_, cmd := m.handleKey(key('F'))
+	msg := cmd()
+	m.Update(msg)
+	if m.pending != nil {
+		t.Fatal("should not pending when REST reports flat")
+	}
+	if !strings.Contains(m.status, "REST flat") || !strings.Contains(m.status, "25") {
+		t.Fatalf("status = %q, want REST flat + local 25", m.status)
+	}
+	if n < 2 {
+		t.Fatalf("LivePosition calls=%d, want >=2 (confirm re-read)", n)
+	}
+}
+
+// When REST is stale-high vs a smaller same-sign local book, prefer local so
+// flatten/panic do not overshoot into a flip.
+func TestResolvePositionQtyPrefersSmallerLocalSameSign(t *testing.T) {
+	d, _, st, _ := testDeps(t)
+	st.Reconcile(
+		alpaca.Account{Equity: 100000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 40, Side: "long"}},
+		nil,
+	)
+	d.LivePosition = func(context.Context, string) (float64, error) {
+		return 100, nil // stale-high REST
+	}
+	m := NewModel(d)
+	q, err := m.resolvePositionQty(context.Background(), "AAPL")
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if q != 40 {
+		t.Fatalf("qty=%v, want 40 (prefer smaller same-sign local)", q)
+	}
+}
+
+// Opposite-sign REST still wins (broker side is authoritative).
+func TestResolvePositionQtyTrustsRESTOppositeSign(t *testing.T) {
+	d, _, st, _ := testDeps(t)
+	st.Reconcile(
+		alpaca.Account{Equity: 100000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 40, Side: "long"}},
+		nil,
+	)
+	d.LivePosition = func(context.Context, string) (float64, error) {
+		return -25, nil
+	}
+	m := NewModel(d)
+	q, err := m.resolvePositionQty(context.Background(), "AAPL")
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if q != -25 {
+		t.Fatalf("qty=%v, want -25 (REST opposite sign)", q)
+	}
+}
+
+// A single REST flat followed by REST error on confirm must fall back to local
+// so panic/flatten do not leave residual after cancel.
+func TestResolvePositionQtyRESTFlatConfirmErrorUsesLocal(t *testing.T) {
+	d, _, st, _ := testDeps(t)
+	st.Reconcile(
+		alpaca.Account{Equity: 100000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 40, Side: "long"}},
+		nil,
+	)
+	n := 0
+	d.LivePosition = func(context.Context, string) (float64, error) {
+		n++
+		if n == 1 {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("transient 404")
+	}
+	m := NewModel(d)
+	ctx := context.Background()
+	q, err := m.resolvePositionQty(ctx, "AAPL")
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if q != 40 {
+		t.Fatalf("qty=%v, want 40 (local after confirm error)", q)
+	}
+}
+
+func TestFlattenSkipsMaxPositionWithWorking(t *testing.T) {
+	d, fx, st, _ := testDeps(t)
+	// Long 100 with max position 100; large resting sells would fail projection
+	// without SkipMaxPosition.
+	st.Reconcile(
+		alpaca.Account{Equity: 100000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 100, Side: "long"}},
+		[]alpaca.Order{{ID: "s1", Symbol: "AAPL", Qty: 2000, Side: "sell", Status: "new"}},
+	)
+	d.Risk = risk.NewChecker(risk.Limits{MaxOrderQty: 50, MaxPositionQty: 100}, st, nil)
+	d.Risk.SetWorkingLookup(st)
+	d.Cfg.ConfirmOrders = false
+	m := NewModel(d)
+	_, cmd := m.handleKey(key('F'))
+	drain(m, cmd)
+	if len(fx.calls) != 1 || fx.calls[0] != "flatten AAPL" {
+		t.Fatalf("flatten should pass with SkipMaxPosition, calls=%v status=%q", fx.calls, m.status)
+	}
+}
+
+func TestSymbolSwitchGenIgnoresStale(t *testing.T) {
+	d, _, _, _ := testDeps(t)
+	m := NewModel(d)
+	m.switchGen = 2
+	m.symbol = "NVDA"
+	// Stale gen=1 success must not clobber.
+	m.Update(symbolSwitchedMsg{symbol: "AAPL", active: "AAPL", err: nil, gen: 1})
+	if m.symbol != "NVDA" {
+		t.Fatalf("symbol = %s, want NVDA (stale gen ignored)", m.symbol)
+	}
+	m.Update(symbolSwitchedMsg{symbol: "MSFT", active: "MSFT", err: nil, gen: 2})
+	if m.symbol != "MSFT" {
+		t.Fatalf("symbol = %s, want MSFT", m.symbol)
+	}
+}
+
+// Concurrent :sym where an intermediate success is followed by a failed later
+// switch must re-sync UI to the rolled-back active (not leave the pre-request name).
+func TestSymbolSwitchErrorResyncsActive(t *testing.T) {
+	d, _, _, _ := testDeps(t)
+	m := NewModel(d)
+	m.symbol = "NVDA"
+	m.switchGen = 2
+	// Intermediate AAPL success (gen=1) is superseded.
+	m.Update(symbolSwitchedMsg{symbol: "AAPL", active: "AAPL", err: nil, gen: 1})
+	if m.symbol != "NVDA" {
+		t.Fatalf("after stale success symbol=%s, want NVDA", m.symbol)
+	}
+	// MSFT fails and rolls market back to AAPL — UI must follow active.
+	m.Update(symbolSwitchedMsg{
+		symbol: "MSFT", active: "AAPL",
+		err: fmt.Errorf("backfill MSFT 1m: timeout"), gen: 2,
+	})
+	if m.symbol != "AAPL" {
+		t.Fatalf("after failed switch symbol=%s, want AAPL (rolled-back active)", m.symbol)
+	}
+	if !m.statusErr {
+		t.Fatal("expected error status on failed switch")
+	}
+}
+
+// Dual switch failure returns active=="" — UI must clear m.symbol so the
+// operator is not stuck on the pre-request name while the tape is muted.
+func TestSymbolSwitchDualFailureClearsActive(t *testing.T) {
+	d, _, _, _ := testDeps(t)
+	m := NewModel(d)
+	m.symbol = "NVDA"
+	m.switchGen = 1
+	m.Update(symbolSwitchedMsg{
+		symbol: "AAPL", active: "",
+		err: fmt.Errorf("subscribe AAPL: boom; restore NVDA: boom"), gen: 1,
+	})
+	if m.symbol != "" {
+		t.Fatalf("symbol=%q, want empty after dual failure", m.symbol)
+	}
+	if !m.statusErr || !strings.Contains(m.status, "no active symbol") {
+		t.Fatalf("status=%q err=%v, want no active symbol", m.status, m.statusErr)
+	}
+}
+
+// Flatten REST preview for an old symbol after a switch must not leave the
+// status bar stuck on "looking up position …".
+func TestFlattenPreviewDroppedOnSymbolChangeClearsStatus(t *testing.T) {
+	d, _, _, _ := testDeps(t)
+	m := NewModel(d)
+	m.symbol = "NVDA"
+	m.setStatus("looking up position AAPL…", false)
+	m.Update(flattenPreviewMsg{symbol: "AAPL", pos: 10, err: nil})
+	if strings.Contains(m.status, "looking up position") {
+		t.Fatalf("status still looking up after symbol mismatch: %q", m.status)
+	}
+	if m.pending != nil {
+		t.Fatal("must not open flatten confirm for mismatched symbol")
 	}
 }

@@ -37,7 +37,13 @@ type Deps struct {
 	Latency  *LatencyTracker
 	// SwitchSymbol resubscribes market data and backfills bars. It may
 	// block briefly; the UI calls it from a command goroutine.
-	SwitchSymbol func(symbol string) error
+	// On return, active is the committed market symbol after success or
+	// rollback (may differ from the requested symbol on failure).
+	SwitchSymbol func(symbol string) (active string, err error)
+	// LivePosition is REST-first signed broker qty for flatten/panic. Local
+	// book is used only when REST errors, or when LivePosition is nil.
+	// Optional.
+	LivePosition func(ctx context.Context, symbol string) (float64, error)
 	Paper        bool
 }
 
@@ -51,7 +57,24 @@ type orderResultMsg struct {
 }
 
 type symbolSwitchedMsg struct {
+	// symbol is the requested target of this :sym.
 	symbol string
+	// active is the committed market symbol after SwitchSymbol returns
+	// (requested on success, rolled-back previous on failure). Always
+	// applied to m.symbol when gen is current so concurrent :sym cannot
+	// leave the UI on a pre-request name while the tape is elsewhere.
+	active string
+	err    error
+	// gen matches Model.switchGen so a late concurrent :sym result cannot
+	// overwrite m.symbol after a newer switch request.
+	gen uint64
+}
+
+// flattenPreviewMsg is the result of a REST position lookup at F/:flatten
+// intent — used to build a full confirm label with REST-first qty.
+type flattenPreviewMsg struct {
+	symbol string
+	pos    float64
 	err    error
 }
 
@@ -61,7 +84,8 @@ type pendingAction struct {
 	// record is called when submission is committed (start of execAsync) so
 	// in-flight duplicates are blocked during broker RTT. Declined confirm
 	// never reaches execAsync and does not burn the debounce window.
-	record func()
+	// Non-nil error aborts submit (e.g. concurrent Record lost the debounce race).
+	record func() error
 }
 
 // Model is the bubbletea root model.
@@ -111,6 +135,10 @@ type Model struct {
 
 	sess session.Session
 	done bool
+
+	// switchGen increments on each :sym request; symbolSwitchedMsg carries the
+	// gen so superseded concurrent switches do not clobber m.symbol.
+	switchGen uint64
 }
 
 // NewModel builds the root model.
@@ -324,15 +352,62 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case symbolSwitchedMsg:
+		if msg.gen != 0 && msg.gen != m.switchGen {
+			// Superseded by a later :sym; that request's completion will
+			// re-sync m.symbol from its committed active.
+			return m, nil
+		}
+		// Always re-sync from the committed active symbol (including empty on
+		// dual switch failure) so a failed later switch that rolls back still
+		// leaves the UI on the tape symbol — not stuck on a pre-request name
+		// while activeSymbol is "" and the tape is muted.
+		// (e.g. NVDA→AAPL ok, AAPL→MSFT fail → active AAPL, not stuck NVDA;
+		//  dual restore failure → active "", UI clears to force re-:sym).
+		if msg.active != m.symbol {
+			m.panOffset = 0
+			m.leftCrop = 0
+		}
+		m.symbol = msg.active
 		if msg.err != nil {
-			m.setStatus(fmt.Sprintf("switch %s: %v", msg.symbol, msg.err), true)
+			if msg.active == "" {
+				m.setStatus(fmt.Sprintf("switch %s: %v (no active symbol — re-issue :sym)", msg.symbol, msg.err), true)
+			} else {
+				m.setStatus(fmt.Sprintf("switch %s: %v", msg.symbol, msg.err), true)
+			}
 		} else {
-			m.symbol = msg.symbol
 			m.panOffset = 0
 			m.leftCrop = 0
 			m.setStatus("symbol → "+msg.symbol, false)
 		}
 		return m, nil
+
+	case flattenPreviewMsg:
+		if msg.symbol != m.symbol {
+			// Symbol changed while REST lookup was in flight; clear the
+			// "looking up position …" status so the strip does not look wedged.
+			if strings.Contains(m.status, "looking up position") {
+				m.setStatus("flatten cancelled (symbol changed)", false)
+			}
+			return m, nil
+		}
+		if msg.err != nil {
+			m.setStatus(fmt.Sprintf("position lookup %s: %v", msg.symbol, msg.err), true)
+			return m, nil
+		}
+		if msg.pos == 0 {
+			// REST-confirmed flat. If local still shows size, say so explicitly
+			// so a bad 404 is visible (we still refuse to flatten — leave residual
+			// rather than wrong-side exit on a true flat).
+			status := "no position in " + msg.symbol
+			if m.d.Store != nil {
+				if local := m.d.Store.PositionQty(msg.symbol); local != 0 {
+					status = fmt.Sprintf("REST flat, local %s — not flattening %s", formatFlattenQty(local), msg.symbol)
+				}
+			}
+			m.setStatus(status, true)
+			return m, nil
+		}
+		return m, m.flattenConfirm(msg.symbol, msg.pos)
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -421,7 +496,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "reduce":
 		return m, m.addReduce(false)
 	case "flatten":
-		return m, m.flattenIntent(false)
+		return m, m.flattenIntent()
 	case "cancel", "cancel_all": // cancel_all is a legacy alias
 		return m, m.cancelIntent()
 	case "panic", "panic_all": // panic_all is a legacy alias (now symbol-scoped)
@@ -605,13 +680,22 @@ func (m *Model) setStatus(s string, isErr bool) {
 	m.status, m.statusErr, m.statusAt = s, isErr, time.Now()
 }
 
+// pinSession returns the session to freeze for this intent (confirm→submit).
+// Captured once so a boundary during y/n cannot change order class.
+func (m *Model) pinSession() session.Session {
+	if m.d.Sessions != nil {
+		return m.d.Sessions.Current()
+	}
+	return m.sess
+}
+
 // orderIntent runs risk checks and either confirms or submits.
 func (m *Model) orderIntent(side string, qty int, limit float64, skipRisk bool) tea.Cmd {
 	symbol := m.symbol
 	// Block new orders until the first REST reconcile lands so a failed
 	// startup snapshot can't let the operator trade against a stale/empty
 	// view. Flatten and panic bypass this (see flattenIntent / panicIntent):
-	// they read PositionQty live and fall back to DELETE /v2/positions.
+	// they re-read position at submit (REST-first when LivePosition is set).
 	if m.d.Store != nil && !m.d.Store.Reconciled() {
 		m.setStatus("reconcile pending — order blocked (flatten/panic still work)", true)
 		return nil
@@ -622,18 +706,24 @@ func (m *Model) orderIntent(side string, qty int, limit float64, skipRisk bool) 
 			return nil
 		}
 	}
+	// Pin session at intent so confirm→submit cannot flip market↔limit.
+	sess := m.pinSession()
 	var run func(ctx context.Context) (alpaca.Order, error)
 	label := fmt.Sprintf("%s %d %s", strings.ToUpper(side), qty, symbol)
 	if limit > 0 {
 		label += fmt.Sprintf(" lmt %.2f", limit)
 		if side == "buy" {
-			run = func(ctx context.Context) (alpaca.Order, error) { return m.d.Exec.LimitBuy(ctx, symbol, qty, limit) }
+			run = func(ctx context.Context) (alpaca.Order, error) {
+				return m.d.Exec.LimitBuy(ctx, symbol, qty, limit, sess)
+			}
 		} else {
-			run = func(ctx context.Context) (alpaca.Order, error) { return m.d.Exec.LimitSell(ctx, symbol, qty, limit) }
+			run = func(ctx context.Context) (alpaca.Order, error) {
+				return m.d.Exec.LimitSell(ctx, symbol, qty, limit, sess)
+			}
 		}
 	} else {
 		// Show the converted limit in extended sessions.
-		if session.Extended(m.sess) && m.d.Builder != nil {
+		if session.Extended(sess) && m.d.Builder != nil {
 			if px, warn := m.d.Builder.PreviewLimit(side); px > 0 {
 				label += fmt.Sprintf(" ~lmt %.2f", px)
 				if warn != "" {
@@ -642,9 +732,13 @@ func (m *Model) orderIntent(side string, qty int, limit float64, skipRisk bool) 
 			}
 		}
 		if side == "buy" {
-			run = func(ctx context.Context) (alpaca.Order, error) { return m.d.Exec.Buy(ctx, symbol, qty) }
+			run = func(ctx context.Context) (alpaca.Order, error) {
+				return m.d.Exec.Buy(ctx, symbol, qty, sess)
+			}
 		} else {
-			run = func(ctx context.Context) (alpaca.Order, error) { return m.d.Exec.Sell(ctx, symbol, qty) }
+			run = func(ctx context.Context) (alpaca.Order, error) {
+				return m.d.Exec.Sell(ctx, symbol, qty, sess)
+			}
 		}
 	}
 	// Debounce is recorded when execAsync commits the submit — not at Check
@@ -653,13 +747,14 @@ func (m *Model) orderIntent(side string, qty int, limit float64, skipRisk bool) 
 	p := &pendingAction{
 		label: label,
 		run:   run,
-		record: func() {
-			if !skipRisk {
-				m.d.Risk.Record(symbol, side, qty)
+		record: func() error {
+			if skipRisk {
+				return nil
 			}
+			return m.d.Risk.Record(symbol, side, qty)
 		},
 	}
-	if m.d.Cfg.ConfirmOrders {
+	if m.d.Cfg != nil && m.d.Cfg.ConfirmOrders {
 		m.pending = p
 		return nil
 	}
@@ -692,53 +787,147 @@ func (m *Model) addReduce(add bool) tea.Cmd {
 	return m.orderIntent("buy", qty, 0, false)
 }
 
-func (m *Model) flattenIntent(skipRisk bool) tea.Cmd {
+// resolvePositionQty returns signed position size for flatten/panic.
+// Prefers REST live qty when LivePosition is wired so a stale-high local book
+// cannot oversize the exit; falls back to the local store on REST error or
+// when LivePosition is nil.
+//
+// A successful REST flat (0), including 404-as-nil from the broker, is trusted
+// even when the local book still shows size — local lag after a true exit must
+// not force a wrong-side or oversized exit. When REST reports flat while local
+// is non-zero, a second REST read confirms before trusting flat (a transient
+// wrong 404 then falls back to local so panic/flatten do not leave residual).
+//
+// When REST and local agree on sign and local is strictly smaller in absolute
+// size, prefer local: REST can briefly lag high after a partial exit and sizing
+// off the larger REST figure would flip the book. Opposite-sign disagreement
+// still trusts REST (side is broker-authoritative).
+// Fail closed only when REST errors and the local book is also empty.
+func (m *Model) resolvePositionQty(ctx context.Context, symbol string) (float64, error) {
+	if m.d.LivePosition != nil {
+		q, err := m.d.LivePosition(ctx, symbol)
+		if err != nil {
+			// REST failed — use local if present rather than aborting the exit.
+			if m.d.Store != nil {
+				if local := m.d.Store.PositionQty(symbol); local != 0 {
+					return local, nil
+				}
+			}
+			return 0, err
+		}
+		if m.d.Store != nil {
+			local := m.d.Store.PositionQty(symbol)
+			if q == 0 && local != 0 {
+				// Confirm flat: a single bad 404 must not cancel+skip while size exists.
+				q2, err2 := m.d.LivePosition(ctx, symbol)
+				if err2 != nil {
+					return local, nil
+				}
+				if q2 != 0 {
+					return preferConservativeQty(q2, local), nil
+				}
+				// Confirmed REST flat over local lag — callers surface the disagreement.
+				return 0, nil
+			}
+			if q != 0 && local != 0 {
+				return preferConservativeQty(q, local), nil
+			}
+		}
+		return q, nil
+	}
+	if m.d.Store != nil {
+		return m.d.Store.PositionQty(symbol), nil
+	}
+	return 0, nil
+}
+
+// preferConservativeQty picks REST qty unless local and REST share sign and
+// |local| < |REST|, in which case local is preferred to avoid overshoot from
+// a stale-high REST position.
+func preferConservativeQty(rest, local float64) float64 {
+	if local == 0 {
+		return rest
+	}
+	if rest == 0 {
+		return rest
+	}
+	sameSign := (rest > 0) == (local > 0)
+	if sameSign && math.Abs(local) < math.Abs(rest) {
+		return local
+	}
+	return rest
+}
+
+func (m *Model) flattenIntent() tea.Cmd {
 	symbol := m.symbol
-	pos := m.d.Store.PositionQty(symbol)
+	// Always REST-resolve at intent when LivePosition is wired so the confirm
+	// line side/qty matches submit (local can be stale high or low).
+	if m.d.LivePosition != nil {
+		m.setStatus("looking up position "+symbol+"…", false)
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			live, err := m.resolvePositionQty(ctx, symbol)
+			return flattenPreviewMsg{symbol: symbol, pos: live, err: err}
+		}
+	}
+	pos := float64(0)
+	if m.d.Store != nil {
+		pos = m.d.Store.PositionQty(symbol)
+	}
+	return m.flattenConfirm(symbol, pos)
+}
+
+// flattenConfirm builds the flatten pending action with a known signed pos
+// (from local book or REST preview). Submit re-resolves qty via REST-first.
+// Flatten is an exit: it does not call risk.Check / CheckOpts at all
+// (full bypass, same as panic for checker scope). Positions can exceed
+// max_order_qty and working stacks must not block F. Confirmation follows
+// ConfirmOrders only (no skipRisk flag — flatten never skipped the checker).
+func (m *Model) flattenConfirm(symbol string, pos float64) tea.Cmd {
 	if pos == 0 {
 		m.setStatus("no position in "+symbol, true)
 		return nil
 	}
-	qty := int(math.Abs(pos))
 	side := "sell"
 	if pos < 0 {
 		side = "buy"
 	}
-	// Sub-share residuals (0 < |pos| < 1) have qty==0 for risk sizing but must
-	// still flatten via ClosePosition. Only enforce kill-switch for those;
-	// whole-share flattens go through the full Check.
-	if !skipRisk {
-		if qty == 0 {
-			if locked, reason := m.d.Risk.Locked(); locked {
-				m.setStatus(fmt.Sprintf("kill-switch locked (%s): use :unlock to re-enable", reason), true)
-				return nil
-			}
-		} else if err := m.d.Risk.Check(symbol, side, qty); err != nil {
-			m.setStatus(err.Error(), true)
-			return nil
-		}
-	}
+	sess := m.pinSession()
 	label := fmt.Sprintf("FLATTEN %s (%s %s)", symbol, strings.ToUpper(side), formatFlattenQty(pos))
 	// Show the converted limit price + any stale-quote warning in extended
-	// sessions, mirroring orderIntent.
-	if session.Extended(m.sess) && m.d.Builder != nil {
-		if px, warn := m.d.Builder.PreviewLimit(side); px > 0 {
+	// sessions (exit pricing budget matches submit).
+	if session.Extended(sess) && m.d.Builder != nil {
+		if px, warn := m.d.Builder.PreviewLimitExit(side); px > 0 {
 			label += fmt.Sprintf(" ~lmt %.2f", px)
 			if warn != "" {
 				label += " [" + warn + "]"
 			}
 		}
 	}
+	confirmPos := pos
 	p := &pendingAction{
 		label: label,
-		run:   func(ctx context.Context) (alpaca.Order, error) { return m.d.Exec.Flatten(ctx, symbol, pos) },
-		record: func() {
-			if !skipRisk && qty > 0 {
-				m.d.Risk.Record(symbol, side, qty)
+		// Re-read qty at submit (REST-first) so confirms that span fills do not
+		// leave a residual, flip side, or oversize on a stale book.
+		run: func(ctx context.Context) (alpaca.Order, error) {
+			live, err := m.resolvePositionQty(ctx, symbol)
+			if err != nil {
+				return alpaca.Order{}, fmt.Errorf("position lookup %s: %w", symbol, err)
 			}
+			if live == 0 {
+				return alpaca.Order{}, fmt.Errorf("no position in %s", symbol)
+			}
+			// Abort if sign flipped vs confirm-time preview (operator intent).
+			if (confirmPos > 0) != (live > 0) {
+				return alpaca.Order{}, fmt.Errorf("position side flipped for %s during confirm — re-issue flatten", symbol)
+			}
+			return m.d.Exec.Flatten(ctx, symbol, live, sess)
 		},
+		// Do not Record debounce for flatten — emergency exits must not be blocked.
+		record: nil,
 	}
-	if m.d.Cfg.ConfirmOrders && !skipRisk {
+	if m.d.Cfg != nil && m.d.Cfg.ConfirmOrders {
 		m.pending = p
 		return nil
 	}
@@ -804,6 +993,7 @@ func countOtherOpenSymbols(st *state.Store, symbol string) int {
 // the currently selected symbol only.
 func (m *Model) panicIntent() tea.Cmd {
 	symbol := m.symbol
+	sess := m.pinSession()
 	// Same as execAsync: start before the bubbletea Cmd so dispatch delay
 	// is included in keypress→ack (status-bar p50/p99).
 	start := time.Now()
@@ -811,7 +1001,7 @@ func (m *Model) panicIntent() tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		cancelFailures, cancelErr := m.d.Exec.CancelSymbol(ctx, symbol)
-		qty := m.d.Store.PositionQty(symbol)
+		qty, qerr := m.resolvePositionQty(ctx, symbol)
 		otherOpen := countOtherOpenSymbols(m.d.Store, symbol)
 		otherNote := ""
 		if otherOpen > 0 {
@@ -823,14 +1013,28 @@ func (m *Model) panicIntent() tea.Cmd {
 		} else if cancelErr != nil {
 			cancelNote = "; cancel err: " + cancelErr.Error()
 		}
+		if qerr != nil {
+			err := fmt.Errorf("position lookup: %w", qerr)
+			if cancelErr != nil {
+				err = fmt.Errorf("%w (also cancel err: %v)", err, cancelErr)
+			}
+			return orderResultMsg{label: "PANIC", err: err, latency: time.Since(start)}
+		}
 		if qty == 0 {
-			detail := "cancelled " + symbol + " orders; already flat" + otherNote + cancelNote
+			detail := "cancelled " + symbol + " orders; already flat"
+			// Surface local lag when REST confirmed flat over a non-zero book.
+			if m.d.Store != nil {
+				if local := m.d.Store.PositionQty(symbol); local != 0 {
+					detail += fmt.Sprintf(" (REST flat, local %s — not flattening)", formatFlattenQty(local))
+				}
+			}
+			detail += otherNote + cancelNote
 			return orderResultMsg{
 				label: "PANIC", detail: detail,
 				latency: time.Since(start),
 			}
 		}
-		o, err := m.d.Exec.Flatten(ctx, symbol, qty)
+		o, err := m.d.Exec.Flatten(ctx, symbol, qty, sess)
 		if err != nil {
 			if cancelErr != nil {
 				err = fmt.Errorf("%w (also cancel err: %v)", err, cancelErr)
@@ -853,8 +1057,12 @@ func (m *Model) execAsync(p *pendingAction) tea.Cmd {
 	// Record debounce as soon as we commit to submit so a second identical
 	// hotkey during broker RTT cannot pass Check. Declined confirm never
 	// reaches here. Broker rejects still burn the short debounce window.
+	// Re-check under lock: concurrent Check that both passed can lose here.
 	if p.record != nil {
-		p.record()
+		if err := p.record(); err != nil {
+			m.setStatus(err.Error(), true)
+			return nil
+		}
 	}
 	// Keypress→ack (or confirm-accept→ack): start before the bubbletea
 	// command goroutine so dispatch delay is included, matching DESIGN.
@@ -889,10 +1097,19 @@ func (m *Model) runCommand(input string) tea.Cmd {
 		if c.Symbol == m.symbol {
 			return nil
 		}
+		if m.d.SwitchSymbol == nil {
+			m.setStatus("symbol switch not available", true)
+			return nil
+		}
+		m.switchGen++
+		gen := m.switchGen
 		m.setStatus("switching to "+c.Symbol+"…", false)
 		return func() tea.Msg {
-			err := m.d.SwitchSymbol(c.Symbol)
-			return symbolSwitchedMsg{symbol: c.Symbol, err: err}
+			active, err := m.d.SwitchSymbol(c.Symbol)
+			if active == "" && err == nil {
+				active = c.Symbol
+			}
+			return symbolSwitchedMsg{symbol: c.Symbol, active: active, err: err, gen: gen}
 		}
 	case cmdline.KindTF:
 		spec, ok := bars.ParseChartTF(c.TF)
@@ -928,7 +1145,7 @@ func (m *Model) runCommand(input string) tea.Cmd {
 		m.setStatus(fmt.Sprintf("preset %d → size %d", c.Preset, m.qty()), false)
 		return nil
 	case cmdline.KindFlatten:
-		return m.flattenIntent(false)
+		return m.flattenIntent()
 	case cmdline.KindCancel:
 		return m.cancelIntent()
 	case cmdline.KindLock:
@@ -1352,6 +1569,10 @@ var (
 	// Order side glyphs (B/S) — bold tinted.
 	stInfoSideBuy  = lipgloss.NewStyle().Foreground(infoUpFg).Bold(true)
 	stInfoSideSell = lipgloss.NewStyle().Foreground(infoDownFg).Bold(true)
+	// Info-bar row band; width applied per frame via .Width(w).
+	stInfoRowBase = lipgloss.NewStyle().
+			Background(lipgloss.Color("#1a1b26")).
+			PaddingLeft(1)
 )
 
 // infoSeg is one pipe-separated info-bar unit with a fit priority
@@ -1459,10 +1680,8 @@ func (m *Model) renderInfoBar(w, h int, book state.BookSnapshot, market bars.Mar
 	}
 	row1, row2 := m.buildInfoBarRows(w, book, market)
 	// Soft band under the status bar so the strip reads as a unit without
-	// competing with the chart below.
-	rowStyle := lipgloss.NewStyle().Width(w).MaxWidth(w).
-		Background(lipgloss.Color("#1a1b26")).
-		PaddingLeft(1)
+	// competing with the chart below. Base style is hoisted; only width is dynamic.
+	rowStyle := stInfoRowBase.Width(w).MaxWidth(w)
 	if h == 1 || row2 == "" {
 		return rowStyle.Render(row1)
 	}

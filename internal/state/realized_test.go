@@ -190,6 +190,64 @@ func TestSeedsFromPositionsIncludesZeroAvg(t *testing.T) {
 	}
 }
 
+// Alpaca REST often returns negative qty for shorts. Seeds must still sign
+// correctly and not drop the position (q <= 0 was the old bug).
+func TestSeedsFromPositionsSignedRESTShortQty(t *testing.T) {
+	seeds := SeedsFromPositions([]alpaca.Position{
+		{Symbol: "PUT", Qty: -20, Side: "short", AvgEntryPrice: 4.825},
+		{Symbol: "LONG", Qty: 10, Side: "long", AvgEntryPrice: 1.26},
+	})
+	if len(seeds) != 2 {
+		t.Fatalf("len = %d, want 2", len(seeds))
+	}
+	by := map[string]PositionSeed{}
+	for _, s := range seeds {
+		by[s.Symbol] = s
+	}
+	if by["PUT"].Qty != -20 || by["PUT"].Avg != 4.825 {
+		t.Fatalf("PUT = %+v, want qty=-20 avg=4.825", by["PUT"])
+	}
+	if by["LONG"].Qty != 10 {
+		t.Fatalf("LONG = %+v", by["LONG"])
+	}
+}
+
+// Activity FILL uses side=sell_short for short opens. Those must realize like sell.
+func TestRealizedSellShortRoundTrip(t *testing.T) {
+	day0 := tUTC(0, 0)
+	fills := []alpaca.Fill{
+		{ID: "1", Symbol: "DRAM", Side: "sell_short", Qty: 100, Price: 58.73, Timestamp: tUTC(1, 0)},
+		{ID: "2", Symbol: "DRAM", Side: "buy", Qty: 100, Price: 58.56, Timestamp: tUTC(2, 0)},
+	}
+	got := RealizedFromFills(fills, day0, day0)
+	// Cover short: (58.73 - 58.56) * 100 = 17
+	if math.Abs(got.Day-17) > 1e-9 {
+		t.Fatalf("day = %v, want 17", got.Day)
+	}
+}
+
+// Short open at REST with sell_short-only history must seed and stay consistent.
+func TestRealizedShortSeedWithSellShortFills(t *testing.T) {
+	day0 := tUTC(0, 0)
+	// Opened short via sell_short; REST still short 20 @ 4.825 (signed REST qty).
+	fills := []alpaca.Fill{
+		{ID: "1", Symbol: "PUT", Side: "sell_short", Qty: 20, Price: 4.825, Timestamp: tUTC(1, 0)},
+	}
+	seeds := SeedsFromPositions([]alpaca.Position{
+		{Symbol: "PUT", Qty: -20, Side: "short", AvgEntryPrice: 4.825},
+	})
+	got, ok, excl := RealizedFromFillsWithSeed(fills, day0, day0, seeds)
+	if !ok {
+		t.Fatal("short seed + sell_short open must be consistent")
+	}
+	if len(excl) != 0 {
+		t.Fatalf("excluded = %v, want none", excl)
+	}
+	if got.Day != 0 {
+		t.Fatalf("open only → day = %v, want 0", got.Day)
+	}
+}
+
 func TestRealizedSeedOnlyLongHeldNoCloses(t *testing.T) {
 	day0 := tUTC(0, 0)
 	seeds := []PositionSeed{{Symbol: "TQQQ", Qty: 100, Avg: 50}}

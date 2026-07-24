@@ -41,7 +41,7 @@ func TestFlattenClosedFallback(t *testing.T) {
 	b := NewBuilder(fakeQuotes{}, nil, 25, 0)
 	exec := NewRESTExecutor(rest, b, func() session.Session { return session.Closed }, "day")
 
-	o, err := exec.Flatten(context.Background(), "AAPL", 300)
+	o, err := exec.Flatten(context.Background(), "AAPL", 300, session.Closed)
 	if err != nil {
 		t.Fatalf("Flatten in closed session: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestFlattenExtendedPricingFailureNoMarketFallback(t *testing.T) {
 	for _, sess := range []session.Session{session.PreMarket, session.AfterHours, session.Overnight} {
 		gotDelete = ""
 		exec := NewRESTExecutor(rest, b, func() session.Session { return sess }, "day")
-		_, err := exec.Flatten(context.Background(), "AAPL", 100)
+		_, err := exec.Flatten(context.Background(), "AAPL", 100, sess)
 		if err == nil {
 			t.Fatalf("%s: expected pricing error, got nil", sess)
 		}
@@ -129,7 +129,7 @@ func TestFlattenOvernightLongShortLimitOrder(t *testing.T) {
 
 	// Long exit → sell limit at bid × (1 − 25bps) = 99.75.
 	got = captured{}
-	if _, err := exec.Flatten(context.Background(), "AAPL", 100); err != nil {
+	if _, err := exec.Flatten(context.Background(), "AAPL", 100, session.Overnight); err != nil {
 		t.Fatalf("flatten long: %v", err)
 	}
 	if got.Type != "limit" || got.Side != "sell" || !got.ExtendedHours || got.LimitPrice != "99.75" || got.Qty != "100" {
@@ -137,7 +137,7 @@ func TestFlattenOvernightLongShortLimitOrder(t *testing.T) {
 	}
 	// Short exit → buy limit at ask × (1 + 25bps) = 100.36 (ceiled).
 	got = captured{}
-	if _, err := exec.Flatten(context.Background(), "AAPL", -100); err != nil {
+	if _, err := exec.Flatten(context.Background(), "AAPL", -100, session.Overnight); err != nil {
 		t.Fatalf("flatten short: %v", err)
 	}
 	if got.Type != "limit" || got.Side != "buy" || !got.ExtendedHours || got.LimitPrice != "100.36" || got.Qty != "100" {
@@ -173,7 +173,7 @@ func TestFlattenBrokerRejectDoesNotFallback(t *testing.T) {
 	b := NewBuilder(fakeQuotes{}, nil, 25, 0)
 	exec := NewRESTExecutor(rest, b, func() session.Session { return session.Regular }, "day")
 
-	_, err := exec.Flatten(context.Background(), "AAPL", 100)
+	_, err := exec.Flatten(context.Background(), "AAPL", 100, session.Regular)
 	if err == nil {
 		t.Fatal("expected PlaceOrder error")
 	}
@@ -213,7 +213,7 @@ func TestFlattenFractionalUsesClosePosition(t *testing.T) {
 		exec := NewRESTExecutor(rest, b, func() session.Session { return sess }, "day")
 		for _, qty := range []float64{100.5, 0.5, -2.25} {
 			gotDelete, gotPost = "", 0
-			if _, err := exec.Flatten(context.Background(), "AAPL", qty); err != nil {
+			if _, err := exec.Flatten(context.Background(), "AAPL", qty, sess); err != nil {
 				t.Fatalf("%s Flatten(%v): %v", sess, qty, err)
 			}
 			if gotDelete != "AAPL" {
@@ -245,7 +245,7 @@ func TestFlattenFractionalExtendedRejected(t *testing.T) {
 	for _, sess := range []session.Session{session.PreMarket, session.AfterHours, session.Overnight} {
 		exec := NewRESTExecutor(rest, b, func() session.Session { return sess }, "day")
 		gotDelete = ""
-		_, err := exec.Flatten(context.Background(), "AAPL", 100.5)
+		_, err := exec.Flatten(context.Background(), "AAPL", 100.5, sess)
 		if err == nil {
 			t.Fatalf("%s: expected error for fractional flatten", sess)
 		}
@@ -283,7 +283,7 @@ func TestFlattenOpenSessionUsesOrder(t *testing.T) {
 	b := NewBuilder(fakeQuotes{}, nil, 25, 0)
 	exec := NewRESTExecutor(rest, b, func() session.Session { return session.Regular }, "day")
 
-	o, err := exec.Flatten(context.Background(), "AAPL", 300)
+	o, err := exec.Flatten(context.Background(), "AAPL", 300, session.Regular)
 	if err != nil {
 		t.Fatalf("Flatten in regular session: %v", err)
 	}
@@ -295,5 +295,45 @@ func TestFlattenOpenSessionUsesOrder(t *testing.T) {
 	}
 	if o.ID != "ord-1" {
 		t.Fatalf("order ID = %q, want ord-1", o.ID)
+	}
+}
+
+// TestFlattenRegularIgnoresIOCConfig: flatten/panic must use day TIF even when
+// the executor is configured with regular_tif=ioc (IOC can leave residuals).
+func TestFlattenRegularIgnoresIOCConfig(t *testing.T) {
+	var gotTIF string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v2/orders" {
+			var body struct {
+				TimeInForce string `json:"time_in_force"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotTIF = body.TimeInForce
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(alpaca.Order{ID: "ord-flat"})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	rest := alpaca.NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	b := NewBuilder(fakeQuotes{}, nil, 25, 0)
+	exec := NewRESTExecutor(rest, b, func() session.Session { return session.Regular }, "ioc")
+
+	if _, err := exec.Flatten(context.Background(), "AAPL", 100, session.Regular); err != nil {
+		t.Fatalf("Flatten: %v", err)
+	}
+	if gotTIF != "day" {
+		t.Fatalf("Flatten TIF = %q, want day (not ioc)", gotTIF)
+	}
+	// Buy still respects ioc config.
+	gotTIF = ""
+	if _, err := exec.Buy(context.Background(), "AAPL", 10, session.Regular); err != nil {
+		t.Fatalf("Buy: %v", err)
+	}
+	if gotTIF != "ioc" {
+		t.Fatalf("Buy TIF = %q, want ioc", gotTIF)
 	}
 }

@@ -79,17 +79,34 @@ func At(t time.Time) Session {
 	// timestamp within the same (ET weekday, minute) shares a result. Memoize
 	// per-minute to avoid re-running weekday arithmetic for each visible bar
 	// on every render frame (the chart renderer calls At once per bar).
+	// Bound the map so multi-day chart history cannot grow without limit.
 	t = t.In(et)
 	key := uint64(t.Unix())/60 + uint64(t.Weekday())*1e6
-	if v, ok := atCache.Load(key); ok {
-		return v.(Session)
+	atCacheMu.RLock()
+	if s, ok := atCache[key]; ok {
+		atCacheMu.RUnlock()
+		return s
 	}
+	atCacheMu.RUnlock()
 	s := classifyAt(t)
-	atCache.Store(key, s)
+	atCacheMu.Lock()
+	if len(atCache) >= maxAtCacheEntries {
+		// Drop all cached classifications by replacing the map — rare; only
+		// after long multi-day charts. Capacity hint keeps the next growth
+		// moderate without retaining stale keys.
+		atCache = make(map[uint64]Session, maxAtCacheEntries/2)
+	}
+	atCache[key] = s
+	atCacheMu.Unlock()
 	return s
 }
 
-var atCache sync.Map
+const maxAtCacheEntries = 8192
+
+var (
+	atCacheMu sync.RWMutex
+	atCache   = make(map[uint64]Session, 256)
+)
 
 // classifyAt is the pure wall-clock classification (no cache).
 func classifyAt(t time.Time) Session {

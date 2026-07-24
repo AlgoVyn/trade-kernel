@@ -859,6 +859,291 @@ func TestRealizedPnLStaleHidden(t *testing.T) {
 	}
 }
 
+// Trading-WS fills must update rday/rwk immediately without waiting for the
+// activities FILL endpoint (the bug: PnL frozen after session-start trades).
+func TestApplyUpdateFillUpdatesRealizedPnL(t *testing.T) {
+	s := NewStore()
+	s.Reconcile(alpaca.Account{Equity: 100000}, nil, nil)
+	// Seed empty historical sample so HasDay is already true (stale 0).
+	s.SetRealizedPnL(0, 0)
+
+	now := time.Now()
+	// Buy 10 @ 10.
+	s.ApplyUpdate(alpaca.TradeUpdate{
+		Event: "fill",
+		Order: alpaca.Order{
+			ID: "o-buy", Symbol: "AAPL", Side: "buy", Qty: 10, FilledQty: 10,
+			FilledAvgPrice: 10, FilledAt: now,
+		},
+		Price:       10,
+		Qty:         10,
+		PositionQty: qty(10),
+	})
+	s.WaitRealizedRecompute()
+	// Still open — realized day should stay 0 but sample must refresh.
+	if p := s.PnL(); !p.HasDay || math.Abs(p.Day) > 1e-9 {
+		t.Fatalf("after buy: pnl=%+v, want day 0", p)
+	}
+
+	// Sell 10 @ 12 → +20 realized.
+	s.ApplyUpdate(alpaca.TradeUpdate{
+		Event: "fill",
+		Order: alpaca.Order{
+			ID: "o-sell", Symbol: "AAPL", Side: "sell", Qty: 10, FilledQty: 10,
+			FilledAvgPrice: 12, FilledAt: now.Add(time.Second),
+		},
+		Price:       12,
+		Qty:         10,
+		PositionQty: qty(0),
+	})
+	s.WaitRealizedRecompute()
+	p := s.PnL()
+	if !p.HasDay || math.Abs(p.Day-20) > 1e-9 {
+		t.Fatalf("after sell: day=%v, want 20 (WS fills must realize)", p.Day)
+	}
+	if !p.HasWeek || math.Abs(p.Week-20) > 1e-9 {
+		t.Fatalf("after sell: week=%v, want 20", p.Week)
+	}
+}
+
+// REST activity fills that fully cover a WS order must not double-count.
+func TestRefreshRealizedPnLDoesNotDoubleCountWSFills(t *testing.T) {
+	s := NewStore()
+	s.Reconcile(alpaca.Account{Equity: 100000}, nil, nil)
+	now := time.Now()
+	day0 := session.DayStart(now)
+	buyAt := day0.Add(time.Hour)
+	sellAt := day0.Add(2 * time.Hour)
+
+	s.ApplyUpdate(alpaca.TradeUpdate{
+		Event: "fill",
+		Order: alpaca.Order{
+			ID: "o-buy", Symbol: "AAPL", Side: "buy", Qty: 10, FilledQty: 10,
+			FilledAvgPrice: 10, FilledAt: buyAt,
+		},
+		Price: 10, Qty: 10, PositionQty: qty(10),
+	})
+	s.ApplyUpdate(alpaca.TradeUpdate{
+		Event: "fill",
+		Order: alpaca.Order{
+			ID: "o-sell", Symbol: "AAPL", Side: "sell", Qty: 10, FilledQty: 10,
+			FilledAvgPrice: 11, FilledAt: sellAt,
+		},
+		Price: 11, Qty: 10, PositionQty: qty(0),
+	})
+	s.WaitRealizedRecompute()
+	if p := s.PnL(); math.Abs(p.Day-10) > 1e-9 {
+		t.Fatalf("ws day=%v, want 10", p.Day)
+	}
+
+	// REST returns the same executions under activity ids.
+	r := fakeRefresher{fills: []alpaca.Fill{
+		{ID: "act-1", OrderID: "o-buy", Symbol: "AAPL", Side: "buy", Qty: 10, Price: 10, Timestamp: buyAt},
+		{ID: "act-2", OrderID: "o-sell", Symbol: "AAPL", Side: "sell", Qty: 10, Price: 11, Timestamp: sellAt},
+	}}
+	if err := s.RefreshRealizedPnL(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	p := s.PnL()
+	if math.Abs(p.Day-10) > 1e-9 {
+		t.Fatalf("after REST merge day=%v, want 10 (no double-count)", p.Day)
+	}
+	s.mu.RLock()
+	nWS := len(s.wsFills)
+	s.mu.RUnlock()
+	if nWS != 0 {
+		t.Fatalf("wsFills len=%d, want 0 after REST coverage prune", nWS)
+	}
+}
+
+func TestMergeWSFillsPrefersWSWhenRESTPartial(t *testing.T) {
+	rest := []alpaca.Fill{
+		{ID: "r1", OrderID: "o1", Symbol: "A", Side: "buy", Qty: 5, Price: 10, Timestamp: time.Now()},
+	}
+	ws := []alpaca.Fill{
+		{ID: "w1", OrderID: "o1", Symbol: "A", Side: "buy", Qty: 5, Price: 10, Timestamp: time.Now()},
+		{ID: "w2", OrderID: "o1", Symbol: "A", Side: "buy", Qty: 5, Price: 10.5, Timestamp: time.Now()},
+	}
+	merged := mergeWSFills(rest, ws)
+	var q float64
+	for _, f := range merged {
+		if f.OrderID == "o1" {
+			q += float64(f.Qty)
+		}
+	}
+	if math.Abs(q-10) > 1e-9 {
+		t.Fatalf("merged qty=%v, want 10 (WS full order, not REST partial+WS)", q)
+	}
+}
+
+// REST aggregated fill without order_id (or different avg price) must de-dupe
+// WS partials of the same symbol+side so realized PnL is not double-counted.
+func TestMergeWSFillsResidualSymSideAgainstAggregatedREST(t *testing.T) {
+	now := time.Now()
+	// REST: single aggregated 10 @ 10.25, no order_id.
+	rest := []alpaca.Fill{
+		{ID: "act-1", Symbol: "AAPL", Side: "buy", Qty: 10, Price: 10.25, Timestamp: now},
+	}
+	// WS: two partials 5+5 at different prices, with order_id.
+	ws := []alpaca.Fill{
+		{ID: "ws:1", OrderID: "o1", Symbol: "AAPL", Side: "buy", Qty: 5, Price: 10, Timestamp: now},
+		{ID: "ws:2", OrderID: "o1", Symbol: "AAPL", Side: "buy", Qty: 5, Price: 10.5, Timestamp: now},
+	}
+	merged := mergeWSFills(rest, ws)
+	var q float64
+	var nWS int
+	for _, f := range merged {
+		q += float64(f.Qty)
+		if strings.HasPrefix(f.ID, "ws:") {
+			nWS++
+		}
+	}
+	if math.Abs(q-10) > 1e-9 {
+		t.Fatalf("merged qty=%v, want 10 (no double-count)", q)
+	}
+	if nWS != 0 {
+		t.Fatalf("expected 0 WS rows after residual de-dupe, got %d (total fills=%d)", nWS, len(merged))
+	}
+}
+
+// REST fully covering o1 via order_id must not residual-swallow a different
+// same-side WS order (o2) that is not yet in REST.
+func TestMergeWSFillsOrderIDCoverageDoesNotCrossConsume(t *testing.T) {
+	now := time.Now()
+	rest := []alpaca.Fill{
+		{ID: "act-1", OrderID: "o1", Symbol: "AAPL", Side: "buy", Qty: 10, Price: 10, Timestamp: now},
+	}
+	ws := []alpaca.Fill{
+		{ID: "ws:o1", OrderID: "o1", Symbol: "AAPL", Side: "buy", Qty: 10, Price: 10, Timestamp: now},
+		{ID: "ws:o2", OrderID: "o2", Symbol: "AAPL", Side: "buy", Qty: 5, Price: 11, Timestamp: now},
+	}
+	merged := mergeWSFills(rest, ws)
+	var q float64
+	var hasO2 bool
+	for _, f := range merged {
+		q += float64(f.Qty)
+		if f.OrderID == "o2" || f.ID == "ws:o2" {
+			hasO2 = true
+		}
+	}
+	if math.Abs(q-15) > 1e-9 {
+		t.Fatalf("merged qty=%v, want 15 (REST o1 + WS o2)", q)
+	}
+	if !hasO2 {
+		t.Fatal("expected WS o2 retained after o1 order_id coverage")
+	}
+	// prune must also retain o2.
+	kept := pruneWSFillsCovered(ws, rest)
+	var nO2 int
+	for _, f := range kept {
+		if f.OrderID == "o2" {
+			nO2++
+		}
+	}
+	if nO2 != 1 {
+		t.Fatalf("prune kept o2 count=%d, want 1 (got %+v)", nO2, kept)
+	}
+}
+
+// REST order_id coverage for o1 must not fingerprint-absorb a concurrent
+// same-size same-price WS fill for o2 (silent rday/rwk undercount).
+func TestMergeWSFillsFingerprintDoesNotCrossOrderID(t *testing.T) {
+	now := time.Now()
+	rest := []alpaca.Fill{
+		{ID: "act-1", OrderID: "o1", Symbol: "AAPL", Side: "buy", Qty: 10, Price: 10, Timestamp: now},
+	}
+	ws := []alpaca.Fill{
+		{ID: "ws:o1", OrderID: "o1", Symbol: "AAPL", Side: "buy", Qty: 10, Price: 10, Timestamp: now},
+		{ID: "ws:o2", OrderID: "o2", Symbol: "AAPL", Side: "buy", Qty: 10, Price: 10, Timestamp: now},
+	}
+	merged := mergeWSFills(rest, ws)
+	var q float64
+	var hasO2 bool
+	for _, f := range merged {
+		q += float64(f.Qty)
+		if f.OrderID == "o2" || f.ID == "ws:o2" {
+			hasO2 = true
+		}
+	}
+	if math.Abs(q-20) > 1e-9 {
+		t.Fatalf("merged qty=%v, want 20 (REST o1 + WS o2; fingerprint must not cross-consume)", q)
+	}
+	if !hasO2 {
+		t.Fatal("expected WS o2 retained (fingerprint only against no-order_id REST)")
+	}
+	kept := pruneWSFillsCovered(ws, rest)
+	var nO2, nO1 int
+	for _, f := range kept {
+		switch f.OrderID {
+		case "o2":
+			nO2++
+		case "o1":
+			nO1++
+		}
+	}
+	if nO1 != 0 {
+		t.Fatalf("prune kept o1 count=%d, want 0 (order_id covered)", nO1)
+	}
+	if nO2 != 1 {
+		t.Fatalf("prune kept o2 count=%d, want 1 (got %+v)", nO2, kept)
+	}
+}
+
+// No-order_id REST residual must not absorb a later same-side WS order outside
+// residualMatchWindow (silent undercount). Prefer temporary double-count.
+func TestMergeWSFillsResidualTimeGateKeepsDistantWS(t *testing.T) {
+	t0 := time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC)
+	// REST: aggregated 10 @ 10.25 for o1, no order_id.
+	rest := []alpaca.Fill{
+		{ID: "act-1", Symbol: "AAPL", Side: "buy", Qty: 10, Price: 10.25, Timestamp: t0},
+	}
+	// WS: o1 partials near REST time + o2 five minutes later (outside window).
+	ws := []alpaca.Fill{
+		{ID: "ws:o1a", OrderID: "o1", Symbol: "AAPL", Side: "buy", Qty: 5, Price: 10, Timestamp: t0},
+		{ID: "ws:o1b", OrderID: "o1", Symbol: "AAPL", Side: "buy", Qty: 5, Price: 10.5, Timestamp: t0.Add(time.Second)},
+		{ID: "ws:o2", OrderID: "o2", Symbol: "AAPL", Side: "buy", Qty: 5, Price: 11, Timestamp: t0.Add(5 * time.Minute)},
+	}
+	merged := mergeWSFills(rest, ws)
+	var q float64
+	var hasO2 bool
+	var nWSO1 int
+	for _, f := range merged {
+		q += float64(f.Qty)
+		if f.OrderID == "o2" || f.ID == "ws:o2" {
+			hasO2 = true
+		}
+		if f.OrderID == "o1" {
+			nWSO1++
+		}
+	}
+	// REST 10 + WS o2 5 = 15; o1 WS absorbed by residual near t0.
+	if math.Abs(q-15) > 1e-9 {
+		t.Fatalf("merged qty=%v, want 15 (REST o1 + distant WS o2)", q)
+	}
+	if !hasO2 {
+		t.Fatal("expected distant WS o2 retained (residual time gate)")
+	}
+	if nWSO1 != 0 {
+		t.Fatalf("expected o1 WS residual-absorbed, got %d rows", nWSO1)
+	}
+	kept := pruneWSFillsCovered(ws, rest)
+	var nO2, nO1 int
+	for _, f := range kept {
+		switch f.OrderID {
+		case "o2":
+			nO2++
+		case "o1":
+			nO1++
+		}
+	}
+	if nO2 != 1 {
+		t.Fatalf("prune kept o2 count=%d, want 1", nO2)
+	}
+	if nO1 != 0 {
+		t.Fatalf("prune kept o1 count=%d, want 0", nO1)
+	}
+}
+
 // TestReconciledGate: a fresh store reports Reconciled()==false until the
 // first Reconcile lands. Order entry in the UI gates on this so a failed
 // startup snapshot can't let the operator trade against an empty view.
@@ -896,4 +1181,190 @@ func (errRefresher) Positions(context.Context) ([]alpaca.Position, error) {
 }
 func (errRefresher) OpenOrders(context.Context, string) ([]alpaca.Order, error) {
 	return nil, nil
+}
+
+
+func TestApplyUpdateReplacedRemovesOrder(t *testing.T) {
+	s := NewStore()
+	s.ApplyUpdate(alpaca.TradeUpdate{
+		Event: "new",
+		Order: alpaca.Order{ID: "o-old", Symbol: "AAPL", Qty: 100, Side: "buy", Status: "new"},
+	})
+	if got := s.WorkingSideQty("AAPL", "buy"); got != 100 {
+		t.Fatalf("working before replace = %v, want 100", got)
+	}
+	s.ApplyUpdate(alpaca.TradeUpdate{
+		Event: "replaced",
+		Order: alpaca.Order{ID: "o-old", Symbol: "AAPL", Qty: 100, Side: "buy", Status: "replaced"},
+	})
+	s.ApplyUpdate(alpaca.TradeUpdate{
+		Event: "new",
+		Order: alpaca.Order{ID: "o-new", Symbol: "AAPL", Qty: 150, Side: "buy", Status: "new"},
+	})
+	if got := s.WorkingSideQty("AAPL", "buy"); got != 150 {
+		t.Fatalf("working after replace = %v, want 150 (not 250)", got)
+	}
+	if n := len(s.OpenOrders()); n != 1 {
+		t.Fatalf("open orders = %d, want 1", n)
+	}
+}
+
+func TestExposureAtomicSnapshot(t *testing.T) {
+	s := NewStore()
+	s.Reconcile(
+		alpaca.Account{Equity: 100000},
+		[]alpaca.Position{{Symbol: "AAPL", Qty: 100, Side: "long"}},
+		[]alpaca.Order{
+			{ID: "b1", Symbol: "AAPL", Qty: 50, Side: "buy", Status: "new"},
+			{ID: "s1", Symbol: "AAPL", Qty: 30, FilledQty: 10, Side: "sell", Status: "partially_filled"},
+		},
+	)
+	pos, wb, ws := s.Exposure("AAPL")
+	if pos != 100 {
+		t.Fatalf("pos=%v, want 100", pos)
+	}
+	if wb != 50 {
+		t.Fatalf("workingBuy=%v, want 50", wb)
+	}
+	if ws != 20 {
+		t.Fatalf("workingSell=%v, want 20", ws)
+	}
+}
+
+func TestWorkingSideQtyIgnoresTerminalStatus(t *testing.T) {
+	s := NewStore()
+	// Simulate a terminal row that somehow remains in the map.
+	s.mu.Lock()
+	s.orders = map[string]alpaca.Order{
+		"dead": {ID: "dead", Symbol: "AAPL", Qty: 500, Side: "buy", Status: "canceled"},
+		"live": {ID: "live", Symbol: "AAPL", Qty: 50, FilledQty: 10, Side: "buy", Status: "partially_filled"},
+	}
+	s.mu.Unlock()
+	if got := s.WorkingSideQty("AAPL", "buy"); got != 40 {
+		t.Fatalf("WorkingSideQty = %v, want 40 (ignore canceled)", got)
+	}
+}
+
+// Unknown / fixture open-like statuses must count (denylist of terminal only).
+func TestWorkingSideQtyCountsUnknownOpenStatus(t *testing.T) {
+	s := NewStore()
+	s.mu.Lock()
+	s.orders = map[string]alpaca.Order{
+		"fx": {ID: "fx", Symbol: "AAPL", Qty: 100, Side: "buy", Status: "open"},
+	}
+	s.mu.Unlock()
+	if got := s.WorkingSideQty("AAPL", "buy"); got != 100 {
+		t.Fatalf("WorkingSideQty = %v, want 100 for status=open", got)
+	}
+}
+
+// sell_short (and case variants) must count toward sell working exposure.
+func TestWorkingSideQtyNormalizesSellShort(t *testing.T) {
+	s := NewStore()
+	s.mu.Lock()
+	s.orders = map[string]alpaca.Order{
+		"ss": {ID: "ss", Symbol: "AAPL", Qty: 75, Side: "sell_short", Status: "accepted"},
+		"sp": {ID: "sp", Symbol: "AAPL", Qty: 25, Side: "SELL", Status: "new"},
+	}
+	s.mu.Unlock()
+	if got := s.WorkingSideQty("AAPL", "sell"); got != 100 {
+		t.Fatalf("WorkingSideQty(sell) = %v, want 100 (sell_short+SELL)", got)
+	}
+	if got := s.WorkingSideQty("AAPL", "buy"); got != 0 {
+		t.Fatalf("WorkingSideQty(buy) = %v, want 0", got)
+	}
+}
+
+func TestBookSnapshotSignedQtyUsesPositionQty(t *testing.T) {
+	s := NewStore()
+	s.Reconcile(alpaca.Account{}, []alpaca.Position{
+		{Symbol: "AAPL", Qty: 100, Side: "short"},
+	}, nil)
+	snap := s.Snapshot()
+	if got := snap.SignedQty("AAPL"); got != -100 {
+		t.Fatalf("SignedQty = %v, want -100", got)
+	}
+	// Hand-built without PositionQty still walks Positions.
+	b := BookSnapshot{Positions: []alpaca.Position{{Symbol: "MSFT", Qty: 10, Side: "long"}}}
+	if got := b.SignedQty("MSFT"); got != 10 {
+		t.Fatalf("fallback SignedQty = %v, want 10", got)
+	}
+}
+
+// Live Alpaca REST returns qty already negative for shorts. Reconcile must
+// normalize so PositionQty stays −N and short seeds are not dropped.
+func TestReconcileSignedRESTShortQty(t *testing.T) {
+	s := NewStore()
+	var put alpaca.Position
+	put.Symbol = "PUT"
+	put.Side = "short"
+	put.SetQty(-20)
+	put.SetAvgEntryPrice(4.825)
+	s.Reconcile(alpaca.Account{}, []alpaca.Position{put}, nil)
+
+	if got := s.PositionQty("PUT"); got != -20 {
+		t.Fatalf("PositionQty = %v, want -20", got)
+	}
+	p := s.Position("PUT")
+	if p == nil || p.Side != "short" || float64(p.Qty) != 20 {
+		t.Fatalf("stored position = %+v, want abs qty 20 side short", p)
+	}
+	if got := s.Snapshot().SignedQty("PUT"); got != -20 {
+		t.Fatalf("Snapshot SignedQty = %v, want -20", got)
+	}
+	seeds := SeedsFromPositions([]alpaca.Position{*p})
+	if len(seeds) != 1 || seeds[0].Qty != -20 {
+		t.Fatalf("seeds = %+v, want [{PUT -20}]", seeds)
+	}
+}
+
+// Flatten/panic REST path must not double-negate already-negative short qty.
+func TestSignedPositionQtyAlreadyNegativeShort(t *testing.T) {
+	var p alpaca.Position
+	p.Symbol = "PUT"
+	p.Side = "short"
+	p.SetQty(-20)
+	if got := SignedPositionQty(p); got != -20 {
+		t.Fatalf("SignedPositionQty(qty=-20, short) = %v, want -20 (not +20)", got)
+	}
+	// Absolute form still works.
+	p.SetQty(20)
+	if got := SignedPositionQty(p); got != -20 {
+		t.Fatalf("SignedPositionQty(qty=20, short) = %v, want -20", got)
+	}
+	// Long with positive qty.
+	p.Side = "long"
+	p.SetQty(15)
+	if got := SignedPositionQty(p); got != 15 {
+		t.Fatalf("SignedPositionQty(long) = %v, want 15", got)
+	}
+}
+
+// Stale REST sample must not overwrite a newer WS recompute.
+func TestRealizedPnLSampleRejectsOlder(t *testing.T) {
+	s := NewStore()
+	t0 := time.Now().Add(-time.Second)
+	t1 := t0.Add(500 * time.Millisecond)
+	s.mu.Lock()
+	if !s.setRealizedPnLSampleIfNewerLocked(100, 200, nil, t1) {
+		t.Fatal("newer sample should publish")
+	}
+	if s.setRealizedPnLSampleIfNewerLocked(1, 2, nil, t0) {
+		t.Fatal("older sample must be rejected")
+	}
+	s.mu.Unlock()
+	pnl := s.PnL()
+	if pnl.Day != 100 || pnl.Week != 200 {
+		t.Fatalf("PnL = %+v, want day=100 week=200 after stale reject", pnl)
+	}
+	// Equal timestamp still publishes (same-tick refresh).
+	s.mu.Lock()
+	if !s.setRealizedPnLSampleIfNewerLocked(50, 60, nil, t1) {
+		t.Fatal("equal sampleAt should publish")
+	}
+	s.mu.Unlock()
+	pnl = s.PnL()
+	if pnl.Day != 50 || pnl.Week != 60 {
+		t.Fatalf("PnL = %+v, want day=50 week=60", pnl)
+	}
 }

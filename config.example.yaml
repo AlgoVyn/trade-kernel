@@ -25,17 +25,27 @@ default_symbol: AAPL
 size_presets: [100, 250, 500, 1000]
 
 # Ask for y/n confirmation before every order (shows the converted
-# limit price in extended sessions).
+# limit price in extended sessions). Session class is pinned at confirm
+# so a boundary during y/n cannot flip market↔limit.
 confirm_orders: true
+
+orders:
+  # Regular-hours time-in-force for hotkey market/limit and :buy/:sell.
+  # Extended sessions always use day + extended_hours=true.
+  # Flatten/panic always use day TIF (IOC can leave residual size).
+  regular_tif: day          # day | ioc
 
 limits:
   max_order_qty: 1000       # reject orders larger than this
-  max_position_qty: 5000    # reject orders that would grow |position| past this
-  debounce_ms: 300          # duplicate-order debounce window
+  max_position_qty: 5000    # reject if position + same-side working + new would grow |exposure|
+                            # opposite-side resting is not a credit and not a gross cap
+                            # (long + resting sells can still stack past this in notional)
+  debounce_ms: 300          # duplicate-order debounce (flatten/panic skip this)
 
 extended_hours:
   slippage_bps: 25          # aggressive-limit offset (basis points)
   quote_stale_ms: 3000      # NBBO older than this -> price off last trade + warn
+                            # (flatten/panic may use last trade up to ~5m on quiet tape)
 
 indicators:
   ema_period: 9             # fast EMA period

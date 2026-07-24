@@ -162,6 +162,55 @@ func TestBuildExtendedStaleQuoteFallsBack(t *testing.T) {
 	}
 }
 
+// Exit paths may price off a last trade older than quoteStaleFor (quiet tape).
+func TestBuildAllowStaleLastTradeForExit(t *testing.T) {
+	q := fakeQuotes{
+		last: 100.00, tAt: testNow.Add(-30 * time.Second), // older than 3s stale
+	}
+	b := newTestBuilder(q, nil)
+	// Normal hotkey: hard fail.
+	_, _, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "sell", Qty: 100, Session: session.Overnight,
+	})
+	if err == nil {
+		t.Fatal("expected ErrNoExtendedPrice without AllowStaleLastTrade")
+	}
+	// Flatten/panic: allow stale last trade within exitStaleLastTradeMax.
+	req, warn, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "sell", Qty: 100, Session: session.AfterHours,
+		AllowStaleLastTrade: true,
+	})
+	if err != nil {
+		t.Fatalf("exit path: %v", err)
+	}
+	if warn == "" {
+		t.Fatal("expected quiet-tape warning")
+	}
+	if req.LimitPrice != "99.75" {
+		t.Fatalf("limit = %s, want 99.75", req.LimitPrice)
+	}
+}
+
+// Future-dated last trade (clock skew) must not skip pricing; age is clamped to 0.
+func TestBuildFutureLastTradeAgeClamped(t *testing.T) {
+	q := fakeQuotes{
+		last: 100.00, tAt: testNow.Add(30 * time.Second), // future stamp
+	}
+	b := newTestBuilder(q, nil)
+	req, warn, err := b.Build(context.Background(), BuildInput{
+		Symbol: "AAPL", Side: "sell", Qty: 10, Session: session.AfterHours,
+	})
+	if err != nil {
+		t.Fatalf("future trade should price as fresh: %v", err)
+	}
+	if warn != "NBBO stale: priced off last trade" {
+		t.Fatalf("warn = %q", warn)
+	}
+	if req.LimitPrice != "99.75" {
+		t.Fatalf("limit = %s, want 99.75", req.LimitPrice)
+	}
+}
+
 func TestBuildOvernightEligibility(t *testing.T) {
 	q := fakeQuotes{bid: 100, ask: 100.1, qAt: testNow.Add(-time.Second)}
 	elig := fakeElig{"AAPL": true, "XYZ": false}

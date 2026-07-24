@@ -28,6 +28,9 @@ type Config struct {
 
 	ConfirmOrders bool `yaml:"confirm_orders"`
 
+	// Orders configures default order form outside the session builder rules.
+	Orders Orders `yaml:"orders"`
+
 	Limits Limits `yaml:"limits"`
 
 	ExtendedHours ExtendedHours `yaml:"extended_hours"`
@@ -39,11 +42,26 @@ type Config struct {
 	Keys map[string]string `yaml:"keys"`
 }
 
+// Orders configures regular-hours defaults.
+type Orders struct {
+	// RegularTIF is "day" (default) or "ioc" for regular-hours hotkey/market
+	// and limit orders. Extended sessions always use day + extended_hours.
+	RegularTIF string `yaml:"regular_tif"`
+}
+
 // Limits are the pre-trade safety rails.
 type Limits struct {
 	MaxOrderQty    int `yaml:"max_order_qty"`
 	MaxPositionQty int `yaml:"max_position_qty"`
 	DebounceMS     int `yaml:"debounce_ms"` // duplicate-order debounce window
+}
+
+// RegularTIF returns the configured regular-hours time-in-force.
+func (c Config) RegularTIF() string {
+	if c.Orders.RegularTIF == "ioc" {
+		return "ioc"
+	}
+	return "day"
 }
 
 // ExtendedHours configures order conversion outside regular hours.
@@ -187,6 +205,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Limits.MaxPositionQty < 0 {
 		return fmt.Errorf("limits.max_position_qty must be >= 0 (0 disables)")
+	}
+	if c.Orders.RegularTIF == "" {
+		c.Orders.RegularTIF = "day"
+	}
+	if c.Orders.RegularTIF != "day" && c.Orders.RegularTIF != "ioc" {
+		return fmt.Errorf("orders.regular_tif must be \"day\" or \"ioc\" (got %q)", c.Orders.RegularTIF)
 	}
 	for action := range c.Keys {
 		if !knownKeyAction(action) {

@@ -889,3 +889,25 @@ func TestFillsHTTPErrorReturnsPartial(t *testing.T) {
 		t.Fatalf("err should mark incomplete: %v", err)
 	}
 }
+
+// Position returns (nil, nil) on HTTP 404 (flat) so flatten REST fallback
+// can treat empty books as zero size without surfacing a hard error.
+func TestPositionNotFoundIsFlat(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v2/positions/") {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"position does not exist"}`))
+	}))
+	defer srv.Close()
+	rest := NewREST("k", "s", true)
+	rest.SetBaseURL(srv.URL)
+	p, err := rest.Position(t.Context(), "AAPL")
+	if err != nil {
+		t.Fatalf("404 should be flat: %v", err)
+	}
+	if p != nil {
+		t.Fatalf("want nil position, got %+v", p)
+	}
+}

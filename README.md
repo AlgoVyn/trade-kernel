@@ -92,26 +92,37 @@ export APCA_API_SECRET_KEY=...
 
 | Session | Hotkey order | `:... lmt PRICE` |
 |---|---|---|
-| Regular | market, TIF=day | limit, TIF=day/ioc |
+| Regular | market, TIF=`orders.regular_tif` (default `day`, or `ioc`) | limit, same TIF |
 | Pre-market / after-hours | limit at NBBO far side ± slippage, `extended_hours=true` | limit as given, `extended_hours=true` |
 | Overnight | same + symbol eligibility check | same |
 | Closed | rejected | rejected |
 
 Stale NBBO (>3 s) falls back to pricing off the last trade with a
-warning. Flatten/reduce are direction-aware from the position sign.
+warning. Flatten/panic may still price off a last trade up to ~5 minutes
+old on quiet extended/overnight tape (with a warning) so exits do not
+hard-fail when the book is empty. Flatten/reduce are direction-aware
+from the position sign; size is re-read at submit (REST first, local
+fallback on error). Regular-hours flatten always uses day TIF even when
+`orders.regular_tif` is `ioc`.
 
 ## Safety
 
 - **Paper first.** Live trading needs both `paper: false` and
   `live_trading_acknowledged: true`, and prints a warning banner.
-- **Size rails.** Max order qty and projected max position qty (reducing
-  exposure is always allowed); short duplicate-order debounce.
+- **Size rails.** Max order qty and projected max position qty including
+  **same-side resting open orders** (strict same-sign reduce while over the
+  cap is allowed; equal-magnitude or oversize reverse while over the cap is
+  rejected); short duplicate-order debounce on new risk. Flatten and panic
+  do not invoke the checker (full bypass).
 - **Panic (X / `:panic`).** Cancels open orders for the active symbol and
-  flattens that symbol only.
+  flattens that symbol only (bypasses checks/confirmation; REST-first
+  position lookup, trusts REST flat even if local lag still shows size).
 - **Manual lock.** `:lock [reason]` engages the kill-switch until
-  `:unlock` (orders rejected; flatten/panic still work).
+  `:unlock` (new risk rejected; **flatten and panic still work**).
 - **Confirmations.** `confirm_orders: true` shows every order (with the
-  converted limit price in extended sessions) before submission.
+  converted limit price in extended sessions) before submission. Session
+  class and order form are pinned at confirm time so a session boundary
+  cannot change market↔limit under your finger.
 
 ## Development
 

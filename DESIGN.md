@@ -46,7 +46,7 @@ Keyboard ──> ui.Model ──> risk.Checker ──> execution.Executor ──
 | `internal/indicators` | Pure incremental O(1) EMA, resettable VWAP (SMA retained as a utility), each with non-mutating `Peek` for live forming-bar values. |
 | `internal/state` | Mutex-guarded cache of account/positions/open orders. REST snapshot at startup + every 5 s; trading-WS events applied incrementally; full refresh on WS reconnect. Account **realized day/week PnL** from closed **order fills** (avg-cost inventory over FILL activities with open-position cost-basis seeds from the last REST reconcile for pre-lookback lots; retained REST avg after positions go flat so pure-exit books of previously seeded names stay continuous; fallback closed orders) — not equity MTM. Symbols with opposite-side seed/fill disagreement or ghost inventory without retained avg (full exit of a lot opened before the ~180d lookback with unknown cost basis) are excluded — partial samples log a soft warning and the TUI marks `rday*`/`rwk*`. Same-side REST-ahead-of-FILL lag trusts the fill book. If nothing trustworthy remains (or a fetch fails), the prior sample is kept; `PnL()` hides figures older than the stale threshold. FILL buffer is cached and delta-fetched on the 60 s refresh (empty successful caches re-poll a short tail, with a periodic full lookback heal). `rday` / `rwk` bucket by `DayStart` / `WeekStart` (last real overnight open Sun–Thu 20:00 ET, weekend pins to Thu 20:00 so Friday rday stays visible / Sunday 20:00 week). POS still shows open unrealized. |
 | `internal/execution` | `Executor` interface (`Buy/Sell/LimitBuy/LimitSell/Flatten/CancelAll/CancelSymbol`). `Builder` applies session rules. `RESTExecutor` submits with generated client order IDs. `EligibilityCache` caches overnight-tradability per symbol (1 h TTL). |
-| `internal/risk` | `Checker`: optional lock, max order qty, projected max position qty (reducing exposure always allowed), duplicate-order debounce (Check/Record split). |
+| `internal/risk` | `Checker`: optional lock, max order qty, projected max position qty including same-side resting orders (strict same-sign reduce while over cap allowed; equal-magnitude or oversize reverse while over cap is rejected), duplicate-order debounce (Check/Record split). Production flatten/panic do **not** invoke the checker (full bypass); `CheckOpts` Skip* flags remain for tests / future gated exits. |
 | `internal/cmdline` | `:` command parser → typed `Command` structs. |
 | `internal/ui` | bubbletea model, solid-block candlestick renderer with braille indicator overlays, volume pane, bottom info bar, status bar, latency tracker, confirmation state machine. Cancel (C) and panic (X) are symbol-scoped via `CancelSymbol` (+ flatten for panic). |
 
@@ -73,7 +73,7 @@ never override a locally-derived Closed into a trading session.
 
 | Session | Hotkey order (B/S/A/D/F) | Explicit limit (`:buy 100 lmt 152.30`) |
 |---|---|---|
-| Regular | market, TIF=day (IOC configurable) | limit, TIF=day/ioc |
+| Regular | market, TIF=`orders.regular_tif` (`day` default, or `ioc`) | limit, same TIF |
 | Pre-market / after-hours | limit at far side of NBBO ± slippage, `extended_hours=true`, TIF=day | limit as given, `extended_hours=true`, TIF=day |
 | Overnight | same conversion + assets-endpoint eligibility check (ineligible ⇒ reject with warning) | same |
 | Closed | reject | reject |
@@ -81,15 +81,22 @@ never override a locally-derived Closed into a trading session.
 Slippage defaults to 25 bps, rounded aggressively (buys ceil to the
 cent, sells floor). If the NBBO is stale (>3 s), the builder prices off
 the last trade and returns a warning that the UI surfaces before
-submission. The confirmation prompt always shows the computed limit
-price in extended sessions.
+submission. **Flatten/panic** additionally allow a last trade up to
+~5 minutes old on quiet extended/overnight tape (`AllowStaleLastTrade`)
+so exits do not hard-fail when the book is empty. The confirmation
+prompt always shows the computed limit price in extended sessions
+(using the same exit pricing budget for flatten).
 
 ### 4. Safety rails (defense in depth)
 
 1. **Pre-trade** (`risk.Checker`): max order size, projected position
-   cap, 300 ms duplicate-order debounce, manual kill-switch
-   (`:lock [reason]` / `:unlock`). There is no automatic daily-loss
-   lock; operators engage the switch deliberately.
+   cap (**open position + same-side resting open-order qty + new order**),
+   300 ms duplicate-order debounce, manual kill-switch (`:lock [reason]` /
+   `:unlock`). Opposite-side resting orders do not create credit against
+   the cap. There is no automatic daily-loss lock; operators engage
+   the switch deliberately. **Flatten and panic do not call the checker**
+   (full bypass so exits work under lock, over size caps, and with stacked
+   working orders). New risk-increasing orders stay blocked while locked.
 2. **Panic key (X / `:panic`)**: cancel open orders for the *active*
    symbol + flatten that symbol only, bypassing the checker and
    confirmation. Scope is always the selected symbol (switch with
@@ -101,7 +108,14 @@ price in extended sessions.
    back to `DELETE /v2/positions` outside regular hours (that endpoint
    liquidates at market, which extended sessions do not allow); that
    endpoint is reserved for the Closed session and fractional
-   quantities, where the order path cannot work.
+   quantities, where the order path cannot work. Submit **re-reads**
+   position size via REST `GET /v2/positions/{symbol}` first (local
+   store only if REST fails) so a confirm delay, unreconciled book, or
+   stale-high local qty cannot leave residual size or oversize the
+   exit. Flatten/panic regular-hours exits always use **day** TIF
+   (`orders.regular_tif` / IOC applies to hotkey `:` buy-sell only).
+   Session class is **pinned at intent/confirm** so a 09:30/16:00
+   boundary during y/n cannot flip limit↔market.
 3. **Idempotency**: every order carries a generated client order ID;
    state reconciliation after reconnect prevents duplicates.
 
@@ -111,16 +125,35 @@ Live trades aggregate into all 8 timeframes simultaneously (fixed-cost
 per trade). On symbol switch and on every WS reconnect, history is
 backfilled from the REST bars endpoint (SIP feed includes
 extended-hours trades, so overnight bars exist; weekend/holiday gaps
-simply don't appear — collapsed chart). The incomplete current bucket
-from REST is kept as the forming bar so live trades extend it — closing
-it into the ring would duplicate the minute and mis-state volume vs
-SIP/TradingView. Session VWAP seeds the forming bar's volume on Load so
-a mid-bar reconnect does not permanently under-count that minute. Sub-minute timeframes (1s/5s/15s) are backfilled by
-replaying recent trades from the REST trades endpoint through the
-aggregator (the bars endpoint doesn't serve sub-minute resolutions);
-the replay touches only the sub-minute series, never the 1m+ bars or
-the live session VWAP. A reconnect triggers a backfill so sequence gaps
-are healed from REST rather than interpolated.
+simply don't appear — collapsed chart). TF bar fetches run **in
+parallel** (bounded concurrency); SIP+BOATS for a given TF stay
+sequential. While REST is in flight, `Aggregator.BeginBackfill` buffers
+live `OnTrade` prints (still updating last price for order pricing);
+after `Load`/`ReplayTrades`, `EndBackfillAfterReplay` applies the
+buffer so multi-second fetches cannot leave permanent volume holes —
+minute+/VWAP only prints after the REST bar-request end, sub-minute
+only prints after the REST trade window (already rebuilt by
+`ReplayTrades`). That dual cutoff prevents overnight BOATS (and any
+path that buffers historical prints during `BeginBackfill`) from
+double-counting volume already present in `Load`. The incomplete
+current bucket from REST is kept as the forming bar so live trades
+extend it — closing it into the ring would duplicate the minute and
+mis-state volume vs SIP/TradingView. Session VWAP seeds the forming
+bar's volume on Load so a mid-bar reconnect does not permanently
+under-count that minute. Sub-minute timeframes (1s/5s/15s) are
+backfilled by replaying recent trades from the REST trades endpoint
+through the aggregator (the bars endpoint doesn't serve sub-minute
+resolutions); the replay touches only the sub-minute series, never the
+1m+ bars or the live session VWAP. A reconnect triggers a backfill so
+sequence gaps are healed from REST rather than interpolated.
+
+**Symbol switch** is transactional: `activeSymbol` and aggregator reset
+commit only after market-data subscribe succeeds; on subscribe or
+*critical* backfill failure (TF1m hard-failed with no bars) the previous
+symbol is restored so the UI and SIP filter stay aligned. Soft SIP
+errors on coarser TFs do not roll back a partial-but-usable switch. The
+overnight poller high-water is symbol-scoped (`backfillHighWater`) so a
+switch cannot inherit the previous symbol's clock.
 
 Alpaca's market-data websocket (SIP) does not stream overnight
 (20:00–04:00 ET) prints; overnight data exists only on the REST BOATS
@@ -128,15 +161,15 @@ feed. During the Overnight session a poller fetches BOATS trades every
 2 s and folds new prints through `Aggregator.OnTrade` exactly like live
 tape — the forming candle updates in place, new candles roll on bucket
 boundaries, and volume / last price / session VWAP advance. Each tick
-also refreshes the NBBO cache from the BOATS latest-quote endpoint so
-extended-hours order pricing has a live quote overnight (without it the
-quote cache is empty all session and pricing falls back to a often-stale
-last trade). A high-water timestamp cursor plus a bounded trade-ID
-dedupe set prevents double application across polls; the backfill
-publishes its fetch end time as a shared cursor so polled prints never
-overlap trades that Load / ReplayTrades already applied. Outside
-Overnight the poller idles (SIP streams the other sessions; BOATS covers
-only overnight).
+also refreshes the NBBO cache from the BOATS latest-quote endpoint
+(**one-sided quotes accepted**, same as SIP) so extended-hours order
+pricing has a live quote overnight. An **exclusive** high-water timestamp
+cursor (trades at or before the mark are skipped) plus a bounded trade-ID
+dedupe set prevents double application across polls and after backfill.
+The backfill publishes the REST trade-window end as a symbol-scoped cursor
+so polled prints never overlap trades already applied via Load/Replay.
+Outside Overnight the poller idles (SIP streams the other sessions;
+BOATS covers only overnight).
 
 ### 6. Indicators
 
@@ -213,8 +246,8 @@ bars flat. Reset to 0 wherever `panOffset` is reset (symbol/TF switch).
 `trade-kernel.yaml` (gitignored; see `config.example.yaml`) holds all
 settings including `api_key_id`/`api_secret_key`. Env vars
 (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`) override the file when set.
-Notables: `size_presets`, `limits.{max_order_qty,
-max_position_qty, debounce_ms}`,
+Notables: `size_presets`, `orders.regular_tif` (`day`|`ioc`),
+`limits.{max_order_qty, max_position_qty, debounce_ms}`,
 `extended_hours.{slippage_bps, quote_stale_ms}`,
 `indicators.{ema_period, ema2_period, vwap_anchor}` (`sma_period` is a
 deprecated alias for `ema2_period`), `confirm_orders`,
@@ -243,8 +276,9 @@ forces live mode (still requires acknowledgement).
 - `internal/execution`: order-builder matrix (regular market/limit/IOC,
   extended conversion price math both sides, stale-quote fallback,
   overnight eligibility accept/reject, closed rejection).
-- `internal/risk`: size caps, reduce-always-allowed, debounce window,
-  lock/unlock.
+- `internal/risk`: size caps (incl. working orders), same-sign reduce while
+  over cap (equal-magnitude / oversize reverse rejected), debounce window,
+  lock/unlock, CheckOpts Skip* flags for tests / gated exits.
 - `internal/cmdline`: parser table tests incl. error forms.
 - `internal/ui`: hotkey→executor flows with a fake executor
   (buy/sell/add/reduce/flatten/panic), confirmation state machine,
@@ -268,6 +302,9 @@ session with `Restart=on-failure`; secrets in a mode-600
   gated on Alpaca FIX eligibility.
 - Overnight liquidity is thin; aggressive-limit conversion can miss
   fills — unfilled exit orders must be watched in the orders panel.
+  Quiet tape may still price exits off a last trade up to ~5 minutes
+  old (with a status warning); beyond that, use the broker UI or wait
+  for RTH.
 - Out of scope v1: options/crypto, bracket/OCO orders, multi-symbol
   panes, alerts, backtesting, fractional qty, custom client-server
   protocol.
